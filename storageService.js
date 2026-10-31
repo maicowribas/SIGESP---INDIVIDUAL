@@ -1474,7 +1474,7 @@ const StorageService = (() => {
             }
 
             const allRows = [];
-            const chunkSize = 64;
+            const chunkSize = 128;
             for (let i = 0; i < files.length; i += chunkSize) {
               const slice = files.slice(i, i + chunkSize);
               const decodedLists = await Promise.all(
@@ -1487,6 +1487,9 @@ const StorageService = (() => {
               );
               for (const list of decodedLists) {
                 for (const r of list) allRows.push(r);
+              }
+              if (i + chunkSize < files.length) {
+                await new Promise(r => setTimeout(r, 0));
               }
             }
 
@@ -1554,7 +1557,7 @@ const StorageService = (() => {
         let totalSize = 0;
         let maxMtime = 0;
         const allRows = [];
-        const chunkSize = 64;
+        const chunkSize = 128;
 
         for (let i = 0; i < handles.length; i += chunkSize) {
           const slice = handles.slice(i, i + chunkSize);
@@ -1581,6 +1584,9 @@ const StorageService = (() => {
           );
           for (const list of decodedLists) {
             for (const r of list) allRows.push(r);
+          }
+          if (i + chunkSize < handles.length) {
+            await new Promise(r => setTimeout(r, 0));
           }
         }
 

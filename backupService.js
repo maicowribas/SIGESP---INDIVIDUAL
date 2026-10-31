@@ -92,15 +92,27 @@ const BackupService = (() => {
       }
     },
 
+    async _parseCsvFileContent(file) {
+      const rawText = await file.text();
+      if (window.CryptoService && window.CryptoService.isEncryptedFile(rawText)) {
+        const decrypted = await window.CryptoService.decrypt(rawText);
+        return typeof parse === 'function'
+          ? parse(decrypted)
+          : (window.StorageService?.parseCsv ? window.StorageService.parseCsv(decrypted) : []);
+      }
+      return typeof parse === 'function'
+        ? parse(rawText)
+        : (window.StorageService?.parseCsv ? window.StorageService.parseCsv(rawText) : []);
+    },
+
     /**
-     * Importa um arquivo CSV selecionado pelo usuário.
-     * Se o arquivo for de ocorrências, normaliza cabeçalhos/sinônimos, garante campos obrigatórios
-     * e realiza upsert/merge contra os registros já existentes no disco, sem sobrescrever dados.
-     * Grava sempre com criptografia AES-GCM através de writeEncryptedCsv.
+     * Importa múltiplos arquivos CSV em lote utilizando Promise.all com paralelismo controlado
+     * e consolidação única em memória (O(N)), evitando leituras/gravações repetidas no disco (O(N²))
+     * e eliminando travamentos da Main Thread.
      */
-    async importCsvData(file, targetFileName = null) {
+    async importCsvFilesBatch(files, onProgress = null) {
       if (typeof denyOperatorAccess === 'function' && denyOperatorAccess()) {
-        return;
+        return { importedFiles: [], totalRows: 0 };
       }
       if (typeof S !== 'undefined' && typeof hasProfile === 'function' && !hasProfile(S.user, 'Administrador')) {
         if (typeof S !== 'undefined') {
@@ -109,41 +121,53 @@ const BackupService = (() => {
         }
         throw new Error('Apenas Administradores podem importar arquivos para a base de dados.');
       }
-
-      let fileName = (targetFileName || file.name || '').trim();
-      const lowerName = fileName.toLowerCase();
-      const isOccFile = lowerName === 'ocorrencias.csv' || /^ocorrencias?.*\.csv$/i.test(lowerName);
-      if (isOccFile) {
-        fileName = 'ocorrencias.csv';
-      }
-
-      const rawText = await file.text();
-
       if (!window.StorageService) {
         throw new Error('StorageService indisponível.');
       }
 
-      let rowsToPersist = [];
-      let headersToUse = null;
-
-      if (window.CryptoService && window.CryptoService.isEncryptedFile(rawText)) {
-        // Testa a integridade descriptografando o contêiner
-        const decrypted = await window.CryptoService.decrypt(rawText);
-        rowsToPersist = typeof parse === 'function' ? parse(decrypted) : (window.StorageService.parseCsv ? window.StorageService.parseCsv(decrypted) : []);
-      } else {
-        // Valida texto plano com suporte a qualquer delimitador
-        rowsToPersist = typeof parse === 'function' ? parse(rawText) : (window.StorageService.parseCsv ? window.StorageService.parseCsv(rawText) : []);
+      const fileArray = Array.from(files || []);
+      if (!fileArray.length) {
+        return { importedFiles: [], totalRows: 0 };
       }
 
-      if (isOccFile) {
-        // Obter ocorrências existentes no disco
-        let existingDisk = [];
-        try {
-          existingDisk = await window.StorageService.readEncryptedCsv('ocorrencias.csv');
-        } catch {
-          existingDisk = [];
-        }
+      const occFiles = [];
+      const otherFilesByTarget = new Map();
 
+      for (const entry of fileArray) {
+        const file = entry.file || entry;
+        const rawName = String(entry.targetFileName || file.name || '').trim();
+        const lower = rawName.toLowerCase();
+        const isOcc = lower === 'ocorrencias.csv' || /^ocorrencias?.*\.csv$/i.test(lower) || lower.includes('ocorrencia');
+        if (isOcc) {
+          occFiles.push(file);
+        } else {
+          let targetName = rawName;
+          if (lower.includes('fumaca') || lower.includes('inspecao') || lower.includes('ambiental')) {
+            targetName = typeof ENVIRONMENTAL_FILE !== 'undefined' ? ENVIRONMENTAL_FILE : 'inspecao_fumaca_preta.csv';
+          } else if (lower.includes('usuario')) {
+            targetName = 'usuarios.csv';
+          } else if (lower.includes('chave') && !lower.includes('moviment')) {
+            targetName = 'chaves.csv';
+          } else if (lower.includes('movimentacao') || lower.includes('movimento')) {
+            targetName = 'movimentacao_chaves.csv';
+          } else if (lower.includes('natureza')) {
+            targetName = 'naturezas_ocorrencias.csv';
+          } else if (lower.includes('supervis') && lower.includes('unidade')) {
+            targetName = 'supervisoes_unidades.csv';
+          }
+          if (!otherFilesByTarget.has(targetName)) {
+            otherFilesByTarget.set(targetName, []);
+          }
+          otherFilesByTarget.get(targetName).push(file);
+        }
+      }
+
+      const importedFiles = [];
+      let totalRows = 0;
+
+      // 1. Processa todos os arquivos de ocorrências em paralelo (Promise.all) e grava em uma única operação em lote
+      if (occFiles.length > 0) {
+        const existingDisk = await window.StorageService.readEncryptedCsv('ocorrencias.csv').catch(() => []);
         const occHeaders = (typeof H !== 'undefined' && H.occ) || [
           'id_ocorrencia', 'id_interno', 'numero_protocolo', 'data_ocorrencia', 'hora_ocorrencia',
           'gerencia', 'supervisao', 'unidade', 'area', 'local_especifico', 'natureza_ocorrencia',
@@ -154,16 +178,33 @@ const BackupService = (() => {
           'usuario_ultima_alteracao', 'status_validacao', 'data_envio_validacao', 'validado_por',
           'data_validacao', 'observacao_validacao'
         ];
-        headersToUse = occHeaders;
 
-        // Normalizar todas as linhas importadas
+        const incomingRows = [];
+        const batchSize = 64;
+        for (let i = 0; i < occFiles.length; i += batchSize) {
+          const slice = occFiles.slice(i, i + batchSize);
+          const parsedSlice = await Promise.all(
+            slice.map(f => this._parseCsvFileContent(f).catch(err => {
+              console.warn(`[BackupService] Ignorando arquivo inválido ${f.name}:`, err);
+              return [];
+            }))
+          );
+          for (const rows of parsedSlice) {
+            for (const r of rows) incomingRows.push(r);
+          }
+          if (typeof onProgress === 'function') {
+            onProgress(Math.min(occFiles.length, i + slice.length), fileArray.length, 'ocorrencias.csv');
+          }
+          if (i + batchSize < occFiles.length) {
+            await new Promise(r => setTimeout(r, 0));
+          }
+        }
+
         const normalizer = typeof normalizeOccurrenceRow === 'function'
           ? normalizeOccurrenceRow
           : (r) => r;
+        const normalizedIncoming = incomingRows.map((r, idx) => normalizer(r, idx, existingDisk));
 
-        const normalizedIncoming = rowsToPersist.map((r, idx) => normalizer(r, idx, existingDisk));
-
-        // Realizar Upsert / Merge por protocolo ou ID
         const mergedMap = new Map();
         for (const item of existingDisk) {
           const key = String(item.numero_protocolo || item.id_ocorrencia || item.id_interno || '').trim().toUpperCase();
@@ -179,28 +220,49 @@ const BackupService = (() => {
         }
 
         const finalMerged = Array.from(mergedMap.values());
-        await window.StorageService.writeEncryptedCsv('ocorrencias.csv', finalMerged, headersToUse);
-
+        await window.StorageService.writeEncryptedCsv('ocorrencias.csv', finalMerged, occHeaders);
         if (typeof CSVService !== 'undefined' && typeof CSVService.invalidateCache === 'function') {
           CSVService.invalidateCache('ocorrencias.csv');
         }
-
-        return { fileName: 'ocorrencias.csv', count: finalMerged.length, importedCount: rowsToPersist.length };
+        importedFiles.push('ocorrencias.csv');
+        totalRows += normalizedIncoming.length;
       }
 
-      const spec = typeof HYBRID_CSVS !== 'undefined'
-        ? HYBRID_CSVS.find(x => x[0] === fileName)
-        : null;
-      headersToUse = spec?.[3] || (typeof H !== 'undefined' && H[fileName.replace('.csv', '')]) || (rowsToPersist.length ? Object.keys(rowsToPersist[0]) : []);
+      // 2. Processa os demais arquivos do sistema em paralelo com Promise.all
+      const otherEntries = Array.from(otherFilesByTarget.entries());
+      if (otherEntries.length > 0) {
+        await Promise.all(otherEntries.map(async ([targetName, targetFiles]) => {
+          const parsedLists = await Promise.all(targetFiles.map(f => this._parseCsvFileContent(f)));
+          const combinedRows = parsedLists.flat();
+          const spec = typeof HYBRID_CSVS !== 'undefined'
+            ? HYBRID_CSVS.find(x => x[0] === targetName)
+            : null;
+          const headersToUse = spec?.[3]
+            || (typeof H !== 'undefined' && H[targetName.replace('.csv', '')])
+            || (combinedRows.length ? Object.keys(combinedRows[0]) : []);
 
-      // Grava sempre com criptografia AES-GCM através do storageService
-      await window.StorageService.writeEncryptedCsv(fileName, rowsToPersist, headersToUse);
-
-      if (typeof CSVService !== 'undefined' && typeof CSVService.invalidateCache === 'function') {
-        CSVService.invalidateCache(fileName);
+          await window.StorageService.writeEncryptedCsv(targetName, combinedRows, headersToUse);
+          if (typeof CSVService !== 'undefined' && typeof CSVService.invalidateCache === 'function') {
+            CSVService.invalidateCache(targetName);
+          }
+          importedFiles.push(targetName);
+          totalRows += combinedRows.length;
+        }));
       }
 
-      return { fileName, count: rowsToPersist.length };
+      return { importedFiles, totalRows };
+    },
+
+    /**
+     * Importa um arquivo CSV selecionado pelo usuário.
+     * Se o arquivo for de ocorrências, normaliza cabeçalhos/sinônimos, garante campos obrigatórios
+     * e realiza upsert/merge contra os registros já existentes no disco, sem sobrescrever dados.
+     * Grava sempre com criptografia AES-GCM através de writeEncryptedCsv.
+     */
+    async importCsvData(file, targetFileName = null) {
+      const res = await this.importCsvFilesBatch([{ file, targetFileName }]);
+      const primaryFile = res.importedFiles[0] || targetFileName || file?.name || 'ocorrencias.csv';
+      return { fileName: primaryFile, count: res.totalRows, importedCount: res.totalRows };
     }
   };
 })();

@@ -1292,37 +1292,119 @@ async function prepare(handle){
 }
 async function connectDataFolder(silent=false){const h=new ServerDirectoryHandle(DATA_FOLDER,'');await prepare(h);if(!silent)S.message='Pasta dados sincronizada com sucesso.';render()}
 const connectServerFolder=connectDataFolder;
+let _isFilePickerActive=false;
+let _filePickerCooldownUntil=0;
+let _filePickerSafetyTimer=null;
+function markFilePickerOpening(){
+  _isFilePickerActive=true;
+  _filePickerCooldownUntil=Date.now()+60000;
+  if(_filePickerSafetyTimer)clearTimeout(_filePickerSafetyTimer);
+  _filePickerSafetyTimer=setTimeout(()=>{
+    _isFilePickerActive=false;
+    _filePickerCooldownUntil=0;
+  },60000);
+}
+function markFilePickerClosed(cooldownMs=1500){
+  _isFilePickerActive=false;
+  _filePickerCooldownUntil=Date.now()+cooldownMs;
+  if(_filePickerSafetyTimer){
+    clearTimeout(_filePickerSafetyTimer);
+    _filePickerSafetyTimer=null;
+  }
+}
+function isFilePickerBlockingSync(){
+  return _isFilePickerActive||Date.now()<_filePickerCooldownUntil;
+}
+function triggerFallbackFolderInput(msg){
+  if(msg)S.message=msg;
+  let inp=document.getElementById('folderPickerInput')||document.getElementById('folderInputDirect');
+  if(!inp){
+    render();
+    inp=document.getElementById('folderPickerInput')||document.getElementById('folderInputDirect');
+  }
+  if(inp){
+    markFilePickerOpening();
+    inp.click();
+  }else if(msg){
+    render();
+  }
+}
 async function selectFolder(){if(denyOperatorAccess())return;S.folderModal=true;render()}
-async function pickFolderWithPicker(){
+async function pickFolderWithPicker(ev){
+  if(ev&&typeof ev.preventDefault==='function')ev.preventDefault();
   if(denyOperatorAccess())return;
+  if(_isFilePickerActive)return;
   if(typeof window.showDirectoryPicker==='function'){
+    markFilePickerOpening();
     try{
+      // IMPORTANTE: showDirectoryPicker deve ser a PRIMEIRA chamada assíncrona no clique para preservar a Transient User Activation
       const handle=await window.showDirectoryPicker({mode:'readwrite'});
+      markFilePickerClosed(2000);
       await DirectoryPersistence.saveDirectoryHandle(handle);
       S.savedHandle=handle;
+      S.permissionNeeded=false;
       await prepare(handle);
       S.folderModal=false;
       S.message=`Pasta "${handle.name}" conectada com sucesso.`;
       render();
       return;
     }catch(err){
+      markFilePickerClosed(800);
       if(err?.name==='AbortError')return;
       console.warn('showDirectoryPicker cancelado ou bloqueado:',err);
-      if(err?.name==='SecurityError'||/cross.origin|iframe|sub frame/i.test(err?.message||'')){
-        S.message='O navegador restringe o seletor nativo no quadro incorporado. Selecione a pasta via arquivos ou use a pasta automática "dados".';
-        render();
-        document.getElementById('folderPickerInput')?.click();
+      if(err?.name==='SecurityError'||/cross.origin|iframe|sub frame|user gesture|activation/i.test(err?.message||'')){
+        triggerFallbackFolderInput('O navegador restringe o seletor nativo no quadro incorporado. Selecione a pasta via arquivos ou use a pasta automática "dados".');
         return;
       }
       fail(err.message||'Não foi possível conectar à pasta selecionada.');
       return;
     }
   }
-  S.message='Seletor nativo indisponível neste navegador. Utilize a seleção de arquivos de pasta ou a pasta automática "dados".';
-  render();
-  document.getElementById('folderPickerInput')?.click();
+  triggerFallbackFolderInput('Seletor nativo indisponível neste navegador. Utilize a seleção de arquivos de pasta ou a pasta automática "dados".');
 }
-async function handleDirectoryInput(files){const list=[...(files||[])];if(!list.length)return;const csvFiles=list.filter(f=>f.name.toLowerCase().endsWith('.csv'));if(!csvFiles.length){fail('Nenhum arquivo .csv encontrado na pasta selecionada.');return}showLoading('Sincronizando arquivos da pasta selecionada...',{kicker:'Sincronização de dados',title:'Lendo arquivos da pasta...',progress:20,overlayId:'pdfProgressOverlay'});try{for(let i=0;i<csvFiles.length;i++){const file=csvFiles[i],cleanName=file.name.trim();updateLoadingProgress(20+Math.round(((i+1)/csvFiles.length)*60),`Lendo e protegendo ${cleanName}...`);if(window.BackupService){await window.BackupService.importCsvData(file,cleanName)}else{const text=await file.text();CSVService.setCachedText(cleanName,text);if(S.dir){try{const fh=await S.dir.getFileHandle(cleanName,{create:true}),w=await fh.createWritable();await w.write(file);await w.close()}catch(err){console.warn('Não foi possível gravar no disco para',cleanName,err)}}}}updateLoadingProgress(90,'Recarregando dados...');await load(false);hideLoading();S.folderModal=false;S.message=`Pasta com ${csvFiles.length} arquivos CSV sincronizada e protegida com sucesso.`;render()}catch(err){hideLoading();fail('Falha ao processar arquivos da pasta: '+(err.message||err))}}
+async function handleDirectoryInput(files){
+  markFilePickerClosed(2000);
+  const list=Array.from(files||[]);
+  if(!list.length)return;
+  const csvFiles=list.filter(f=>f.name&&f.name.toLowerCase().endsWith('.csv'));
+  if(!csvFiles.length){
+    fail('Nenhum arquivo .csv encontrado na pasta selecionada.');
+    return;
+  }
+  showLoading('Sincronizando arquivos da pasta selecionada...',{kicker:'Sincronização de dados',title:'Lendo arquivos da pasta em lote...',progress:20,overlayId:'pdfProgressOverlay'});
+  try{
+    await new Promise(r=>setTimeout(r,0));
+    if(window.BackupService?.importCsvFilesBatch){
+      await window.BackupService.importCsvFilesBatch(csvFiles,(done,total,currentName)=>{
+        const pct=20+Math.round((done/Math.max(1,total))*65);
+        updateLoadingProgress(pct,`Sincronizando em lote (${done}/${total}) · ${currentName}...`);
+      });
+    }else if(window.BackupService){
+      const batchSize=32;
+      for(let i=0;i<csvFiles.length;i+=batchSize){
+        const slice=csvFiles.slice(i,i+batchSize);
+        updateLoadingProgress(20+Math.round(((i+slice.length)/csvFiles.length)*65),`Lendo lote de arquivos (${i+slice.length}/${csvFiles.length})...`);
+        await Promise.all(slice.map(file=>window.BackupService.importCsvData(file,file.name.trim())));
+        await new Promise(r=>setTimeout(r,0));
+      }
+    }else{
+      await Promise.all(csvFiles.map(async file=>{
+        const cleanName=file.name.trim();
+        const text=await file.text();
+        CSVService.setCachedText(cleanName,text);
+      }));
+    }
+    updateLoadingProgress(90,'Recarregando dados...');
+    await load(false);
+    hideLoading();
+    S.folderModal=false;
+    S.message=`Pasta com ${csvFiles.length} arquivos CSV sincronizada e protegida com sucesso.`;
+    render();
+  }catch(err){
+    hideLoading();
+    fail('Falha ao processar arquivos da pasta: '+(err.message||err));
+  }
+}
 async function restoreFolder(){
   S.restoring=true;
   render();
@@ -1453,13 +1535,12 @@ async function authorizeSaved(){
     fail(err.message||'Permissão negada.');
   }
 }
-async function changeFolderFallback(){
+async function changeFolderFallback(ev){
+  if(ev&&typeof ev.preventDefault==='function')ev.preventDefault();
   if(denyOperatorAccess())return;
   try{
-    await DirectoryPersistence.clearDirectoryHandle();
-    S.dir=null;
-    S.savedHandle=null;
-    S.permissionNeeded=false;
+    // Chama pickFolderWithPicker imediatamente no evento de clique sem aguardar IndexedDB antes,
+    // preservando o User Gesture nativo e evitando bloqueio da Main Thread.
     await pickFolderWithPicker();
   }catch(err){
     console.error('Falha ao alterar pasta:',err);
@@ -1484,16 +1565,17 @@ const HYBRID_CSVS=[['ocorrencias.csv','Ocorrências registradas',()=>S.occ.lengt
 async function downloadRawCsvFile(fileName){if(denyOperatorAccess())return;try{if(window.BackupService){await window.BackupService.exportDecryptedCsvBackup(fileName);return}const cached=CSVService.cache.get(fileName),spec=HYBRID_CSVS.find(x=>x[0]===fileName);let blob;if(cached?.rawText){blob=new Blob([cached.rawText],{type:'text/csv;charset=utf-8'})}else if(cached?.rows&&spec?.[3]){blob=new Blob([csv(cached.rows,spec[3])],{type:'text/csv;charset=utf-8'})}else{const handle=await S.dir.getFileHandle(fileName);blob=await handle.getFile()}const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=fileName;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)}catch(error){console.error('Falha ao baixar CSV:',fileName,error);fail(`Não foi possível baixar o arquivo ${fileName}.`)}}
 async function downloadAllServerCsvs(){if(denyOperatorAccess())return;try{if(window.BackupService){await window.BackupService.exportAllDecryptedBackups();return}showLoading('Preparando exportação dos arquivos CSV da pasta dados...',{kicker:'Backup de dados',title:'Exportando arquivos CSV...',progress:15,overlayId:'pdfProgressOverlay'});for(let i=0;i<HYBRID_CSVS.length;i++){const[name]=HYBRID_CSVS[i];updateLoadingProgress(15+Math.round(((i+1)/HYBRID_CSVS.length)*80),`Baixando ${name}...`);await downloadRawCsvFile(name);await new Promise(r=>setTimeout(r,160))}hideLoading();S.message='Todos os arquivos CSV da pasta dados foram exportados.';render()}catch(error){hideLoading();fail('Não foi possível exportar todos os arquivos CSV.')}}
 async function uploadHybridCsvFiles(fileList){
+  markFilePickerClosed(2000);
   if(denyOperatorAccess())return;
   if(!hasProfile(S.user,'Administrador')){S.accessDenied=true;render();return}
-  const files=[...(fileList||[])].filter(f=>f.name.toLowerCase().endsWith('.csv'));
+  const files=Array.from(fileList||[]).filter(f=>f.name&&f.name.toLowerCase().endsWith('.csv'));
   if(!files.length)return fail('Selecione pelo menos um arquivo .csv válido.');
-  showLoading('Importando arquivos CSV para a pasta dados...',{kicker:'Sincronização de dados',title:'Importando CSV(s)...',progress:20,overlayId:'pdfProgressOverlay'});
+  showLoading('Importando arquivos CSV para a pasta dados...',{kicker:'Sincronização de dados',title:'Importando CSV(s) em lote...',progress:20,overlayId:'pdfProgressOverlay'});
   try{
+    await new Promise(r=>setTimeout(r,0));
     const allowed=new Set([...HYBRID_CSVS.map(x=>x[0]),'supervisoes.csv','unidades.csv']);
-    const imported=[];
-    for(let i=0;i<files.length;i++){
-      const f=files[i],rawName=f.name.trim();
+    const mappedEntries=files.map(f=>{
+      const rawName=f.name.trim();
       let cleanName=rawName;
       const lower=cleanName.toLowerCase();
       if(lower==='ocorrencias.csv'||lower.includes('ocorrencia'))cleanName='ocorrencias.csv';
@@ -1503,14 +1585,27 @@ async function uploadHybridCsvFiles(fileList){
       else if(lower.includes('movimentacao')||lower.includes('movimento'))cleanName='movimentacao_chaves.csv';
       else if(lower.includes('natureza'))cleanName='naturezas_ocorrencias.csv';
       else if(lower.includes('supervis')||lower.includes('unidade'))cleanName='supervisoes_unidades.csv';
-
       if(!allowed.has(cleanName))throw new Error(`O arquivo "${rawName}" não pertence ao catálogo padrão do SIGESP.`);
-      updateLoadingProgress(20+Math.round(((i+1)/files.length)*60),`Gravando e sincronizando ${cleanName}...`);
-      if(window.BackupService){
-        await window.BackupService.importCsvData(f,cleanName);
-      }else{
-        const text=await f.text();
-        const parsed=parse(text);
+      return {file:f,targetFileName:cleanName};
+    });
+
+    let imported=[];
+    if(window.BackupService?.importCsvFilesBatch){
+      const batchRes=await window.BackupService.importCsvFilesBatch(mappedEntries,(done,total,currentName)=>{
+        const pct=20+Math.round((done/Math.max(1,total))*65);
+        updateLoadingProgress(pct,`Processando em paralelo (${done}/${total}) · ${currentName}...`);
+      });
+      imported=batchRes.importedFiles||[];
+    }else{
+      const grouped=new Map();
+      for(const item of mappedEntries){
+        if(!grouped.has(item.targetFileName))grouped.set(item.targetFileName,[]);
+        grouped.get(item.targetFileName).push(item.file);
+      }
+      for(const [cleanName,groupFiles] of grouped.entries()){
+        updateLoadingProgress(50,`Gravando e sincronizando ${cleanName}...`);
+        const texts=await Promise.all(groupFiles.map(f=>f.text()));
+        const parsed=texts.flatMap(t=>parse(t));
         let finalRows=parsed;
         let hdrs=null;
         if(cleanName==='ocorrencias.csv'){
@@ -1531,17 +1626,19 @@ async function uploadHybridCsvFiles(fileList){
         }
         await write(cleanName,finalRows,hdrs||H[cleanName.replace('.csv','')]);
         CSVService.invalidateCache(cleanName);
+        imported.push(cleanName);
       }
-      imported.push(cleanName);
     }
-    if((imported.includes('supervisoes.csv')||imported.includes('unidades.csv'))&&!imported.includes('supervisoes_unidades.csv')){
+
+    const uniqueImported=[...new Set(imported)];
+    if((uniqueImported.includes('supervisoes.csv')||uniqueImported.includes('unidades.csv'))&&!uniqueImported.includes('supervisoes_unidades.csv')){
       const[supervisions,units]=await Promise.all([read('supervisoes.csv'),read('unidades.csv')]),legacy=organizationRows(supervisions,units);
       if(legacy.length)await write('supervisoes_unidades.csv',legacy,H.org);
     }
     updateLoadingProgress(90,'Atualizando e recarregando o histórico...');
     if(typeof CSVService!=='undefined')CSVService.invalidateCache();
     await load(true);
-    if(imported.includes('ocorrencias.csv')){
+    if(uniqueImported.includes('ocorrencias.csv')){
       S.page='occ-history';
       S.activeMenu='ocorrencias';
       S.historyFilters={dateFrom:'',dateTo:'',nature:'',protocol:'',general:''};
@@ -1551,7 +1648,7 @@ async function uploadHybridCsvFiles(fileList){
     render();
     updateSyncIndicatorElement();
     showToast('Importação concluída. As ocorrências estão visíveis no Histórico.','success','Sincronização de Dados');
-    showUserResult('success','Importação concluída com sucesso',`Arquivo(s) atualizado(s) e normalizados na base de dados: ${imported.join(', ')}. Os registros estão disponíveis na tela de Histórico.`,'','Sincronização de dados');
+    showUserResult('success','Importação concluída com sucesso',`Arquivo(s) atualizado(s) e normalizados na base de dados: ${uniqueImported.join(', ')}. Os registros estão disponíveis na tela de Histórico.`,'','Sincronização de dados');
   }catch(error){
     hideLoading();
     console.error('Falha ao importar arquivos CSV.',error);
@@ -1590,6 +1687,7 @@ let _pollIntervalId=null;
 let _isPollingActive=false;
 async function smartPollSync(){
   if(typeof document!=='undefined'&&document.visibilityState==='hidden')return;
+  if(isFilePickerBlockingSync()||S.folderModal)return;
   if(!S.dir||S.restoring||S.permissionNeeded)return;
   if(S.submitting)return;
   if(_isPollingActive)return;
@@ -1766,7 +1864,7 @@ async function smartPollSync(){
       if(userForm)captureUserDraft(userForm);
       if(isApuracaoModalOpen&&typeof syncApuracaoFormState==='function')syncApuracaoFormState();
 
-      if(isTyping||(isOccFormPage&&isEditingOcc)||(isAmbFormPage&&isEditingAmb)||isEditingUser||isValidationModalOpen||isApuracaoModalOpen){
+      if(isTyping||(isOccFormPage&&isEditingOcc)||(isAmbFormPage&&isEditingAmb)||isEditingUser||isValidationModalOpen||isApuracaoModalOpen||isFilePickerBlockingSync()||S.folderModal){
         updateSyncIndicatorElement();
       }else{
         render();
@@ -1810,11 +1908,18 @@ async function handleManualRefresh(){
 }
 if(typeof window!=='undefined'){
   window.addEventListener('focus',()=>{
+    if(_isFilePickerActive){
+      // Quando a janela recupera o foco após fechar/cancelar o seletor do SO, libera o bloqueio com cooldown
+      markFilePickerClosed(1500);
+      return;
+    }
+    if(isFilePickerBlockingSync()||S.folderModal)return;
     if(S.dir&&!S.submitting&&!S.restoring&&!S.permissionNeeded){
       smartPollSync().catch(()=>{});
     }
   });
   document.addEventListener('visibilitychange',()=>{
+    if(isFilePickerBlockingSync()||S.folderModal)return;
     if(document.visibilityState==='visible'&&S.dir&&!S.submitting&&!S.restoring&&!S.permissionNeeded){
       smartPollSync().catch(()=>{});
     }
@@ -1833,7 +1938,22 @@ function cleanup(){S.newPhotos.forEach(x=>URL.revokeObjectURL(x.url));S.existing
 async function image(path){try{const[p,n]=path.split('/'),root=await S.dir.getDirectoryHandle('anexos'),fd=await root.getDirectoryHandle(p),fh=await fd.getFileHandle(n),file=await fh.getFile();return{path,url:URL.createObjectURL(file),missing:0}}catch{return{path,url:'',missing:1}}}
 async function loadImages(rec){cleanup();const refs=String(rec.anexos_referencias||'').split('|').filter(Boolean).filter(p=>!/\.pdf$/i.test(p.trim()));S.existing=await Promise.all(refs.map(image))}
 async function compress(file){if(!['image/jpeg','image/png','image/webp'].includes(file.type))throw Error(`Formato inválido: ${file.name}`);const b=await createImageBitmap(file),scale=Math.min(1,WIDTH/b.width),c=document.createElement('canvas');c.width=Math.max(1,Math.round(b.width*scale));c.height=Math.max(1,Math.round(b.height*scale));const ctx=c.getContext('2d',{alpha:false});ctx.fillStyle='#fff';ctx.fillRect(0,0,c.width,c.height);ctx.drawImage(b,0,0,c.width,c.height);b.close();const blob=await new Promise((ok,no)=>c.toBlob(x=>x?ok(x):no(Error('Falha na compressão')),'image/jpeg',QUALITY));return{blob,url:URL.createObjectURL(blob),name:file.name,size:blob.size}}
-async function choose(files){captureOccurrenceDraft();const a=[...files],space=MAX-S.existing.length-S.newPhotos.length;if(a.length>space)return fail(`Limite de ${MAX} fotos. Restam ${space}.`);try{for(const f of a)S.newPhotos.push(await compress(f));S.message='Fotos comprimidas.';render()}catch(x){fail(x.message)}}
+async function choose(files){
+  markFilePickerClosed(1200);
+  captureOccurrenceDraft();
+  const a=Array.from(files||[]);
+  if(!a.length)return;
+  const space=MAX-S.existing.length-S.newPhotos.length;
+  if(a.length>space)return fail(`Limite de ${MAX} fotos. Restam ${space}.`);
+  try{
+    const compressed=await Promise.all(a.map(f=>compress(f)));
+    for(const item of compressed)S.newPhotos.push(item);
+    S.message='Fotos comprimidas.';
+    render();
+  }catch(x){
+    fail(x.message);
+  }
+}
 async function removeFiles(){
   if(!S.removed?.length)return;
   try{
@@ -3470,7 +3590,7 @@ function filteredAmbientalInspecoes(){const f=S.ambientalFilters||{},rows=scopeA
 function ambientalHistoryTotalPages(){const total=filteredAmbientalInspecoes().length;return Math.max(1,Math.ceil(total/S.pageSize))}
 function pagedAmbientalInspecoes(){const rows=filteredAmbientalInspecoes();const total=ambientalHistoryTotalPages();S.currentPage=Math.min(Math.max(1,S.currentPage),total);const start=(S.currentPage-1)*S.pageSize;return rows.slice(start,start+S.pageSize)}
 function ambientalHistoryPage(){const allFiltered=filteredAmbientalInspecoes(),rows=pagedAmbientalInspecoes(),totalPages=ambientalHistoryTotalPages(),f=S.ambientalFilters||{},allUnits=[...new Set((S.inspecoes||[]).map(item=>item.unidade).filter(Boolean))].sort(),allSupervisoes=[...new Set((S.inspecoes||[]).map(item=>item.supervisao).filter(Boolean))].sort();return `<div class="row between"><div><h2>HISTÓRICO DE INSPEÇÕES</h2><p class="muted">Monitoramento de Fumaça Preta</p></div><button type="button" class="btn primary ambiental-new">Nova inspeção</button></div><div class="card"><div class="history-filter-grid"><label><span class="label">Data inicial</span><input id="ambientalDateFrom" class="field" type="date" value="${esc(f.dateFrom||'')}"></label><label><span class="label">Data final</span><input id="ambientalDateTo" class="field" type="date" value="${esc(f.dateTo||'')}"></label><label><span class="label">Placa</span><input id="ambientalPlaca" class="field" value="${esc(f.placa||'')}" placeholder="Placa"></label><label><span class="label">Transportadora</span><input id="ambientalTransportadora" class="field" value="${esc(f.transportadora||'')}" placeholder="Transportadora"></label><label><span class="label">Monitoramento</span><select id="ambientalRealizado" class="field"><option value="">Todos</option><option value="Sim" ${f.realizado==='Sim'?'selected':''}>Sim</option><option value="Não" ${f.realizado==='Não'?'selected':''}>Não</option></select></label><label><span class="label">Laudo</span><select id="ambientalLaudo" class="field"><option value="">Todos</option><option value="Aprovado" ${f.laudo==='Aprovado'?'selected':''}>Aprovado</option><option value="Reprovado" ${f.laudo==='Reprovado'?'selected':''}>Reprovado</option></select></label><label><span class="label">Responsável</span><input id="ambientalResponsavel" class="field" value="${esc(f.responsavel||'')}" placeholder="Responsável"></label><label><span class="label">Unidade</span><select id="ambientalUnidade" class="field"><option value="">Todas</option>${allUnits.map(item=>`<option value="${esc(item)}" ${f.unidade===item?'selected':''}>${esc(item)}</option>`).join('')}</select></label><label><span class="label">Supervisão</span><select id="ambientalSupervisao" class="field"><option value="">Todas</option>${allSupervisoes.map(item=>`<option value="${esc(item)}" ${f.supervisao===item?'selected':''}>${esc(item)}</option>`).join('')}</select></label><label class="history-general"><span class="label">Pesquisa geral</span><input id="ambientalGeneral" class="field" value="${esc(f.general||'')}" placeholder="Buscar registro..."></label></div><div class="row between" style="margin-top:14px"><button id="clearAmbientalFilters" class="btn">Limpar filtros</button><span class="muted">${allFiltered.length} registros · Página ${S.currentPage} de ${totalPages}</span></div></div><div class="card"><div class="tablewrap"><table class="table"><thead><tr><th>Data</th><th>Placa</th><th>Transportadora</th><th>Monitoramento</th><th>Laudo</th><th>Responsável</th><th>Ações</th></tr></thead><tbody>${rows.length?rows.map(item=>`<tr><td>${esc(item.data||'')}</td><td>${esc(item.placa||'')}</td><td>${esc(item.transportadora||'')}</td><td>${esc(item.realizar_monitoramento||'Não')}</td><td>${String(item.laudo||'') ? ambientalStatusBadge(item.laudo) : ambientalStatusBadge('Não realizado')}</td><td>${esc(formatAmbientalResponsible(item))}</td><td class="actions"><button class="viewAmbiental" data-id="${esc(item.id||'')}" title="Visualizar">👁️</button><button class="editAmbiental" data-id="${esc(item.id||'')}" title="Editar">✏️</button>${isAdministratorUser(S.user)?`<button class="deleteRecordPrompt" data-modulo="Meio Ambiente" data-id="${esc(item.id||'')}" data-code="${esc(item.placa||item.id||'Sem placa')}" data-detail="${esc(item.transportadora||'')} · ${esc(item.laudo||'Não realizado')}" title="Excluir Inspeção">🗑️</button>`:''}</td></tr>`).join(''):`<tr><td colspan="7" class="muted">Nenhum registro disponível para o período selecionado.</td></tr>`}</tbody></table></div><div class="row between" style="margin-top:14px"><button id="ambientalPrev" class="btn" ${S.currentPage<=1?'disabled':''}>◀ Anterior</button><button id="ambientalNext" class="btn" ${S.currentPage>=totalPages?'disabled':''}>Próxima ▶</button></div></div>`}
-function photos(editable){const old=S.existing.map((p,i)=>`<div class="photo">${p.missing?'<div style="height:110px;display:grid;place-items:center">Imagem não encontrada</div>':`<img class="zoom" data-url="${p.url}" src="${p.url}">`}<small>${esc(p.path)}</small>${editable?`<button type="button" class="removeOld btn" data-i="${i}">Remover</button>`:''}</div>`).join(''),fresh=S.newPhotos.map((p,i)=>`<div class="photo"><img class="zoom" data-url="${p.url}" src="${p.url}"><small>${esc(p.name)} · ${Math.round(p.size/1024)} KB</small><button type="button" class="removeNew btn" data-i="${i}">Remover</button></div>`).join(''),count=S.existing.length+S.newPhotos.length;return `<div class="photos">${old}${fresh}${editable&&count<MAX?'<label class="add-photo">📷<br>Adicionar foto<input id="photos" class="hidden" type="file" accept="image/jpeg,image/png,image/webp" multiple></label>':''}</div>${editable?`<p class="muted">${count} de ${MAX}. JPEG até ${WIDTH}px, qualidade ${Math.round(QUALITY*100)}%.</p>`:''}`}
+function photos(editable){const old=S.existing.map((p,i)=>`<div class="photo">${p.missing?'<div style="height:110px;display:grid;place-items:center">Imagem não encontrada</div>':`<img class="zoom" data-url="${p.url}" src="${p.url}">`}<small>${esc(p.path)}</small>${editable?`<button type="button" class="removeOld btn" data-i="${i}">Remover</button>`:''}</div>`).join(''),fresh=S.newPhotos.map((p,i)=>`<div class="photo"><img class="zoom" data-url="${p.url}" src="${p.url}"><small>${esc(p.name)} · ${Math.round(p.size/1024)} KB</small><button type="button" class="removeNew btn" data-i="${i}">Remover</button></div>`).join(''),count=S.existing.length+S.newPhotos.length;return `<div class="photos">${old}${fresh}${editable&&count<MAX?'<label class="add-photo">📷<br>Adicionar foto<input id="photos" class="hidden" type="file" accept=".jpg,.jpeg,.png,.webp" multiple></label>':''}</div>${editable?`<p class="muted">${count} de ${MAX}. JPEG até ${WIDTH}px, qualidade ${Math.round(QUALITY*100)}%.</p>`:''}`}
 function selectOptions(items,value){return items.map(item=>{const optionValue=typeof item==='string'?item:item.value,label=typeof item==='string'?item:item.label;return `<option value="${esc(optionValue)}" ${optionValue===value?'selected':''}>${esc(label)}</option>`}).join('')}
 function occForm(){
 const x=S.editing||{},availableUnits=units(),historicalUnit=unitForName(x.unidade);
@@ -4381,7 +4501,7 @@ function apuracaoModal(){
             ${renderApuracaoPdfList()}
             ${totalPdfs < 3 ? `
               <div style="display:flex;align-items:center;gap:10px;margin-top:4px">
-                <input type="file" id="apuracaoPdfInput" accept="application/pdf,.pdf" multiple style="display:none">
+                <input type="file" id="apuracaoPdfInput" accept=".pdf" multiple style="display:none">
                 <button type="button" id="btnChooseApuracaoPdf" class="btn" style="background:#f1f5f9;border:1px solid #cbd5e1;font-weight:700;display:inline-flex;align-items:center;gap:6px;font-size:12.5px">
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
                   Adicionar Documento / Laudo PDF
@@ -5584,7 +5704,7 @@ function settingsSearchForm(placeholder){return `<form id="settingsSearch" class
 function settingsMasterList(){const entity=S.settingsTab,query=normalizedMasterName(S.settingsSearch),admin=hasProfile(S.user,'Administrador');let rows=masterEntityRecords(entity).filter(item=>{const parent=entity==='units'?(_supervisionLookupMap.get(item.id_supervisao)?.nome||''):'';return !query||normalizedMasterName(`${item.nome} ${parent}`).includes(query)});rows.sort((a,b)=>a.nome.localeCompare(b.nome,'pt-BR'));let table='';if(entity==='supervisions'){table=`<table class="table"><tr><th>Supervisão</th><th>Unidades</th><th>Usuários</th><th>Status</th><th>Ações</th></tr>${rows.map(item=>`<tr><td>${esc(item.nome)}</td><td>${S.unitCatalog.filter(unit=>unit.id_supervisao===item.id_supervisao).length}</td><td>${S.users.filter(user=>effectiveSupervisionId(user)===item.id_supervisao).length}</td><td>${activeMaster(item)?'Ativa':'Inativa'}</td><td class="actions">${admin?`<button class="editMaster" data-entity="supervision" data-id="${esc(item.id_supervisao)}" title="Editar">✏️</button><button class="deactivateMaster btn" data-entity="supervision" data-id="${esc(item.id_supervisao)}">${activeMaster(item)?'Inativar':'Reativar'}</button>`:'-'}</td></tr>`).join('')}</table>`}else if(entity==='units'){table=`<table class="table"><tr><th>Unidade</th><th>Supervisão</th><th>Status</th><th>Ações</th></tr>${rows.map(item=>`<tr><td>${esc(item.nome)}</td><td>${esc(_supervisionLookupMap.get(item.id_supervisao)?.nome||'Sem Supervisão')}</td><td>${activeMaster(item)?'Ativa':'Inativa'}</td><td class="actions">${admin?`<button class="editMaster" data-entity="unit" data-id="${esc(item.id_unidade)}" title="Editar">✏️</button><button class="deactivateMaster btn" data-entity="unit" data-id="${esc(item.id_unidade)}">${activeMaster(item)?'Inativar':'Reativar'}</button>`:'-'}</td></tr>`).join('')}</table>`}else{const natureFreq=new Map();for(let i=0;i<S.occ.length;i++){const k=normalizedMasterName(S.occ[i].natureza_ocorrencia);if(k)natureFreq.set(k,(natureFreq.get(k)||0)+1)}for(let i=0;i<S.pending.length;i++){const k=normalizedMasterName(S.pending[i].natureza_ocorrencia);if(k)natureFreq.set(k,(natureFreq.get(k)||0)+1)}table=`<table class="table"><tr><th>Natureza de Ocorrência</th><th>Status</th><th>Usos históricos</th><th>Ações</th></tr>${rows.map(item=>{const names=new Set([item.nome,...aliasesOf(item)].map(normalizedMasterName));let count=0;for(const nKey of names)count+=natureFreq.get(nKey)||0;return `<tr><td>${esc(item.nome)}</td><td>${activeMaster(item)?'Ativa':'Inativa'}</td><td>${count}</td><td class="actions">${admin?`<button class="editMaster" data-entity="nature" data-id="${esc(item.id_natureza)}" title="Editar">✏️</button><button class="deactivateMaster btn" data-entity="nature" data-id="${esc(item.id_natureza)}">${activeMaster(item)?'Inativar':'Reativar'}</button>`:'-'}</td></tr>`}).join('')}</table>`}return `<div class="card settings-list"><div class="row between"><div><h3>${masterEntityName(entity==='supervisions'?'supervision':entity==='units'?'unit':'nature')}</h3><p class="muted">${entity==='supervisions'?'Cadastro das Supervisões organizacionais.':entity==='units'?'Unidades vinculadas às respectivas Supervisões.':'Naturezas disponíveis para novos registros de ocorrência.'}</p></div>${admin?`<button class="btn primary newMaster" data-entity="${entity==='supervisions'?'supervision':entity==='units'?'unit':'nature'}">Cadastrar ${entity==='supervisions'?'Supervisão':entity==='units'?'Unidade':'Natureza'}</button>`:''}</div>${settingsSearchForm('Pesquisar por nome...')}<div class="tablewrap">${table||'<p class="muted">Nenhum cadastro encontrado.</p>'}</div></div>`}
 function settingsMasterEditor(){if(!S.masterEditor||!hasProfile(S.user,'Administrador'))return'';const{entity,id,data}=S.masterEditor,title=`${id?'Editar':'Cadastrar'} ${masterEntityName(entity)}`,supOptions=S.supervisions.filter(item=>activeMaster(item)||(id&&item.id_supervisao===data.id_supervisao)).map(item=>({value:item.id_supervisao,label:item.nome}));return `<div class="modalbg popup-backdrop"><div class="card modal"><button type="button" class="close cancelMasterEditor" aria-label="Fechar">×</button><h2>${esc(title)}</h2><form id="masterDataForm" class="stack"><label><span class="label">Nome</span><input class="field" name="nome" value="${esc(data.nome||'')}" required maxlength="120"></label>${entity==='unit'?`<label><span class="label">Supervisão</span><select class="field" name="supervisao_id" required><option value="">Selecione uma Supervisão</option>${selectOptions(supOptions,data.id_supervisao||'')}</select></label>`:''}<div class="row" style="justify-content:flex-end"><button type="button" id="cancelMasterEditor" class="btn">Cancelar</button><button type="submit" class="btn primary" ${S.masterBusy?'disabled':''}>Salvar</button></div></form></div></div>`}
 function masterConfirmationModal(){const item=S.masterConfirmation;if(!item)return'';const title=item.error?'Não foi possível verificar dependências':`Confirmar ${item.active?'reativação':'inativação'}?`,message=item.error?item.error:`Tem certeza de que deseja ${item.active?'reativar':'inativar'} ${masterEntityName(item.entity)} “${item.name}”?`;return `<div class="modalbg popup-backdrop"><div class="result-dialog result-error"><div class="error-strip"></div><div class="error-body"><div class="error-icon">!</div><div><div class="result-kicker error-kicker">Confirmação necessária</div><h2>${esc(title)}</h2><p>${esc(message)}</p>${item.dependencies?.length?`<p class="muted">Dependências: ${esc(item.dependencies.join('; '))}. Os registros históricos e vínculos serão preservados; a inativação impede novos usos.</p>`:''}</div></div><div class="result-actions error-actions"><button id="cancelMasterConfirmation" class="btn">Cancelar</button>${item.error?'':`<button id="confirmMasterDeactivation" class="btn danger">${item.active?'Reativar':'Inativar'}</button>`}</div></div></div>`}
-function settingsPage(){const tabs=[['supervisions','Supervisões'],['units','Unidades'],['natures','Naturezas de Ocorrência']],admin=hasProfile(S.user,'Administrador');return `<div class="settings-heading"><h2>Configurações</h2><p class="muted">Administração centralizada dos dados mestres e persistência automática do SIGESP.</p></div><div class="settings-tabs" role="tablist">${tabs.map(([id,label])=>`<button class="btn settingsTab ${S.settingsTab===id?'primary':''}" data-tab="${id}" role="tab" aria-selected="${S.settingsTab===id}">${label}</button>`).join('')}</div>${settingsMasterList()}<div class="card settings-folder"><div class="row between"><div><h3>Armazenamento Automático de Dados (Pasta dados)</h3><p class="muted">Os dados são lidos e salvos automaticamente na pasta <b>dados</b> (localizada no mesmo diretório do index.html), protegidos por criptografia nativa AES-GCM de 256 bits.</p></div><div class="row"><button id="syncServerFolder" type="button" class="btn">Sincronizar pasta dados</button><button id="selectFolderSettings" type="button" class="btn">Selecionar outra pasta...</button><button id="downloadAllCsvs" type="button" class="btn primary">Baixar todos os CSVs</button>${admin?`<label class="btn" style="cursor:pointer;display:inline-flex;align-items:center;gap:6px">Importar CSV(s)<input id="uploadCsvInput" class="hidden" type="file" accept=".csv,text/csv" multiple></label>`:''}</div></div><div class="status" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px"><span>Pasta ativa: <b>${esc(S.dir?.name||'dados')}</b> · Persistência centralizada</span><span style="display:inline-flex;align-items:center;gap:6px;background:rgba(22,163,74,0.12);color:#166534;padding:4px 10px;border-radius:4px;font-size:12px;font-weight:600">🔒 Criptografia AES-GCM 256 bits (Web Crypto API) Ativa</span></div><div class="tablewrap" style="margin-top:12px"><table class="table"><thead><tr><th>Arquivo CSV</th><th>Descrição</th><th>Registros carregados</th><th>Ação</th></tr></thead><tbody>${HYBRID_CSVS.map(([file,desc,countFn])=>`<tr><td><b>${esc(file)}</b></td><td>${esc(desc)}</td><td>${countFn()}</td><td><button type="button" class="btn downloadSingleCsv" data-file="${esc(file)}" style="padding:6px 10px;font-size:12px">Baixar CSV</button></td></tr>`).join('')}</tbody></table></div></div>`}
+function settingsPage(){const tabs=[['supervisions','Supervisões'],['units','Unidades'],['natures','Naturezas de Ocorrência']],admin=hasProfile(S.user,'Administrador');return `<div class="settings-heading"><h2>Configurações</h2><p class="muted">Administração centralizada dos dados mestres e persistência automática do SIGESP.</p></div><div class="settings-tabs" role="tablist">${tabs.map(([id,label])=>`<button class="btn settingsTab ${S.settingsTab===id?'primary':''}" data-tab="${id}" role="tab" aria-selected="${S.settingsTab===id}">${label}</button>`).join('')}</div>${settingsMasterList()}<div class="card settings-folder"><div class="row between"><div><h3>Armazenamento Automático de Dados (Pasta dados)</h3><p class="muted">Os dados são lidos e salvos automaticamente na pasta <b>dados</b> (localizada no mesmo diretório do index.html), protegidos por criptografia nativa AES-GCM de 256 bits.</p></div><div class="row"><button id="syncServerFolder" type="button" class="btn">Sincronizar pasta dados</button><button id="selectFolderSettings" type="button" class="btn">Selecionar outra pasta...</button><button id="downloadAllCsvs" type="button" class="btn primary">Baixar todos os CSVs</button>${admin?`<label class="btn" style="cursor:pointer;display:inline-flex;align-items:center;gap:6px">Importar CSV(s)<input id="uploadCsvInput" class="hidden" type="file" accept=".csv" multiple></label>`:''}</div></div><div class="status" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px"><span>Pasta ativa: <b>${esc(S.dir?.name||'dados')}</b> · Persistência centralizada</span><span style="display:inline-flex;align-items:center;gap:6px;background:rgba(22,163,74,0.12);color:#166534;padding:4px 10px;border-radius:4px;font-size:12px;font-weight:600">🔒 Criptografia AES-GCM 256 bits (Web Crypto API) Ativa</span></div><div class="tablewrap" style="margin-top:12px"><table class="table"><thead><tr><th>Arquivo CSV</th><th>Descrição</th><th>Registros carregados</th><th>Ação</th></tr></thead><tbody>${HYBRID_CSVS.map(([file,desc,countFn])=>`<tr><td><b>${esc(file)}</b></td><td>${esc(desc)}</td><td>${countFn()}</td><td><button type="button" class="btn downloadSingleCsv" data-file="${esc(file)}" style="padding:6px 10px;font-size:12px">Baixar CSV</button></td></tr>`).join('')}</tbody></table></div></div>`}
 function dashboardPage(){if(denyOperatorAccess())return'';const rows=scope(S.occ||[]),series=dashboardSeries(rows),summary={},unitCounts={};for(let i=0,len=rows.length;i<len;i++){const item=rows[i],st=normalizeApuracaoStatus(item.status),un=String(item.unidade||item.local_ocorrencia||'Sem unidade').trim();summary[st]=(summary[st]||0)+1;unitCounts[un]=(unitCounts[un]||0)+1}const pendingCount=filteredPendingOccurrences().length;const catalogUnits=authorizedUnitRecords();for(let i=0,len=catalogUnits.length;i<len;i++){const uName=String(catalogUnits[i]?.nome||'').trim();if(uName&&!(uName in unitCounts)){unitCounts[uName]=0}}const periods=series.months.slice(-6),totals=series.totals.slice(-6),unitEntries=Object.entries(unitCounts),topUnits=unitEntries.sort((a,b)=>b[1]-a[1]).slice(0,5),featured=ambientalDashboard();const registeredUnitsCount=catalogUnits.length||S.unitCatalog.length;const unitsWithOccurrences=unitEntries.filter(([un,count])=>un!=='Sem unidade'&&count>0).length;return `<div class="section-block"><div class="dashboard-heading"><div><h2>DASHBOARD</h2><p class="muted">Visão geral operativa do SIGESP</p></div><span class="dashboard-period">Últimos 6 meses</span></div><div class="grid metrics">${[['Total de registros',rows.length],['Ocorrências pendentes',pendingCount],['Em apuração',summary['Em Apuração']||0],['Encerradas',summary['Encerrada']||0],['Unidades cadastradas',registeredUnitsCount],['Unidades com registros',unitsWithOccurrences]].map(([label,value])=>`<div class="card metric-card"><span class="metric-label">${esc(label)}</span><strong>${esc(String(value))}</strong></div>`).join('')}</div><div class="corporate-dashboard-grid"><section class="card chart-card"><div class="chart-title"><div><h3>Evolução operacional</h3><p>Ocorrências por período</p></div><span class="chart-badge">Período</span></div>${periods.length?`<div class="ambiental-mini-chart">${periods.map((month,index)=>{const value=totals[index]||0;const maxTotal=Math.max(1,...totals);const height=Math.max(8,(value/maxTotal)*100);return `<div class="ambiental-small-bar-wrap" style="position:relative;display:flex;flex-direction:column;align-items:center;justify-content:flex-end"><span class="bar-data-label" style="font-size:11px;font-weight:700;color:#1e40af;margin-bottom:4px;line-height:1">${value}</span><div class="ambiental-small-bar" style="height:${height}%" title="${value} ocorrência(s) em ${corporateMonthLabel(month)}"></div><span>${esc(corporateMonthLabel(month).slice(0,6))}</span></div>`}).join('')}</div>`:`<div class="chart-empty">Nenhum dado disponível para o período.</div>`}</section><section class="card chart-card"><div class="chart-title"><div><h3>Top unidades</h3><p>Registros por unidade no escopo</p></div><span class="chart-badge">Unidades</span></div><div class="ambiental-stack">${topUnits.length?topUnits.map(([unit,count])=>`<div class="ambiental-legend-row"><span>${esc(unit)}</span><strong>${count}</strong></div>`).join(''):`<div class="chart-empty">Sem registros para exibir.</div>`}</div></section></div>${featured}</div>`}
 const unguardedRestrictedViews={dashboard:dashboardPage,occList,occurrenceHistoryPage,pendingValidationPage,apuracaoOccurrencesPage,usersPage,auditPage,reportsPage,settingsPage};
 function dashboard(){if(denyOperatorAccess())return'';return unguardedRestrictedViews.dashboard();}
@@ -5890,8 +6010,17 @@ function bind(){
   document.querySelectorAll('.cancelFolderModal').forEach(b=>b.onclick=()=>{S.folderModal=false;render()});
   document.getElementById('chooseAutoFolder')?.addEventListener('click',()=>{S.folderModal=false;void connectDataFolder(false)});
   document.getElementById('chooseNativeFolder')?.addEventListener('click',pickFolderWithPicker);
-  document.getElementById('folderPickerInput')?.addEventListener('change',e=>{if(e.target.files?.length)void handleDirectoryInput(e.target.files);e.target.value=''});
-  document.getElementById('folderInputDirect')?.addEventListener('change',e=>{if(e.target.files?.length)void handleDirectoryInput(e.target.files);e.target.value=''});
+  const bindFileInputGuard=el=>{
+    if(!el)return;
+    el.addEventListener('click',()=>markFilePickerOpening());
+    el.addEventListener('cancel',()=>markFilePickerClosed(800));
+  };
+  const folderPickerEl=document.getElementById('folderPickerInput');
+  bindFileInputGuard(folderPickerEl);
+  folderPickerEl?.addEventListener('change',e=>{markFilePickerClosed(2000);const files=Array.from(e.target.files||[]);e.target.value='';if(files.length)void handleDirectoryInput(files)});
+  const folderDirectEl=document.getElementById('folderInputDirect');
+  bindFileInputGuard(folderDirectEl);
+  folderDirectEl?.addEventListener('change',e=>{markFilePickerClosed(2000);const files=Array.from(e.target.files||[]);e.target.value='';if(files.length)void handleDirectoryInput(files)});
   document.getElementById('authorize')?.addEventListener('click',authorizeSaved);
   document.getElementById('forget')?.addEventListener('click',forgetFolder);
   document.getElementById('login')?.addEventListener('submit',login);
@@ -6067,7 +6196,9 @@ function bind(){
   document.getElementById('occForm')?.addEventListener('change',e=>{if(e.target.name==='tipo_vinculo'){handleVinculoChange(e);return}if(e.target.name)captureOccurrenceDraft(e.currentTarget)});
   document.getElementById('occTipoVinculo')?.addEventListener('change',handleVinculoChange);
   document.getElementById('cancelOcc')?.addEventListener('click',async()=>{const wasEditingExisting=Boolean(S.editing?.id_ocorrencia);cleanup();S.occurrenceDraft=null;if(wasEditingExisting){S.editing=null;S.page=hasProfile(S.user,'Operador')?'occ-register':'occ-history';if(S.page==='occ-register'){await openOccurrenceRegistration({forceNew:false,clearDraft:true});}else{render();}}else{await openOccurrenceRegistration({forceNew:false,clearDraft:true});}});
-  document.getElementById('photos')?.addEventListener('change',x=>choose(x.target.files));
+  const photosEl=document.getElementById('photos');
+  bindFileInputGuard(photosEl);
+  photosEl?.addEventListener('change',x=>{markFilePickerClosed(1200);const files=Array.from(x.target.files||[]);x.target.value='';if(files.length)void choose(files)});
   document.querySelectorAll('.removeNew').forEach(b=>b.onclick=()=>{captureOccurrenceDraft();const i=+b.dataset.i;URL.revokeObjectURL(S.newPhotos[i].url);S.newPhotos.splice(i,1);render()});
   document.querySelectorAll('.removeOld').forEach(b=>b.onclick=()=>{captureOccurrenceDraft();const i=+b.dataset.i,p=S.existing[i];S.removed.push(p.path);if(p.url)URL.revokeObjectURL(p.url);S.existing.splice(i,1);render()});
   document.querySelectorAll('.zoom').forEach(b=>b.onclick=()=>{S.viewUrl=b.dataset.url;render()});
@@ -6135,11 +6266,15 @@ function bind(){
     S.apuracaoExistingPdfs=[];
     render();
   });
+  const apuracaoPdfEl=document.getElementById('apuracaoPdfInput');
+  bindFileInputGuard(apuracaoPdfEl);
   document.getElementById('btnChooseApuracaoPdf')?.addEventListener('click',()=>{
     syncApuracaoFormState();
-    document.getElementById('apuracaoPdfInput')?.click();
+    markFilePickerOpening();
+    apuracaoPdfEl?.click();
   });
-  document.getElementById('apuracaoPdfInput')?.addEventListener('change',e=>{
+  apuracaoPdfEl?.addEventListener('change',e=>{
+    markFilePickerClosed(1200);
     syncApuracaoFormState();
     const files=Array.from(e.target.files||[]);
     if(!files.length)return;
@@ -6270,8 +6405,12 @@ function bind(){
   document.getElementById('forgetFolder')?.addEventListener('click',forgetFolder);
   document.getElementById('syncServerFolder')?.addEventListener('click',()=>connectServerFolder(false));
   document.getElementById('downloadAllCsvs')?.addEventListener('click',downloadAllServerCsvs);
-  document.getElementById('uploadCsvInput')?.addEventListener('change',e=>{if(e.target.files?.length)void uploadHybridCsvFiles(e.target.files);e.target.value=''});
-  document.getElementById('historyImportCsvInput')?.addEventListener('change',e=>{if(e.target.files?.length)void uploadHybridCsvFiles(e.target.files);e.target.value=''});
+  const uploadCsvEl=document.getElementById('uploadCsvInput');
+  bindFileInputGuard(uploadCsvEl);
+  uploadCsvEl?.addEventListener('change',e=>{markFilePickerClosed(2000);const files=Array.from(e.target.files||[]);e.target.value='';if(files.length)void uploadHybridCsvFiles(files)});
+  const historyImportEl=document.getElementById('historyImportCsvInput');
+  bindFileInputGuard(historyImportEl);
+  historyImportEl?.addEventListener('change',e=>{markFilePickerClosed(2000);const files=Array.from(e.target.files||[]);e.target.value='';if(files.length)void uploadHybridCsvFiles(files)});
   document.querySelectorAll('.downloadSingleCsv').forEach(b=>b.onclick=()=>downloadRawCsvFile(b.dataset.file));
 }
 if(typeof window!=='undefined'){
