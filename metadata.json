@@ -1,0 +1,8 @@
+{
+  "name": "App de teste",
+  "description": "Imported from GitHub: maicowribas/SIGESP_HTML_COMPLET",
+  "permissions": [],
+  "capabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

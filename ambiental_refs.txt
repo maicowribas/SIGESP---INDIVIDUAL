@@ -1,0 +1,345 @@
+﻿
+app.js:6:const ENVIRONMENTAL_FILE='inspecao_fumaca_preta.csv';
+app.js:21:function canAccessPage(page,user=S.user){if(page==='usuarios'&&!canManageUsers(user))return 
+false;if(['inspecao-veicular','hist-inspecoes'].includes(page))return hasProfile(user,'Administrador','Supervisor','Líd
+er');if(hasProfile(user,'Operador'))return['occ-register','chaves'].includes(page);if(hasProfile(user,'Líder'))return 
+page!=='usuarios';return true}
+app.js:28:const S={dir:null,user:null,users:[],unitCatalog:[],supervisions:[],natureCatalog:[],occ:[],pending:[],keys:[
+],moves:[],audits:[],inspecoes:[],page:'dashboard',message:'',permissionNeeded:false,restoring:true,editing:null,userPa
+sswordTarget:null,userRemovalTarget:null,modal:null,masterEditor:null,masterConfirmation:null,masterBusy:false,settings
+Tab:'supervisions',settingsSearch:'',newPhotos:[],existing:[],removed:[],viewUrl:null,query:'',currentPage:1,pageSize:5
+0,successPopup:null,errorPopup:null,submitting:false,accessDenied:false,occurrencesMenuOpen:false,environmentMenuOpen:f
+alse,historyFilters:{dateFrom:'',dateTo:'',nature:'',protocol:'',general:''},ambientalFilters:{dateFrom:'',dateTo:'',pl
+aca:'',transportadora:'',realizado:'',laudo:'',responsavel:'',unidade:'',supervisao:'',general:''}};
+app.js:511:async function saveAmbientalInspection(ev){ev.preventDefault();const form=ev.currentTarget;const 
+raw=Object.fromEntries(new FormData(form));if(!S.user){fail('Sessão inválida.');return}const input=normalizeAmbientalRo
+w(raw),edit=Boolean(raw.id),isSim=String(input.realizar_monitoramento||'Sim').trim()==='Sim';if(!input.data){fail('Info
+rme a data da inspeção.');return}if(isSim){if(!input.placa||!input.transportadora||!input.nota||!input.laudo||!input.ob
+servacao||!input.responsavel){fail('Preencha todos os campos obrigatórios da inspeção.');return}}else 
+if(!input.motivo_nao_execucao){fail('Selecione o motivo da não execução.');return}try{await 
+refreshAccessContext();await ensureDataWritePermission();if(!canAccessPage('inspecao-veicular'))throw new 
+DataScopeError('Seu perfil não possui autorização para registrar inspeções.');showLoading(edit?'Salvando 
+alterações...':'Registrando inspeção...',{kicker:'Processamento corporativo',title:edit?'Salvando 
+alterações...':'Registrando inspeção...',progress:18,overlayId:'pdfProgressOverlay'});await 
+withWriteLock('ambiental',async()=>{const disk=await read(ENVIRONMENTAL_FILE),time=now(),unit=assignedUnitIds(S.user)[0
+]||'',supervisao=effectiveSupervisionId(S.user)||'';let next=[],row;if(edit){const 
+current=disk.find(item=>String(item.id)===String(input.id));if(!current)throw new DataScopeError('Inspeção não encontra
+da.');row={...current,...input,responsavel:String(input.responsavel||current.responsavel||S.user.nome).trim(),usuario_r
+egistro:current.usuario_registro||S.user.login,unidade:String(input.unidade||current.unidade||unit),supervisao:String(i
+nput.supervisao||current.supervisao||supervisao),data_hora_registro:current.data_hora_registro||time,data_hora_alteraca
+o:time,alterado_por:S.user.login};if(row.realizar_monitoramento==='Sim'){row.motivo_nao_execucao='';}else{row.placa='';
+row.transportadora='';row.nota='';row.laudo='';row.observacao='';}}else{row={id:uid(),...input,responsavel:String(input
+.responsavel||S.user.nome).trim(),usuario_registro:S.user.login,data_hora_registro:time,data_hora_alteracao:'',alterado
+_por:'',unidade:unit,supervisao:supervisao};if(row.realizar_monitoramento==='Sim'){row.motivo_nao_execucao='';}else{row
+.placa='';row.transportadora='';row.nota='';row.laudo='';row.observacao='';}}next=edit?disk.map(item=>String(item.id)==
+=String(row.id)?row:item):[row,...disk];await write(ENVIRONMENTAL_FILE,next,H.inspecoes);const confirmed=await 
+read(ENVIRONMENTAL_FILE);if(!confirmed.some(item=>String(item.id)===String(row.id)))throw new Error('Não foi possível 
+confirmar a inspeção no CSV.');S.inspecoes=confirmed});S.editing=null;S.page='hist-inspecoes';S.message=edit?'Inspeção 
+alterada com sucesso':'Inspeção registrada com 
+sucesso';hideLoading();render();showUserResult(edit?'success':'success',edit?'Inspeção alterada com sucesso':'Inspeção 
+registrada com sucesso',edit?'A inspeção foi atualizada e persistida em inspeção fumaça preta.csv.':'A inspeção foi 
+registrada e já aparece no histórico.','','Conclusão');}catch(error){hideLoading();console.error('Falha ao salvar 
+inspeção ambiental.',error);fail(error instanceof DataScopeError?error.message:error.message||'Não foi possível salvar 
+a inspeção.')} }
+app.js:517:function scopeAmbiental(rows,user=S.user){if(!rows)return[];const 
+safe=rows.filter(Boolean);if(hasProfile(user,'Administrador'))return safe;return safe.filter(row=>{const 
+unit=String(row?.unidade||'').trim();if(hasProfile(user,'Supervisor')){const 
+supervision=String(row?.supervisao||'').trim();return 
+!supervision||supervision===String(effectiveSupervisionId(user));}return !unit||canAccessUnit(unit,user);})}
+app.js:518:async function ensureAmbientalCsv(){try{const rows=await 
+read(ENVIRONMENTAL_FILE);if(!Array.isArray(rows)||!rows.length){await write(ENVIRONMENTAL_FILE,[],H.inspecoes);return 
+true}return true}catch(error){console.error('Falha ao garantir a presença do CSV de inspeções.',error);throw error}}
+app.js:519:function ambientalStatusBadge(value){const status=String(value||'').trim();if(status==='Aprovado')return 
+'<span class="status-badge success">APROVADO</span>';if(status==='Reprovado')return '<span class="status-badge 
+danger">REPROVADO</span>';return '<span class="status-badge warning">NÃO REALIZADO</span>'}
+app.js:520:function normalizeAmbientalRow(raw={}){const row={...raw};row.realizar_monitoramento=String(row.realizar_mon
+itoramento||'Sim').trim()==='Não'?'Não':'Sim';if(row.realizar_monitoramento==='Sim'){row.motivo_nao_execucao='';}else{r
+ow.placa='';row.transportadora='';row.nota='';row.laudo='';row.observacao='';}return row}
+app.js:521:function ambientalDashboardStats(rows){const total=rows.length,realizados=rows.filter(x=>String(x.realizar_m
+onitoramento||'').trim()==='Sim').length,naoRealizados=rows.filter(x=>String(x.realizar_monitoramento||'').trim()==='Nã
+o').length,aprovados=rows.filter(x=>String(x.realizar_monitoramento||'').trim()==='Sim'&&String(x.laudo||'').trim()==='
+Aprovado').length,reprovados=rows.filter(x=>String(x.realizar_monitoramento||'').trim()==='Sim'&&String(x.laudo||'').tr
+im()==='Reprovado').length;const taxa=realizados?((aprovados/realizados)*100):0;return 
+{total,realizados,naoRealizados,aprovados,reprovados,taxa};}
+app.js:522:function ambientalDashboardChart(rows){const byDate={};for(const row of rows){const 
+key=String(row.data||'').trim();if(!key)continue;byDate[key]=(byDate[key]||0)+1}const 
+labels=Object.keys(byDate).sort().slice(-6);const values=labels.map(key=>byDate[key]||0);const 
+max=Math.max(1,...values);const bars=labels.map((label,index)=>{const 
+value=values[index],height=Math.max(8,(value/max)*100);return `<div class="ambiental-small-bar-wrap"><div 
+class="ambiental-small-bar" 
+style="height:${height}%"></div><span>${esc(label.slice(5))}</span></div>`}).join('');return labels.length?`<div 
+class="ambiental-mini-chart">${bars}</div>`:`<div class="chart-empty">Nenhum registro disponível para o período 
+selecionado.</div>`}
+app.js:523:function ambientalDashboard(){if(denyOperatorAccess())return '';const 
+rows=scopeAmbiental(S.inspecoes||[]),stats=ambientalDashboardStats(rows),period=ambientalDashboardChart(rows);const rea
+sons=ENVIRONMENTAL_REASONS.map(label=>({label,count:rows.filter(item=>String(item.motivo_nao_execucao||'').trim()===lab
+el).length})).filter(item=>item.count>0);const 
+made=rows.filter(item=>String(item.realizar_monitoramento||'').trim()==='Sim');const laudos=[['Aprovado',rows.filter(it
+em=>String(item.laudo||'').trim()==='Aprovado').length],['Reprovado',rows.filter(item=>String(item.laudo||'').trim()===
+'Reprovado').length]];return `<div class="section-block"><div class="dashboard-heading"><div><h2>MEIO AMBIENTE</h2><p 
+class="muted">Monitoramento de Fumaça Preta</p></div><span class="dashboard-period">Dados reais do 
+CSV</span></div><div class="grid metrics">${[['TOTAL DE REGISTROS',stats.total],['TOTAL DE MONITORAMENTOS 
+REALIZADOS',stats.realizados],['TOTAL DE MONITORAMENTOS NÃO REALIZADOS',stats.naoRealizados],['TOTAL DE 
+APROVADOS',stats.aprovados],['TOTAL DE REPROVADOS',stats.reprovados],['TAXA DE 
+APROVAÇÃO',`${stats.taxa.toFixed(1)}%`]].map(([label,value])=>`<div class="card metric-card"><span 
+class="metric-label">${esc(label)}</span><strong>${esc(String(value))}</strong></div>`).join('')}</div><div 
+class="corporate-dashboard-grid"><section class="card chart-card"><div class="chart-title"><div><h3>Monitoramentos por 
+período</h3><p>Evolução dos registros por data</p></div><span 
+class="chart-badge">Período</span></div>${period}</section><section class="card chart-card"><div 
+class="chart-title"><div><h3>Resultado dos Laudos</h3><p>Comparativo aprovados x reprovados</p></div><span 
+class="chart-badge">Laudos</span></div><div class="ambiental-stack">${laudos.map(([label,count])=>`<div class="ambienta
+l-legend-row"><span>${esc(label)}</span><strong>${count}</strong></div>`).join('')}</div></section></div><div 
+class="corporate-dashboard-grid"><section class="card chart-card"><div class="chart-title"><div><h3>Execução dos 
+Monitoramentos</h3><p>Realizados x não realizados</p></div><span class="chart-badge">Execução</span></div><div 
+class="ambiental-stack"><div 
+class="ambiental-legend-row"><span>Realizados</span><strong>${stats.realizados}</strong></div><div 
+class="ambiental-legend-row"><span>Não 
+realizados</span><strong>${stats.naoRealizados}</strong></div></div></section><section class="card chart-card"><div 
+class="chart-title"><div><h3>Motivos da não execução</h3><p>Distribuição dos motivos registrados</p></div><span 
+class="chart-badge">Motivos</span></div><div class="ambiental-stack">${reasons.length?reasons.map(item=>`<div 
+class="ambiental-legend-row"><span>${esc(item.label)}</span><strong>${item.count}</strong></div>`).join(''):`<div 
+class="chart-empty">Nenhum motivo registrado.</div>`}</div></section></div></div>`}
+app.js:524:function ambientalFormPage(){const x=S.editing?.kind==='ambiental'?S.editing.data||{}:{};const 
+registro=normalizeAmbientalRow(x);const isSim=String(registro.realizar_monitoramento||'Sim').trim()==='Sim';const 
+fallbackResponsavel=S.user?.nome||'';return `<div class="card"><div class="page-title"><div><h2>INSPEÇÃO 
+VEICULAR</h2><p>Monitoramento de Fumaça Preta</p></div></div><form id="ambientalForm" novalidate><input type="hidden" 
+name="id" value="${esc(registro.id||'')}"><div class="section">Informações do monitoramento</div><div 
+class="formgrid"><label class="c6"><span class="label">Data</span><input class="field" type="date" name="data" 
+value="${esc(registro.data||new Date().toISOString().slice(0,10))}" required></label><label class="c6"><span 
+class="label">Realizar Monitoramento?</span><select class="field" name="realizar_monitoramento"><option value="Sim" 
+${isSim?'selected':''}>Sim</option><option value="Não" 
+${!isSim?'selected':''}>Não</option></select></label></div>${isSim?`<div class="section">Dados do veículo</div><div 
+class="formgrid"><label class="c3"><span class="label">Placa</span><input class="field" name="placa" 
+value="${esc(registro.placa||'')}" required></label><label class="c6"><span class="label">Transportadora</span><input 
+class="field" name="transportadora" value="${esc(registro.transportadora||'')}" required></label><label 
+class="c3"><span class="label">Nota</span><input class="field" name="nota" type="number" min="0" max="10" step="0.1" 
+value="${esc(registro.nota||'')}" required></label><label class="c3"><span class="label">Laudo</span><select 
+class="field" name="laudo" required><option value="">Selecionar</option><option value="Aprovado" 
+${String(registro.laudo||'')==='Aprovado'?'selected':''}>Aprovado</option><option value="Reprovado" 
+${String(registro.laudo||'')==='Reprovado'?'selected':''}>Reprovado</option></select></label><label class="c6"><span 
+class="label">Observação</span><textarea class="field" name="observacao" rows="4" 
+required>${esc(registro.observacao||'')}</textarea></label><label class="c3"><span 
+class="label">Responsável</span><input class="field" name="responsavel" 
+value="${esc(registro.responsavel||fallbackResponsavel)}" required></label></div>`:`<div class="section">Não 
+execução</div><div class="formgrid"><label class="c12"><span class="label">Motivo da não execução</span><select 
+class="field" name="motivo_nao_execucao" required><option value="">Selecionar sua 
+resposta</option>${ENVIRONMENTAL_REASONS.map(reason=>`<option value="${esc(reason)}" ${String(registro.motivo_nao_execu
+cao||'')===reason?'selected':''}>${esc(reason)}</option>`).join('')}</select></label></div>`}<div class="row" 
+style="justify-content:flex-end;margin-top:18px"><button type="button" class="btn" 
+data-page="hist-inspecoes">Cancelar</button><button type="submit" class="btn 
+primary">${S.editing?.kind==='ambiental'?'Salvar Alterações':'Salvar Inspeção'}</button></div></form></div>`}
+app.js:525:function filteredAmbientalInspecoes(){const 
+f=S.ambientalFilters||{},query=String(f.general||'').trim().toLowerCase();const 
+rows=scopeAmbiental(S.inspecoes||[]);return rows.filter(item=>{const 
+date=String(item.data||'').trim();if(f.dateFrom&&(!date||date<f.dateFrom))return 
+false;if(f.dateTo&&(!date||date>f.dateTo))return 
+false;if(f.placa&&String(item.placa||'').toLowerCase().indexOf(String(f.placa).toLowerCase())===-1)return false;if(f.tr
+ansportadora&&String(item.transportadora||'').toLowerCase().indexOf(String(f.transportadora).toLowerCase())===-1)return
+ false;if(f.realizado&&String(item.realizar_monitoramento||'')!==f.realizado)return 
+false;if(f.laudo&&String(item.laudo||'')!==f.laudo)return false;if(f.responsavel&&String(item.responsavel||'').toLowerC
+ase().indexOf(String(f.responsavel).toLowerCase())===-1)return 
+false;if(f.unidade&&String(item.unidade||'')!==f.unidade)return 
+false;if(f.supervisao&&String(item.supervisao||'')!==f.supervisao)return false;if(query&&`${item.placa||''} 
+${item.transportadora||''} ${item.responsavel||''} ${item.observacao||''} 
+${item.motivo_nao_execucao||''}`.toLowerCase().indexOf(query)===-1)return false;return true})}
+app.js:526:function ambientalHistoryTotalPages(){const total=filteredAmbientalInspecoes().length;return 
+Math.max(1,Math.ceil(total/S.pageSize))}
+app.js:527:function pagedAmbientalInspecoes(){const rows=filteredAmbientalInspecoes();const 
+total=ambientalHistoryTotalPages();S.currentPage=Math.min(Math.max(1,S.currentPage),total);const 
+start=(S.currentPage-1)*S.pageSize;return rows.slice(start,start+S.pageSize)}
+app.js:528:function ambientalHistoryPage(){const 
+rows=pagedAmbientalInspecoes(),f=S.ambientalFilters||{},allUnits=[...new 
+Set((S.inspecoes||[]).map(item=>item.unidade).filter(Boolean))].sort(),allSupervisoes=[...new 
+Set((S.inspecoes||[]).map(item=>item.supervisao).filter(Boolean))].sort();return `<div class="row 
+between"><div><h2>HISTÓRICO DE INSPEÇÕES</h2><p class="muted">Monitoramento de Fumaça Preta</p></div><button 
+type="button" class="btn primary ambiental-new">Nova inspeção</button></div><div class="card"><div 
+class="history-filter-grid"><label><span class="label">Data inicial</span><input id="ambientalDateFrom" class="field" 
+type="date" value="${esc(f.dateFrom||'')}"></label><label><span class="label">Data final</span><input 
+id="ambientalDateTo" class="field" type="date" value="${esc(f.dateTo||'')}"></label><label><span 
+class="label">Placa</span><input id="ambientalPlaca" class="field" value="${esc(f.placa||'')}" 
+placeholder="Placa"></label><label><span class="label">Transportadora</span><input id="ambientalTransportadora" 
+class="field" value="${esc(f.transportadora||'')}" placeholder="Transportadora"></label><label><span 
+class="label">Monitoramento</span><select id="ambientalRealizado" class="field"><option value="">Todos</option><option 
+value="Sim" ${f.realizado==='Sim'?'selected':''}>Sim</option><option value="Não" 
+${f.realizado==='Não'?'selected':''}>Não</option></select></label><label><span class="label">Laudo</span><select 
+id="ambientalLaudo" class="field"><option value="">Todos</option><option value="Aprovado" 
+${f.laudo==='Aprovado'?'selected':''}>Aprovado</option><option value="Reprovado" 
+${f.laudo==='Reprovado'?'selected':''}>Reprovado</option></select></label><label><span 
+class="label">Responsável</span><input id="ambientalResponsavel" class="field" value="${esc(f.responsavel||'')}" 
+placeholder="Responsável"></label><label><span class="label">Unidade</span><select id="ambientalUnidade" 
+class="field"><option value="">Todas</option>${allUnits.map(item=>`<option value="${esc(item)}" 
+${f.unidade===item?'selected':''}>${esc(item)}</option>`).join('')}</select></label><label><span 
+class="label">Supervisão</span><select id="ambientalSupervisao" class="field"><option 
+value="">Todas</option>${allSupervisoes.map(item=>`<option value="${esc(item)}" 
+${f.supervisao===item?'selected':''}>${esc(item)}</option>`).join('')}</select></label><label 
+class="history-general"><span class="label">Pesquisa geral</span><input id="ambientalGeneral" class="field" 
+value="${esc(f.general||'')}" placeholder="Buscar registro..."></label></div><div class="row between" 
+style="margin-top:14px"><button id="clearAmbientalFilters" class="btn">Limpar filtros</button><span 
+class="muted">${filteredAmbientalInspecoes().length} registros · Página ${S.currentPage} de 
+${ambientalHistoryTotalPages()}</span></div></div><div class="card"><div class="tablewrap"><table class="table"><thead>
+<tr><th>Data</th><th>Placa</th><th>Transportadora</th><th>Monitoramento</th><th>Nota</th><th>Laudo</th><th>Responsável<
+/th><th>Ações</th></tr></thead><tbody>${rows.length?rows.map(item=>`<tr><td>${esc(item.data||'')}</td><td>${esc(item.pl
+aca||'')}</td><td>${esc(item.transportadora||'')}</td><td>${esc(item.realizar_monitoramento||'Não')}</td><td>${esc(item
+.nota||'')}</td><td>${String(item.laudo||'') ? ambientalStatusBadge(item.laudo) : ambientalStatusBadge('Não 
+realizado')}</td><td>${esc(item.responsavel||'')}</td><td class="actions"><button class="viewAmbiental" 
+data-id="${esc(item.id||'')}" title="Visualizar">👁️</button><button class="editAmbiental" 
+data-id="${esc(item.id||'')}" title="Editar">✏️</button></td></tr>`).join(''):`<tr><td colspan="8" 
+class="muted">Nenhum registro disponível para o período selecionado.</td></tr>`}</tbody></table></div><div class="row 
+between" style="margin-top:14px"><button id="ambientalPrev" class="btn" ${S.currentPage<=1?'disabled':''}>◀ 
+Anterior</button><button id="ambientalNext" class="btn" 
+${S.currentPage>=ambientalHistoryTotalPages()?'disabled':''}>Próxima ▶</button></div></div>`}
+app.js:603:function modal(){if(!S.modal)return '';const x=S.modal;if(x?.kind==='ambiental'){const 
+r=x.data||{},isSim=String(r.realizar_monitoramento||'Sim').trim()==='Sim';const details=[[`ID`,r.id],[`Data`,r.data],[`
+Monitoramento`,r.realizar_monitoramento||'Não'],[`Placa`,r.placa],[`Transportadora`,r.transportadora],[`Nota`,r.nota],[
+`Laudo`,r.laudo],[`Observação`,r.observacao],[`Motivo da não execução`,r.motivo_nao_execucao],[`Responsável`,r.responsa
+vel],[`Unidade`,r.unidade],[`Supervisão`,r.supervisao],[`Usuário do registro`,r.usuario_registro],[`Data/hora do 
+registro`,r.data_hora_registro],[`Data/hora da alteração`,r.data_hora_alteracao],[`Alterado 
+por`,r.alterado_por]];const summary=details.filter(([,value])=>String(value??'').trim()).map(([label,value])=>`<div 
+class="detail"><b>${esc(label)}</b><p>${esc(value || 'Não informado')}</p></div>`).join('');return `<div 
+class="modalbg"><div class="card modal"><button id="closeModal" class="close">×</button><h2>Inspeção veicular</h2><p 
+class="muted">Monitoramento de Fumaça Preta</p>${summary?`<div 
+class="detail-grid">${summary}</div>`:''}</div></div>`}const details=[['Protocolo',x.numero_protocolo],['Data',x.data_o
+correncia],['Hora',x.hora_ocorrencia],['Gerência',x.gerencia],['Supervisão',x.supervisao],['Unidade',x.unidade],['Área'
+,x.area],['Local específico',x.local_especifico],['Natureza',x.natureza_ocorrencia],['Vínculo',x.tipo_vinculo],['Nome 
+do envolvido',x.nome_envolvido],['Empresa',x.empresa_envolvido],['Matrícula/ID',x.matricula_id],['Telefone',x.telefone]
+,['Documento',x.documento],['Placa',x.placa_veiculo],['Prioridade',x.prioridade],['Status',x.status],['Responsável',x.r
+esponsavel_registro],['Perfil',x.perfil_registro],['Data de registro',x.data_registro]];const 
+summary=details.filter(([,v])=>String(v??'').trim()).map(([label,value])=>`<div 
+class="detail"><b>${esc(label)}</b><p>${esc(value || 'Não informado')}</p></div>`).join('');return `<div 
+class="modalbg"><div class="card modal"><button id="closeModal" class="close">×</button><h2>${esc(x.numero_protocolo 
+|| 'Ocorrência')}</h2>${summary ? `<div class="detail-grid">${summary}</div>` : ''}<div 
+class="detail"><b>Relato</b><p>${esc(x.relato_detalhado || 'Não informado')}</p></div><div 
+class="detail"><b>Providências adotadas</b><p>${esc(x.providencias_adotadas || 'Não 
+informado')}</p></div>${x.observacoes?`<div 
+class="detail"><b>Observações</b><p>${esc(x.observacoes)}</p></div>`:''}<h3>Fotos anexadas</h3><div 
+class="photo-zone">${S.existing.length||S.newPhotos.length?photos(false):'<p class="muted">Nenhuma foto 
+anexada.</p>'}</div></div></div>`}
+app.js:616:function shell(){const operator=hasProfile(S.user,'Operador'),p=getRightsForUser(S.user),occActive=['occ-reg
+ister','occ-history','occ-validation','ocorrencias'].includes(S.page),occOpen=S.occurrencesMenuOpen||occActive,envActiv
+e=['inspecao-veicular','hist-inspecoes'].includes(S.page),envOpen=S.environmentMenuOpen||envActive;let body=S.page==='d
+ashboard'?dashboard():S.page==='occ-register'?occForm():S.page==='occ-validation'?pendingValidationPage():['occ-history
+','ocorrencias'].includes(S.page)?occurrenceHistoryPage():S.page==='inspecao-veicular'?ambientalFormPage():S.page==='hi
+st-inspecoes'?ambientalHistoryPage():S.page==='chaves'?keysPage():S.page==='usuarios'?usersPage():S.page==='auditoria'?
+auditPage():S.page==='relatorios'?reportsPage():settingsPage();const menu=[`<button class="menu-btn 
+${S.page==='dashboard'?'active':''}" data-page="dashboard">Dashboard</button>`,`<button id="occurrencesMenuToggle" 
+class="menu-btn menu-parent ${occActive?'active':''}" aria-expanded="${occOpen}"><span>Ocorrências</span><span 
+class="menu-arrow ${occOpen?'open':''}">▾</span></button>`,`<div class="submenu ${occOpen?'open':''}"><button 
+class="submenu-btn ${S.page==='occ-register'?'active':''}" data-page="occ-register"><span>＋</span> Registrar 
+Ocorrência</button><button class="submenu-btn ${['occ-history','ocorrencias'].includes(S.page)?'active':''}" 
+data-page="occ-history"><span>◷</span> Histórico de Ocorrências</button><button class="submenu-btn 
+${S.page==='occ-validation'?'active':''}" data-page="occ-validation"><span>✓</span> Validação de 
+Ocorrências</button></div>`,`<button id="environmentMenuToggle" class="menu-btn menu-parent ${envActive?'active':''}" 
+aria-expanded="${envOpen}"><span>Meio Ambiente</span><span class="menu-arrow 
+${envOpen?'open':''}">▾</span></button>`,`<div class="submenu ${envOpen?'open':''}"><button class="submenu-btn 
+${S.page==='inspecao-veicular'?'active':''}" data-page="inspecao-veicular"><span>◔</span> Inspeção 
+Veicular</button><button class="submenu-btn ${S.page==='hist-inspecoes'?'active':''}" 
+data-page="hist-inspecoes"><span>◷</span> Histórico de Inspeções</button></div>`,`<button class="menu-btn 
+${S.page==='chaves'?'active':''}" data-page="chaves">Chaves</button>`,`<button class="menu-btn 
+${S.page==='relatorios'?'active':''}" data-page="relatorios">Relatórios</button>`,p.users?`<button class="menu-btn 
+${S.page==='usuarios'?'active':''}" data-page="usuarios">Usuários</button>`:'',p.audit?`<button class="menu-btn 
+${S.page==='auditoria'?'active':''}" data-page="auditoria">Auditoria</button>`:'',`<button class="menu-btn 
+${S.page==='configuracoes'?'active':''}" data-page="configuracoes">Configurações</button>`,`<button id="logout" 
+class="menu-btn">Sair</button>`].join('');return `<div class="shell"><aside class="sidebar"><div class="brand">🛡️ 
+SIGESP</div><div class="menu">${menu}</div></aside><main class="main"><header class="topbar"><b>${esc(S.user.nome)} · 
+${esc(S.user.perfil)}</b>${operator?'':'<button id="refresh" class="btn">Atualizar</button>'}</header><section class="c
+ontent">${alert()}${body}</section></main>${modal()}${userPasswordModal()}${userRemovalModal()}${successModal()}${error
+Modal()}${settingsMasterEditor()}${masterConfirmationModal()}${S.viewUrl?`<div class="viewer"><button 
+id="closeViewer">×</button><img src="${S.viewUrl}"></div>`:''}</div>${accessDeniedModal()}`}
+app.js:617:function render(){app.innerHTML=S.restoring?restoringV():S.permissionNeeded?permissionV():!S.dir?connectV():
+!S.user?loginV():shell();bind()}function download(name,rows,h){const u=URL.createObjectURL(new Blob([csv(rows,h)],{type
+:'text/csv'})),a=document.createElement('a');a.href=u;a.download=name;a.click();URL.revokeObjectURL(u)}function bind(){
+document.getElementById('select')?.addEventListener('click',selectFolder);document.getElementById('authorize')?.addEven
+tListener('click',authorizeSaved);document.getElementById('forget')?.addEventListener('click',forgetFolder);document.ge
+tElementById('login')?.addEventListener('submit',login);document.getElementById('logout')?.addEventListener('click',log
+out);document.getElementById('refresh')?.addEventListener('click',load);document.querySelectorAll('.menu-btn[data-page]
+').forEach(b=>b.onclick=()=>{cleanup();S.editing=null;S.modal=null;S.query='';S.currentPage=1;S.page=b.dataset.page;ren
+der()});document.getElementById('occurrencesMenuToggle')?.addEventListener('click',()=>{S.occurrencesMenuOpen=!S.occurr
+encesMenuOpen;render()});document.getElementById('environmentMenuToggle')?.addEventListener('click',()=>{S.environmentM
+enuOpen=!S.environmentMenuOpen;render()});document.querySelectorAll('.submenu-btn[data-page]').forEach(b=>b.onclick=()=
+>{cleanup();S.modal=null;S.query='';S.currentPage=1;S.occurrencesMenuOpen=true;S.environmentMenuOpen=true;S.page=b.data
+set.page;S.editing=b.dataset.page==='occ-register'?{}:null;render()});document.getElementById('newOcc')?.addEventListen
+er('click',openOccurrenceRegistration);document.getElementById('occForm')?.addEventListener('submit',saveOcc);document.
+getElementById('occForm')?.addEventListener('input',e=>{if(e.target.name)captureOccurrenceDraft(e.currentTarget)});docu
+ment.getElementById('occForm')?.addEventListener('change',e=>{if(e.target.name)captureOccurrenceDraft(e.currentTarget)}
+);document.getElementById('cancelOcc')?.addEventListener('click',()=>{cleanup();S.editing=null;render()});document.getE
+lementById('photos')?.addEventListener('change',x=>choose(x.target.files));document.querySelectorAll('.removeNew').forE
+ach(b=>b.onclick=()=>{captureOccurrenceDraft();const i=+b.dataset.i;URL.revokeObjectURL(S.newPhotos[i].url);S.newPhotos
+.splice(i,1);render()});document.querySelectorAll('.removeOld').forEach(b=>b.onclick=()=>{captureOccurrenceDraft();cons
+t i=+b.dataset.i,p=S.existing[i];S.removed.push(p.path);if(p.url)URL.revokeObjectURL(p.url);S.existing.splice(i,1);rend
+er()});document.querySelectorAll('.zoom').forEach(b=>b.onclick=()=>{S.viewUrl=b.dataset.url;render()});document.getElem
+entById('closeViewer')?.addEventListener('click',()=>{S.viewUrl=null;render()});document.getElementById('search')?.addE
+ventListener('input',x=>{S.query=x.target.value;S.currentPage=1;render()});document.getElementById('prevPage')?.addEven
+tListener('click',()=>{if(S.currentPage>1){S.currentPage--;render()}});document.getElementById('nextPage')?.addEventLis
+tener('click',()=>{if(S.currentPage<occurrenceTotalPages()){S.currentPage++;render()}});document.getElementById('histor
+yRegisterOccurrence')?.addEventListener('click',openOccurrenceRegistration);const updateHistoryFilter=(key,value)=>{S.h
+istoryFilters={...S.historyFilters,[key]:value};S.currentPage=1;render()};document.getElementById('historyDateFrom')?.a
+ddEventListener('change',e=>updateHistoryFilter('dateFrom',e.target.value));document.getElementById('historyDateTo')?.a
+ddEventListener('change',e=>updateHistoryFilter('dateTo',e.target.value));document.getElementById('historyNature')?.add
+EventListener('change',e=>updateHistoryFilter('nature',e.target.value));document.getElementById('historyProtocol')?.add
+EventListener('input',e=>updateHistoryFilter('protocol',e.target.value));document.getElementById('historyGeneral')?.add
+EventListener('input',e=>updateHistoryFilter('general',e.target.value));document.getElementById('clearHistoryFilters')?
+.addEventListener('click',()=>{S.historyFilters={dateFrom:'',dateTo:'',nature:'',protocol:'',general:''};S.currentPage=
+1;render()});document.getElementById('historyFirst')?.addEventListener('click',()=>{S.currentPage=1;render()});document
+.getElementById('historyPrev')?.addEventListener('click',()=>{if(S.currentPage>1){S.currentPage--;render()}});document.
+getElementById('historyNext')?.addEventListener('click',()=>{if(S.currentPage<occurrenceHistoryTotalPages()){S.currentP
+age++;render()}});document.getElementById('historyLast')?.addEventListener('click',()=>{S.currentPage=occurrenceHistory
+TotalPages();render()});document.querySelectorAll('.pdfOcc').forEach(b=>b.onclick=()=>generateOccurrencePdf(b.dataset.i
+d));document.querySelectorAll('.viewOcc').forEach(b=>b.onclick=()=>viewOcc(b.dataset.id));document.querySelectorAll('.e
+ditOcc').forEach(b=>b.onclick=()=>editOcc(b.dataset.id));document.querySelectorAll('.viewPendingOcc').forEach(b=>b.oncl
+ick=()=>viewPendingOcc(b.dataset.id));document.querySelectorAll('.validatePendingOcc').forEach(b=>b.onclick=()=>validat
+ePendingOcc(b.dataset.id));document.getElementById('closeModal')?.addEventListener('click',()=>{cleanup();S.modal=null;
+render()});document.getElementById('ambientalForm')?.addEventListener('change',e=>{if(e.target.name==='realizar_monitor
+amento'){const form=e.currentTarget;const diagn=String(new FormData(form).get('realizar_monitoramento')||'Sim');const c
+hecked=diagn==='Sim';form.querySelector('[name="placa"]').disabled=!checked;form.querySelector('[name="transportadora"]
+').disabled=!checked;form.querySelector('[name="nota"]').disabled=!checked;form.querySelector('[name="laudo"]').disable
+d=!checked;form.querySelector('[name="observacao"]').disabled=!checked;form.querySelector('[name="responsavel"]').disab
+led=!checked;form.querySelector('[name="motivo_nao_execucao"]').disabled=checked; if(!checked){[...form.elements].filte
+r(el=>['placa','transportadora','nota','laudo','observacao','responsavel'].includes(el.name)).forEach(el=>{el.required=
+false;el.value=''});}else{form.querySelector('[name="motivo_nao_execucao"]').value='';form.querySelector('[name="motivo
+_nao_execucao"]').required=false;}}});document.getElementById('ambientalForm')?.addEventListener('submit',saveAmbiental
+Inspection);document.querySelectorAll('.ambiental-new').forEach(b=>b.onclick=()=>{S.editing={kind:'ambiental',data:{rea
+lizar_monitoramento:'Sim',responsavel:S.user?.nome||''}};S.page='inspecao-veicular';render()});document.querySelectorAl
+l('.viewAmbiental').forEach(b=>b.onclick=()=>{const record=(S.inspecoes||[]).find(x=>String(x.id)===String(b.dataset.id
+));if(record){S.modal={kind:'ambiental',data:record};render()}});document.querySelectorAll('.editAmbiental').forEach(b=
+>b.onclick=()=>{const record=(S.inspecoes||[]).find(x=>String(x.id)===String(b.dataset.id));if(record){S.editing={kind:
+'ambiental',data:record};S.page='inspecao-veicular';render()}});document.getElementById('ambientalPrev')?.addEventListe
+ner('click',()=>{if(S.currentPage>1){S.currentPage--;render()}});document.getElementById('ambientalNext')?.addEventList
+ener('click',()=>{if(S.currentPage<ambientalHistoryTotalPages()){S.currentPage++;render()}});document.getElementById('c
+learAmbientalFilters')?.addEventListener('click',()=>{S.ambientalFilters={dateFrom:'',dateTo:'',placa:'',transportadora
+:'',realizado:'',laudo:'',responsavel:'',unidade:'',supervisao:'',general:''};S.currentPage=1;render()});document.getEl
+ementById('ambientalDateFrom')?.addEventListener('change',e=>{S.ambientalFilters={...S.ambientalFilters,dateFrom:e.targ
+et.value};S.currentPage=1;render()});document.getElementById('ambientalDateTo')?.addEventListener('change',e=>{S.ambien
+talFilters={...S.ambientalFilters,dateTo:e.target.value};S.currentPage=1;render()});document.getElementById('ambientalP
+laca')?.addEventListener('input',e=>{S.ambientalFilters={...S.ambientalFilters,placa:e.target.value};S.currentPage=1;re
+nder()});document.getElementById('ambientalTransportadora')?.addEventListener('input',e=>{S.ambientalFilters={...S.ambi
+entalFilters,transportadora:e.target.value};S.currentPage=1;render()});document.getElementById('ambientalRealizado')?.a
+ddEventListener('change',e=>{S.ambientalFilters={...S.ambientalFilters,realizado:e.target.value};S.currentPage=1;render
+()});document.getElementById('ambientalLaudo')?.addEventListener('change',e=>{S.ambientalFilters={...S.ambientalFilters
+,laudo:e.target.value};S.currentPage=1;render()});document.getElementById('ambientalResponsavel')?.addEventListener('in
+put',e=>{S.ambientalFilters={...S.ambientalFilters,responsavel:e.target.value};S.currentPage=1;render()});document.getE
+lementById('ambientalUnidade')?.addEventListener('change',e=>{S.ambientalFilters={...S.ambientalFilters,unidade:e.targe
+t.value};S.currentPage=1;render()});document.getElementById('ambientalSupervisao')?.addEventListener('change',e=>{S.amb
+ientalFilters={...S.ambientalFilters,supervisao:e.target.value};S.currentPage=1;render()});document.getElementById('amb
+ientalGeneral')?.addEventListener('input',e=>{S.ambientalFilters={...S.ambientalFilters,general:e.target.value};S.curre
+ntPage=1;render()});document.getElementById('userForm')?.addEventListener('submit',saveUser);document.getElementById('n
+ewUser')?.addEventListener('click',()=>{S.editing={kind:'user',data:{}};render()});document.getElementById('cancelUser'
+)?.addEventListener('click',()=>{S.editing=null;render()});document.querySelectorAll('.editUser').forEach(b=>b.onclick=
+()=>{S.editing={kind:'user',data:S.users.find(x=>x.id_usuario===b.dataset.id)};render()});document.querySelectorAll('.t
+oggleUser').forEach(b=>b.onclick=()=>toggleUser(b.dataset.id));document.getElementById('closeSuccess')?.addEventListene
+r('click',()=>{const kind=S.successPopup?.kind;S.successPopup=null;S.editing=null;S.page=kind==='pending'?'occ-validati
+on':'occ-history';render()});document.getElementById('newSuccessOccurrence')?.addEventListener('click',openOccurrenceRe
+gistration);document.getElementById('viewSuccessOccurrence')?.addEventListener('click',async()=>{const 
+id=S.successPopup?.idOcorrencia;const kind=S.successPopup?.kind;S.successPopup=null;S.editing=null;S.page=kind==='pendi
+ng'?'occ-validation':'occ-history';if(id){if(kind==='pending')await viewPendingOcc(id);else await viewOcc(id)}else 
+render()});document.getElementById('copyProtocol')?.addEventListener('click',async()=>{const 
+protocol=S.successPopup?.protocolo;if(!protocol)return;try{await 
+navigator.clipboard.writeText(protocol);S.message='Protocolo copiado.'}catch{S.message='Não foi possível copiar automat
+icamente.'}render()});document.getElementById('closeError')?.addEventListener('click',()=>{S.errorPopup=null;render()})
+;document.getElementById('keyForm')?.addEventListener('submit',saveKey);document.querySelectorAll('.editKey').forEach(b
+=>b.onclick=()=>{S.editing={kind:'key',data:S.keys.find(x=>x.id_chave===b.dataset.id)};render()});document.getElementBy
+Id('exportOcc')?.addEventListener('click',()=>download('ocorrencias.csv',scope(S.occ),H.occ));document.getElementById('
+exportKeys')?.addEventListener('click',()=>download('chaves.csv',scope(S.keys),H.keys));document.getElementById('change
+Folder')?.addEventListener('click',selectFolder);document.getElementById('forgetFolder')?.addEventListener('click',forg
+etFolder) }restoreFolder();
+
+
