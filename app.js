@@ -1753,7 +1753,7 @@ let _isPollingActive=false;
 async function smartPollSync(){
   if(typeof document!=='undefined'&&document.visibilityState==='hidden')return;
   if(isFilePickerBlockingSync()||S.folderModal)return;
-  if(S.page==='occ-register'||S.validationModal)return;
+  if(S.page==='occ-register'||S.validationModal||S.apuracaoModal)return;
   if(!S.dir||S.restoring||S.permissionNeeded)return;
   if(S.submitting)return;
   if(_isPollingActive)return;
@@ -2645,6 +2645,7 @@ async function openValidationModal(id){
 
     // Carregamento de imagens em segundo plano sem travar a interface
     loadImages(item).then(()=>{
+      if(isFilePickerBlockingSync()||_isFilePickerActive)return;
       if(S.validationModal&&(String(S.validationModal.id_ocorrencia)===normId||String(S.validationModal.id_interno)===normId||String(S.validationModal.numero_protocolo||'').trim().toUpperCase()===normId.toUpperCase())){
         render();
       }
@@ -2888,153 +2889,189 @@ async function validatePendingOcc(id,form=null){
 async function deletePendingOcc(id){
   if(hasProfile(S.user,'Operador'))return denyOperatorAccess();
   if(!canValidateOccurrence(S.user))return fail('Somente administradores e supervisores podem excluir ocorrências pendentes.');
+  
+  const normId=String(id??'').trim();
+  const prevOcc=[...(S.occ||[])];
+  const prevPending=[...(S.pending||[])];
+  
+  // Optimistic UI: Fecha o modal imediatamente e remove o registro da interface sem latência (0ms)
   S.deletePendingTarget=null;
+  S.occ=(S.occ||[]).filter(x=>String(x.id_ocorrencia||'').trim()!==normId&&(!x.id_interno||String(x.id_interno).trim()!==normId));
+  S.pending=S.occ.filter(isPendingOccurrence);
   render();
-  showLoading('Excluindo ocorrência pendente...',{kicker:'Fila de validação',title:'Excluindo...',progress:25,overlayId:'pdfProgressOverlay'});
-  try{
-    await ensureDataWritePermission();
-    await withWriteLock('occurrences',async()=>{
-      await refreshAccessContext();
-      const normId=String(id??'').trim();
-      const rawText=await fetchFreshRawCsv('ocorrencias.csv');
-      const freshRows=parseAndConsolidateCsv(rawText);
-      const target=freshRows.find(x=>String(x.id_ocorrencia||'').trim()===normId||String(x.id_interno||'').trim()===normId);
-      if(!target)throw new DataScopeError('Ocorrência pendente não encontrada.');
-      assertUnitAccess(target.unidade);
-      const nextRows=freshRows.filter(x=>String(x.id_ocorrencia||'').trim()!==normId&&(!x.id_interno||String(x.id_interno).trim()!==normId));
-      await write('ocorrencias.csv',nextRows,H.occ);
-      S.occ=nextRows.map((x,idx)=>normalizeOccurrenceRow(x,idx,nextRows)).filter(Boolean);
-      S.pending=S.occ.filter(isPendingOccurrence);
-    });
-    hideLoading();
-    render();
-    showToast('Ocorrência excluída com sucesso','success');
-  }catch(error){
-    hideLoading();
-    console.error('Falha ao excluir ocorrência pendente.',error);
-    showToast(error.message||'Não foi possível excluir a ocorrência pendente.','error','Erro na exclusão');
-  }finally{
-    hideLoading();
-  }
+  showToast('Ocorrência pendente excluída com sucesso.','success','Fila de Validação');
+
+  // Persistência assíncrona em background com rollback seguro
+  (async()=>{
+    try{
+      await ensureDataWritePermission();
+      await withWriteLock('occurrences',async()=>{
+        await refreshAccessContext();
+        const rawText=await fetchFreshRawCsv('ocorrencias.csv');
+        const freshRows=parseAndConsolidateCsv(rawText);
+        const target=freshRows.find(x=>String(x.id_ocorrencia||'').trim()===normId||String(x.id_interno||'').trim()===normId);
+        if(!target)return;
+        assertUnitAccess(target.unidade);
+        const nextRows=freshRows.filter(x=>String(x.id_ocorrencia||'').trim()!==normId&&(!x.id_interno||String(x.id_interno).trim()!==normId));
+        await write('ocorrencias.csv',nextRows,H.occ);
+      });
+    }catch(error){
+      console.error('Falha na persistência da exclusão de ocorrência pendente:',error);
+      // Rollback automático caso a persistência física falhe
+      S.occ=prevOcc;
+      S.pending=prevPending;
+      render();
+      showToast(error.message||'Não foi possível confirmar a exclusão no disco. Ocorrência restaurada.','error','Erro na exclusão');
+    }
+  })();
 }
+
 async function executeRecordDeletion(){
-if(!isAdministratorUser(S.user)){
-fail('Apenas Administradores possuem autorização para excluir registros.');
-S.deleteRecordTarget=null;
-render();
-return;
-}
-const target=S.deleteRecordTarget;
-if(!target)return;
-S.deleteRecordTarget=null;
-render();
-const {modulo,id,code}=target;
-showLoading('Gravando em auditoria e excluindo registro...',{kicker:'Auditoria Corporativa',title:`Excluindo registro de ${modulo}...`,progress:20,overlayId:'pdfProgressOverlay'});
-try{
-await ensureDataWritePermission();
-const time=now();
-const adminUser=S.user?.login||'admin';
-if(modulo==='Ocorrências'){
-await withWriteLock('occurrences',async()=>{
-const occList=await read('ocorrencias.csv');
-const original=occList.find(x=>x.id_ocorrencia===id||x.numero_protocolo===id);
-if(!original)throw new Error('Ocorrência não encontrada na base de dados.');
-const auditItem={
-id_exclusao:uid(),
-modulo_origem:'Ocorrências',
-data_hora_exclusao:time,
-administrador:adminUser,
-id_registro:original.id_ocorrencia||id,
-codigo_registro:original.numero_protocolo||code||id,
-dados_originais:JSON.stringify(original),
-motivo_exclusao:'Exclusão definitiva solicitada por Administrador'
-};
-if(window.StorageService?.appendRecord){
-await window.StorageService.appendRecord('registros_apagados.csv',auditItem,H.registros_apagados);
-}else{
-const currentDeleted=await read('registros_apagados.csv').catch(()=>[]);
-await write('registros_apagados.csv',[auditItem,...currentDeleted],H.registros_apagados);
-}
-const updatedList=occList.filter(x=>x.id_ocorrencia!==original.id_ocorrencia&&x.numero_protocolo!==original.numero_protocolo);
-S.occ=await write('ocorrencias.csv',updatedList,H.occ);
-});
-}else if(modulo==='Chaves'){
-await withWriteLock('keys',async()=>{
-const keysList=await read('chaves.csv');
-const original=keysList.find(x=>x.id_chave===id||x.codigo===id);
-if(!original)throw new Error('Chave não encontrada na base de dados.');
-const auditItem={
-id_exclusao:uid(),
-modulo_origem:'Chaves',
-data_hora_exclusao:time,
-administrador:adminUser,
-id_registro:original.id_chave||id,
-codigo_registro:original.codigo||code||id,
-dados_originais:JSON.stringify(original),
-motivo_exclusao:'Exclusão definitiva solicitada por Administrador'
-};
-if(window.StorageService?.appendRecord){
-await window.StorageService.appendRecord('registros_apagados.csv',auditItem,H.registros_apagados);
-}else{
-const currentDeleted=await read('registros_apagados.csv').catch(()=>[]);
-await write('registros_apagados.csv',[auditItem,...currentDeleted],H.registros_apagados);
-}
-const updatedKeys=keysList.filter(x=>x.id_chave!==original.id_chave);
-S.keys=await write('chaves.csv',updatedKeys,H.keys);
-});
-}else if(modulo==='Meio Ambiente'){
-await withWriteLock('ambiental',async()=>{
-const inspList=await read(ENVIRONMENTAL_FILE);
-const original=inspList.find(x=>String(x.id)===String(id));
-if(!original)throw new Error('Inspeção não encontrada na base de dados.');
-const auditItem={
-id_exclusao:uid(),
-modulo_origem:'Meio Ambiente',
-data_hora_exclusao:time,
-administrador:adminUser,
-id_registro:original.id||id,
-codigo_registro:original.placa||code||id,
-dados_originais:JSON.stringify(original),
-motivo_exclusao:'Exclusão definitiva solicitada por Administrador'
-};
-if(window.StorageService?.appendRecord){
-await window.StorageService.appendRecord('registros_apagados.csv',auditItem,H.registros_apagados);
-}else{
-const currentDeleted=await read('registros_apagados.csv').catch(()=>[]);
-await write('registros_apagados.csv',[auditItem,...currentDeleted],H.registros_apagados);
-}
-const updatedInsp=inspList.filter(x=>String(x.id)!==String(original.id));
-S.inspecoes=await write(ENVIRONMENTAL_FILE,updatedInsp,H.inspecoes);
-});
-}
-S.deletedRecords=await read('registros_apagados.csv').catch(()=>[]);
-try{
-await withWriteLock('system-audit',async()=>{
-const disk=await read('historico_sistema.csv').catch(()=>[]);
-const auditLog={
-id_auditoria:uid(),
-data_hora:time,
-usuario:adminUser,
-perfil:S.user?.perfil||'Administrador',
-modulo:modulo.toUpperCase(),
-acao:'REGISTRO_EXCLUIDO',
-id_registro:id,
-codigo_registro:code||id,
-detalhes:`Registro de ${modulo} (${code||id}) excluído e arquivado em registros_apagados.csv`
-};
-S.audits=await write('historico_sistema.csv',[auditLog,...disk],H.audit);
-});
-}catch(auditErr){
-console.warn('Registro no histórico do sistema falhou:',auditErr);
-}
-hideLoading();
-render();
-showToast(`Registro de ${modulo} excluído com sucesso e preservado em auditoria.`,'success');
-}catch(error){
-hideLoading();
-console.error('Falha ao excluir registro:',error);
-fail(error.message||'Não foi possível concluir a exclusão do registro.');
-}
+  if(!isAdministratorUser(S.user)){
+    fail('Apenas Administradores possuem autorização para excluir registros.');
+    S.deleteRecordTarget=null;
+    render();
+    return;
+  }
+  const target=S.deleteRecordTarget;
+  if(!target)return;
+  const {modulo,id,code}=target;
+
+  // Snapshot para rollback defensivo
+  const prevOcc=[...(S.occ||[])];
+  const prevPending=[...(S.pending||[])];
+  const prevKeys=[...(S.keys||[])];
+  const prevInsp=[...(S.inspecoes||[])];
+
+  // Optimistic UI: Fecha modal de confirmação imediatamente e remove da interface (0ms)
+  S.deleteRecordTarget=null;
+  if(modulo==='Ocorrências'){
+    S.occ=(S.occ||[]).filter(x=>x.id_ocorrencia!==id&&x.numero_protocolo!==id);
+    S.pending=S.occ.filter(isPendingOccurrence);
+  }else if(modulo==='Chaves'){
+    S.keys=(S.keys||[]).filter(x=>x.id_chave!==id&&x.codigo!==id);
+  }else if(modulo==='Meio Ambiente'){
+    S.inspecoes=(S.inspecoes||[]).filter(x=>String(x.id)!==String(id));
+  }
+  render();
+  showToast(`Registro de ${modulo} (${code||id}) excluído com sucesso.`,'success');
+
+  // Persistência em background (Auditoria + Exclusão nos CSVs e IndexedDB)
+  (async()=>{
+    try{
+      await ensureDataWritePermission();
+      const time=now();
+      const adminUser=S.user?.login||'admin';
+
+      if(modulo==='Ocorrências'){
+        await withWriteLock('occurrences',async()=>{
+          const occList=await read('ocorrencias.csv');
+          const original=occList.find(x=>x.id_ocorrencia===id||x.numero_protocolo===id);
+          if(!original)return;
+          const auditItem={
+            id_exclusao:uid(),
+            modulo_origem:'Ocorrências',
+            data_hora_exclusao:time,
+            administrador:adminUser,
+            id_registro:original.id_ocorrencia||id,
+            codigo_registro:original.numero_protocolo||code||id,
+            dados_originais:JSON.stringify(original),
+            motivo_exclusao:'Exclusão definitiva solicitada por Administrador'
+          };
+          if(window.StorageService?.appendRecord){
+            await window.StorageService.appendRecord('registros_apagados.csv',auditItem,H.registros_apagados);
+          }else{
+            const currentDeleted=await read('registros_apagados.csv').catch(()=>[]);
+            await write('registros_apagados.csv',[auditItem,...currentDeleted],H.registros_apagados);
+          }
+          const updatedList=occList.filter(x=>x.id_ocorrencia!==original.id_ocorrencia&&x.numero_protocolo!==original.numero_protocolo);
+          await write('ocorrencias.csv',updatedList,H.occ);
+        });
+      }else if(modulo==='Chaves'){
+        await withWriteLock('keys',async()=>{
+          const keysList=await read('chaves.csv');
+          const original=keysList.find(x=>x.id_chave===id||x.codigo===id);
+          if(!original)return;
+          const auditItem={
+            id_exclusao:uid(),
+            modulo_origem:'Chaves',
+            data_hora_exclusao:time,
+            administrador:adminUser,
+            id_registro:original.id_chave||id,
+            codigo_registro:original.codigo||code||id,
+            dados_originais:JSON.stringify(original),
+            motivo_exclusao:'Exclusão definitiva solicitada por Administrador'
+          };
+          if(window.StorageService?.appendRecord){
+            await window.StorageService.appendRecord('registros_apagados.csv',auditItem,H.registros_apagados);
+          }else{
+            const currentDeleted=await read('registros_apagados.csv').catch(()=>[]);
+            await write('registros_apagados.csv',[auditItem,...currentDeleted],H.registros_apagados);
+          }
+          const updatedKeys=keysList.filter(x=>x.id_chave!==original.id_chave);
+          await write('chaves.csv',updatedKeys,H.keys);
+        });
+      }else if(modulo==='Meio Ambiente'){
+        await withWriteLock('ambiental',async()=>{
+          const inspList=await read(ENVIRONMENTAL_FILE);
+          const original=inspList.find(x=>String(x.id)===String(id));
+          if(!original)return;
+          const auditItem={
+            id_exclusao:uid(),
+            modulo_origem:'Meio Ambiente',
+            data_hora_exclusao:time,
+            administrador:adminUser,
+            id_registro:original.id||id,
+            codigo_registro:original.placa||code||id,
+            dados_originais:JSON.stringify(original),
+            motivo_exclusao:'Exclusão definitiva solicitada por Administrador'
+          };
+          if(window.StorageService?.appendRecord){
+            await window.StorageService.appendRecord('registros_apagados.csv',auditItem,H.registros_apagados);
+          }else{
+            const currentDeleted=await read('registros_apagados.csv').catch(()=>[]);
+            await write('registros_apagados.csv',[auditItem,...currentDeleted],H.registros_apagados);
+          }
+          const updatedInsp=inspList.filter(x=>String(x.id)!==String(original.id));
+          await write(ENVIRONMENTAL_FILE,updatedInsp,H.inspecoes);
+        });
+      }
+
+      S.deletedRecords=await read('registros_apagados.csv').catch(()=>[]);
+      try{
+        await withWriteLock('system-audit',async()=>{
+          const disk=await read('historico_sistema.csv').catch(()=>[]);
+          const auditLog={
+            id_auditoria:uid(),
+            data_hora:time,
+            usuario:adminUser,
+            perfil:S.user?.perfil||'Administrador',
+            modulo:modulo.toUpperCase(),
+            acao:'REGISTRO_EXCLUIDO',
+            id_registro:id,
+            codigo_registro:code||id,
+            detalhes:`Registro de ${modulo} (${code||id}) excluído e arquivado em registros_apagados.csv`
+          };
+          S.audits=await write('historico_sistema.csv',[auditLog,...disk],H.audit);
+        });
+      }catch(auditErr){
+        console.warn('Registro no histórico do sistema falhou:',auditErr);
+      }
+    }catch(error){
+      console.error('Falha ao persistir exclusão do registro:',error);
+      // Rollback defensivo imediato
+      if(modulo==='Ocorrências'){
+        S.occ=prevOcc;
+        S.pending=prevPending;
+      }else if(modulo==='Chaves'){
+        S.keys=prevKeys;
+      }else if(modulo==='Meio Ambiente'){
+        S.inspecoes=prevInsp;
+      }
+      render();
+      showToast(error.message||'Falha ao gravar exclusão no disco. Registro restaurado.','error','Erro na exclusão');
+    }
+  })();
 }
 const ACTIVE_RESERVATION_STORAGE_KEY='SIGESP_ACTIVE_PROTOCOL_RESERVATION';
 function getTabSessionClientId(){
@@ -4664,7 +4701,7 @@ function apuracaoModal(){
             ${renderApuracaoPdfList()}
             ${totalPdfs < 3 ? `
               <div style="display:flex;align-items:center;gap:10px;margin-top:4px">
-                <input type="file" id="apuracaoPdfInput" accept=".pdf" multiple style="display:none">
+                <input type="file" id="apuracaoPdfInput" accept="application/pdf,.pdf" multiple style="display:none">
                 <button type="button" id="btnChooseApuracaoPdf" class="btn" style="background:#f1f5f9;border:1px solid #cbd5e1;font-weight:700;display:inline-flex;align-items:center;gap:6px;font-size:12.5px">
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
                   Adicionar Documento / Laudo PDF
@@ -6452,10 +6489,15 @@ function bind(){
   });
   const apuracaoPdfEl=document.getElementById('apuracaoPdfInput');
   bindFileInputGuard(apuracaoPdfEl);
-  document.getElementById('btnChooseApuracaoPdf')?.addEventListener('click',()=>{
+  document.getElementById('btnChooseApuracaoPdf')?.addEventListener('click',e=>{
+    e.preventDefault();
+    if(isFilePickerBlockingSync()||Date.now()-(_filePickerOpenedAt||0)<600)return;
     syncApuracaoFormState();
     markFilePickerOpening();
     apuracaoPdfEl?.click();
+  });
+  apuracaoPdfEl?.addEventListener('cancel',()=>{
+    markFilePickerClosed(1000);
   });
   apuracaoPdfEl?.addEventListener('change',e=>{
     markFilePickerClosed(1200);
