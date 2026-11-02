@@ -1340,8 +1340,10 @@ const connectServerFolder=connectDataFolder;
 let _isFilePickerActive=false;
 let _filePickerCooldownUntil=0;
 let _filePickerSafetyTimer=null;
+let _filePickerOpenedAt=0;
 function markFilePickerOpening(){
   _isFilePickerActive=true;
+  _filePickerOpenedAt=Date.now();
   _filePickerCooldownUntil=Date.now()+60000;
   if(_filePickerSafetyTimer)clearTimeout(_filePickerSafetyTimer);
   _filePickerSafetyTimer=setTimeout(()=>{
@@ -1751,6 +1753,7 @@ let _isPollingActive=false;
 async function smartPollSync(){
   if(typeof document!=='undefined'&&document.visibilityState==='hidden')return;
   if(isFilePickerBlockingSync()||S.folderModal)return;
+  if(S.page==='occ-register'||S.validationModal)return;
   if(!S.dir||S.restoring||S.permissionNeeded)return;
   if(S.submitting)return;
   if(_isPollingActive)return;
@@ -1972,17 +1975,22 @@ async function handleManualRefresh(){
 if(typeof window!=='undefined'){
   window.addEventListener('focus',()=>{
     if(_isFilePickerActive){
-      // Quando a janela recupera o foco após fechar/cancelar o seletor do SO, libera o bloqueio com cooldown
-      markFilePickerClosed(1500);
+      // Evita fechar prematuramente nos primeiros 1500ms (artefato comum de foco ao exibir a janela nativa do SO)
+      if(Date.now()-_filePickerOpenedAt < 1500){
+        return;
+      }
+      markFilePickerClosed(2500);
       return;
     }
     if(isFilePickerBlockingSync()||S.folderModal)return;
+    if(S.page==='occ-register'||S.validationModal)return;
     if(S.dir&&!S.submitting&&!S.restoring&&!S.permissionNeeded){
       smartPollSync().catch(()=>{});
     }
   });
   document.addEventListener('visibilitychange',()=>{
     if(isFilePickerBlockingSync()||S.folderModal)return;
+    if(S.page==='occ-register'||S.validationModal)return;
     if(document.visibilityState==='visible'&&S.dir&&!S.submitting&&!S.restoring&&!S.permissionNeeded){
       smartPollSync().catch(()=>{});
     }
@@ -2000,21 +2008,113 @@ function readOccurrenceValue(form,data,name){const field=form?.elements?.namedIt
 function cleanup(){S.newPhotos.forEach(x=>URL.revokeObjectURL(x.url));S.existing.forEach(x=>x.url&&URL.revokeObjectURL(x.url));S.newPhotos=[];S.existing=[];S.removed=[];S.viewUrl=null}
 async function image(path){try{const[p,n]=path.split('/'),root=await S.dir.getDirectoryHandle('anexos'),fd=await root.getDirectoryHandle(p),fh=await fd.getFileHandle(n),file=await fh.getFile();return{path,url:URL.createObjectURL(file),missing:0}}catch{return{path,url:'',missing:1}}}
 async function loadImages(rec){cleanup();const refs=String(rec.anexos_referencias||'').split('|').filter(Boolean).filter(p=>!/\.pdf$/i.test(p.trim()));S.existing=await Promise.all(refs.map(image))}
-async function compress(file){if(!['image/jpeg','image/png','image/webp'].includes(file.type))throw Error(`Formato inválido: ${file.name}`);const b=await createImageBitmap(file),scale=Math.min(1,WIDTH/b.width),c=document.createElement('canvas');c.width=Math.max(1,Math.round(b.width*scale));c.height=Math.max(1,Math.round(b.height*scale));const ctx=c.getContext('2d',{alpha:false});ctx.fillStyle='#fff';ctx.fillRect(0,0,c.width,c.height);ctx.drawImage(b,0,0,c.width,c.height);b.close();const blob=await new Promise((ok,no)=>c.toBlob(x=>x?ok(x):no(Error('Falha na compressão')),'image/jpeg',QUALITY));return{blob,url:URL.createObjectURL(blob),name:file.name,size:blob.size}}
+async function compress(file){
+  const fileName=String(file?.name||'').toLowerCase();
+  const fileType=String(file?.type||'').toLowerCase();
+  const isImage=fileType.startsWith('image/')||/\.(jpe?g|png|webp|bmp|jfif)$/i.test(fileName);
+  if(!isImage){
+    throw new Error(`Formato inválido ou não suportado: ${file.name}. Utilize imagens JPEG, PNG ou WebP.`);
+  }
+
+  let imgBitmap=null;
+  let imgElement=null;
+  let srcWidth=0;
+  let srcHeight=0;
+
+  try{
+    if(typeof createImageBitmap==='function'){
+      try{
+        imgBitmap=await createImageBitmap(file);
+        srcWidth=imgBitmap.width;
+        srcHeight=imgBitmap.height;
+      }catch(bmpErr){
+        console.warn('createImageBitmap falhou, usando fallback HTMLImageElement:',bmpErr);
+      }
+    }
+
+    if(!imgBitmap){
+      imgElement=await new Promise((resolve,reject)=>{
+        const img=new Image();
+        const objectUrl=URL.createObjectURL(file);
+        img.onload=()=>resolve({img,objectUrl});
+        img.onerror=()=>{
+          URL.revokeObjectURL(objectUrl);
+          reject(new Error(`Falha ao decodificar a imagem: ${file.name}`));
+        };
+        img.src=objectUrl;
+      });
+      srcWidth=imgElement.img.naturalWidth||imgElement.img.width;
+      srcHeight=imgElement.img.naturalHeight||imgElement.img.height;
+    }
+
+    if(!srcWidth||!srcHeight){
+      throw new Error(`Dimensões ilegíveis na imagem: ${file.name}`);
+    }
+
+    const scale=Math.min(1,WIDTH/srcWidth);
+    const targetW=Math.max(1,Math.round(srcWidth*scale));
+    const targetH=Math.max(1,Math.round(srcHeight*scale));
+
+    const canvas=document.createElement('canvas');
+    canvas.width=targetW;
+    canvas.height=targetH;
+
+    const ctx=canvas.getContext('2d',{alpha:false});
+    if(!ctx)throw new Error('Não foi possível obter contexto de renderização 2D.');
+    ctx.fillStyle='#ffffff';
+    ctx.fillRect(0,0,targetW,targetH);
+
+    if(imgBitmap){
+      ctx.drawImage(imgBitmap,0,0,targetW,targetH);
+    }else if(imgElement){
+      ctx.drawImage(imgElement.img,0,0,targetW,targetH);
+    }
+
+    const blob=await new Promise((ok,no)=>canvas.toBlob(x=>x?ok(x):no(new Error('Falha na compressão da imagem')),'image/jpeg',QUALITY));
+
+    // Libera imediatamente os buffers de GPU do canvas
+    canvas.width=0;
+    canvas.height=0;
+
+    return {blob,url:URL.createObjectURL(blob),name:file.name,size:blob.size};
+  }finally{
+    if(imgBitmap){
+      try{imgBitmap.close()}catch{}
+    }
+    if(imgElement){
+      try{URL.revokeObjectURL(imgElement.objectUrl)}catch{}
+      imgElement.img.src='';
+    }
+  }
+}
 async function choose(files){
-  markFilePickerClosed(1200);
+  markFilePickerClosed(2500);
   captureOccurrenceDraft();
-  const a=Array.from(files||[]);
+  const a=Array.from(files||[]).filter(f=>f&&f.size>0);
   if(!a.length)return;
   const space=MAX-S.existing.length-S.newPhotos.length;
-  if(a.length>space)return fail(`Limite de ${MAX} fotos. Restam ${space}.`);
+  if(a.length>space)return fail(`Limite de ${MAX} fotos. Restam ${space} vaga(s).`);
+
+  showLoading('Otimizando fotos selecionadas...',{kicker:'Anexos de Evidências',title:'Processando fotos...',progress:15,overlayId:'pdfProgressOverlay'});
   try{
-    const compressed=await Promise.all(a.map(f=>compress(f)));
+    const compressed=[];
+    for(let i=0;i<a.length;i++){
+      const file=a[i];
+      const percent=Math.round(((i)/a.length)*80)+10;
+      updatePdfProgress(percent,`Otimizando foto ${i+1} de ${a.length}: ${file.name}...`);
+      // Cede a thread principal para o navegador atualizar frames e responder com fluidez
+      await new Promise(r=>setTimeout(r,30));
+      const item=await compress(file);
+      compressed.push(item);
+    }
     for(const item of compressed)S.newPhotos.push(item);
-    S.message='Fotos comprimidas.';
+    S.message=`${compressed.length} foto(s) anexada(s) e otimizada(s) com sucesso.`;
+    hideLoading();
     render();
   }catch(x){
-    fail(x.message);
+    hideLoading();
+    console.error('Falha ao processar fotos selecionadas:',x);
+    fail(x.message||'Falha ao processar fotos selecionadas.');
   }
 }
 async function removeFiles(){
@@ -3653,7 +3753,7 @@ function filteredAmbientalInspecoes(){const f=S.ambientalFilters||{},rows=scopeA
 function ambientalHistoryTotalPages(){const total=filteredAmbientalInspecoes().length;return Math.max(1,Math.ceil(total/S.pageSize))}
 function pagedAmbientalInspecoes(){const rows=filteredAmbientalInspecoes();const total=ambientalHistoryTotalPages();S.currentPage=Math.min(Math.max(1,S.currentPage),total);const start=(S.currentPage-1)*S.pageSize;return rows.slice(start,start+S.pageSize)}
 function ambientalHistoryPage(){const allFiltered=filteredAmbientalInspecoes(),rows=pagedAmbientalInspecoes(),totalPages=ambientalHistoryTotalPages(),f=S.ambientalFilters||{},allUnits=[...new Set((S.inspecoes||[]).map(item=>item.unidade).filter(Boolean))].sort(),allSupervisoes=[...new Set((S.inspecoes||[]).map(item=>item.supervisao).filter(Boolean))].sort();return `<div class="row between"><div><h2>HISTÓRICO DE INSPEÇÕES</h2><p class="muted">Monitoramento de Fumaça Preta</p></div><button type="button" class="btn primary ambiental-new">Nova inspeção</button></div><div class="card"><div class="history-filter-grid"><label><span class="label">Data inicial</span><input id="ambientalDateFrom" class="field" type="date" value="${esc(f.dateFrom||'')}"></label><label><span class="label">Data final</span><input id="ambientalDateTo" class="field" type="date" value="${esc(f.dateTo||'')}"></label><label><span class="label">Placa</span><input id="ambientalPlaca" class="field" value="${esc(f.placa||'')}" placeholder="Placa"></label><label><span class="label">Transportadora</span><input id="ambientalTransportadora" class="field" value="${esc(f.transportadora||'')}" placeholder="Transportadora"></label><label><span class="label">Monitoramento</span><select id="ambientalRealizado" class="field"><option value="">Todos</option><option value="Sim" ${f.realizado==='Sim'?'selected':''}>Sim</option><option value="Não" ${f.realizado==='Não'?'selected':''}>Não</option></select></label><label><span class="label">Laudo</span><select id="ambientalLaudo" class="field"><option value="">Todos</option><option value="Aprovado" ${f.laudo==='Aprovado'?'selected':''}>Aprovado</option><option value="Reprovado" ${f.laudo==='Reprovado'?'selected':''}>Reprovado</option></select></label><label><span class="label">Responsável</span><input id="ambientalResponsavel" class="field" value="${esc(f.responsavel||'')}" placeholder="Responsável"></label><label><span class="label">Unidade</span><select id="ambientalUnidade" class="field"><option value="">Todas</option>${allUnits.map(item=>`<option value="${esc(item)}" ${f.unidade===item?'selected':''}>${esc(item)}</option>`).join('')}</select></label><label><span class="label">Supervisão</span><select id="ambientalSupervisao" class="field"><option value="">Todas</option>${allSupervisoes.map(item=>`<option value="${esc(item)}" ${f.supervisao===item?'selected':''}>${esc(item)}</option>`).join('')}</select></label><label class="history-general"><span class="label">Pesquisa geral</span><input id="ambientalGeneral" class="field" value="${esc(f.general||'')}" placeholder="Buscar registro..."></label></div><div class="row between" style="margin-top:14px"><button id="clearAmbientalFilters" class="btn">Limpar filtros</button><span class="muted">${allFiltered.length} registros · Página ${S.currentPage} de ${totalPages}</span></div></div><div class="card"><div class="tablewrap"><table class="table"><thead><tr><th>Data</th><th>Placa</th><th>Transportadora</th><th>Monitoramento</th><th>Laudo</th><th>Responsável</th><th>Ações</th></tr></thead><tbody>${rows.length?rows.map(item=>`<tr><td>${esc(item.data||'')}</td><td>${esc(item.placa||'')}</td><td>${esc(item.transportadora||'')}</td><td>${esc(item.realizar_monitoramento||'Não')}</td><td>${String(item.laudo||'') ? ambientalStatusBadge(item.laudo) : ambientalStatusBadge('Não realizado')}</td><td>${esc(formatAmbientalResponsible(item))}</td><td class="actions"><button class="viewAmbiental" data-id="${esc(item.id||'')}" title="Visualizar">👁️</button><button class="editAmbiental" data-id="${esc(item.id||'')}" title="Editar">✏️</button>${isAdministratorUser(S.user)?`<button class="deleteRecordPrompt" data-modulo="Meio Ambiente" data-id="${esc(item.id||'')}" data-code="${esc(item.placa||item.id||'Sem placa')}" data-detail="${esc(item.transportadora||'')} · ${esc(item.laudo||'Não realizado')}" title="Excluir Inspeção">🗑️</button>`:''}</td></tr>`).join(''):`<tr><td colspan="7" class="muted">Nenhum registro disponível para o período selecionado.</td></tr>`}</tbody></table></div><div class="row between" style="margin-top:14px"><button id="ambientalPrev" class="btn" ${S.currentPage<=1?'disabled':''}>◀ Anterior</button><button id="ambientalNext" class="btn" ${S.currentPage>=totalPages?'disabled':''}>Próxima ▶</button></div></div>`}
-function photos(editable){const old=S.existing.map((p,i)=>`<div class="photo">${p.missing?'<div style="height:110px;display:grid;place-items:center">Imagem não encontrada</div>':`<img class="zoom" data-url="${p.url}" src="${p.url}">`}<small>${esc(p.path)}</small>${editable?`<button type="button" class="removeOld btn" data-i="${i}">Remover</button>`:''}</div>`).join(''),fresh=S.newPhotos.map((p,i)=>`<div class="photo"><img class="zoom" data-url="${p.url}" src="${p.url}"><small>${esc(p.name)} · ${Math.round(p.size/1024)} KB</small><button type="button" class="removeNew btn" data-i="${i}">Remover</button></div>`).join(''),count=S.existing.length+S.newPhotos.length;return `<div class="photos">${old}${fresh}${editable&&count<MAX?'<label class="add-photo">📷<br>Adicionar foto<input id="photos" class="hidden" type="file" accept=".jpg,.jpeg,.png,.webp" multiple></label>':''}</div>${editable?`<p class="muted">${count} de ${MAX}. JPEG até ${WIDTH}px, qualidade ${Math.round(QUALITY*100)}%.</p>`:''}`}
+function photos(editable){const old=S.existing.map((p,i)=>`<div class="photo">${p.missing?'<div style="height:110px;display:grid;place-items:center">Imagem não encontrada</div>':`<img class="zoom" data-url="${p.url}" src="${p.url}">`}<small>${esc(p.path)}</small>${editable?`<button type="button" class="removeOld btn" data-i="${i}">Remover</button>`:''}</div>`).join(''),fresh=S.newPhotos.map((p,i)=>`<div class="photo"><img class="zoom" data-url="${p.url}" src="${p.url}"><small>${esc(p.name)} · ${Math.round(p.size/1024)} KB</small><button type="button" class="removeNew btn" data-i="${i}">Remover</button></div>`).join(''),count=S.existing.length+S.newPhotos.length;return `<div class="photos">${old}${fresh}${editable&&count<MAX?`<label for="photos" class="add-photo" role="button" tabindex="0" style="cursor:pointer">📷<br>Adicionar foto</label><input id="photos" class="hidden" type="file" accept="image/jpeg,image/png,image/webp,image/*" multiple>`:''}</div>${editable?`<p class="muted">${count} de ${MAX}. Imagens otimizadas automaticamente (até ${WIDTH}px, JPEG ${Math.round(QUALITY*100)}%).</p>`:''}`}
 function selectOptions(items,value){return items.map(item=>{const optionValue=typeof item==='string'?item:item.value,label=typeof item==='string'?item:item.label;return `<option value="${esc(optionValue)}" ${optionValue===value?'selected':''}>${esc(label)}</option>`}).join('')}
 function occForm(){
 const x=S.editing||{},availableUnits=units(),historicalUnit=unitForName(x.unidade);
@@ -6260,8 +6360,29 @@ function bind(){
   document.getElementById('occTipoVinculo')?.addEventListener('change',handleVinculoChange);
   document.getElementById('cancelOcc')?.addEventListener('click',async()=>{const wasEditingExisting=Boolean(S.editing?.id_ocorrencia);cleanup();S.occurrenceDraft=null;if(wasEditingExisting){S.editing=null;S.page=hasProfile(S.user,'Operador')?'occ-register':'occ-history';if(S.page==='occ-register'){await openOccurrenceRegistration({forceNew:false,clearDraft:true});}else{render();}}else{await openOccurrenceRegistration({forceNew:false,clearDraft:true});}});
   const photosEl=document.getElementById('photos');
+  const photosLabel=document.querySelector('label[for="photos"].add-photo, .add-photo');
   bindFileInputGuard(photosEl);
-  photosEl?.addEventListener('change',x=>{markFilePickerClosed(1200);const files=Array.from(x.target.files||[]);x.target.value='';if(files.length)void choose(files)});
+  if(photosLabel){
+    photosLabel.addEventListener('click',()=>{
+      markFilePickerOpening();
+    });
+    photosLabel.addEventListener('keydown',e=>{
+      if(e.key==='Enter'||e.key===' '){
+        e.preventDefault();
+        markFilePickerOpening();
+        photosEl?.click();
+      }
+    });
+  }
+  photosEl?.addEventListener('change',x=>{
+    markFilePickerClosed(2500);
+    const files=Array.from(x.target.files||[]);
+    x.target.value='';
+    if(files.length)void choose(files);
+  });
+  photosEl?.addEventListener('cancel',()=>{
+    markFilePickerClosed(1000);
+  });
   document.querySelectorAll('.removeNew').forEach(b=>b.onclick=()=>{captureOccurrenceDraft();const i=+b.dataset.i;URL.revokeObjectURL(S.newPhotos[i].url);S.newPhotos.splice(i,1);render()});
   document.querySelectorAll('.removeOld').forEach(b=>b.onclick=()=>{captureOccurrenceDraft();const i=+b.dataset.i,p=S.existing[i];S.removed.push(p.path);if(p.url)URL.revokeObjectURL(p.url);S.existing.splice(i,1);render()});
   document.querySelectorAll('.zoom').forEach(b=>b.onclick=()=>{S.viewUrl=b.dataset.url;render()});

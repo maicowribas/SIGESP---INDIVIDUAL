@@ -595,16 +595,18 @@ function createStorageMiddleware() {
         const effectiveMaxMtime = Math.max(batchInfo.maxMtimeMs, legacyMtime);
 
         if (knownSig && knownSig === effectiveSig) {
-          res.statusCode = 200;
-          res.setHeader('Content-Type', 'application/json; charset=utf-8');
-          res.end(JSON.stringify({
+          const respBuf = Buffer.from(JSON.stringify({
             ok: true,
             unchanged: true,
             sig: effectiveSig,
             count: batchInfo.count,
             totalSize: effectiveTotalSize,
             maxMtimeMs: effectiveMaxMtime
-          }));
+          }), 'utf8');
+          res.statusCode = 200;
+          res.setHeader('Content-Type', 'application/json; charset=utf-8');
+          res.setHeader('Content-Length', String(respBuf.length));
+          res.end(respBuf);
           return;
         }
 
@@ -638,9 +640,7 @@ function createStorageMiddleware() {
           } catch {}
         }
 
-        res.statusCode = 200;
-        res.setHeader('Content-Type', 'application/json; charset=utf-8');
-        res.end(JSON.stringify({
+        const respPayload = Buffer.from(JSON.stringify({
           ok: true,
           unchanged: false,
           sig: effectiveSig,
@@ -649,7 +649,11 @@ function createStorageMiddleware() {
           maxMtimeMs: effectiveMaxMtime,
           files: loadedFiles,
           legacyRawText
-        }));
+        }), 'utf8');
+        res.statusCode = 200;
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.setHeader('Content-Length', String(respPayload.length));
+        res.end(respPayload);
         return;
       }
 

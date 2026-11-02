@@ -1592,89 +1592,124 @@ const StorageService = (() => {
       try {
         // MODO 1: Servidor de desenvolvimento / API local (/api/storage/occurrences/batch)
         if (dir.isServer && !dir.relPath) {
-          const batchUrl = `/api/storage/occurrences/batch?knownSig=${encodeURIComponent(_lastKnownBatchSig || '')}&_t=${Date.now()}`;
-          const res = await fetch(batchUrl, {
-            method: 'GET',
-            headers: { 'Cache-Control': 'no-cache' }
-          });
+          try {
+            const batchUrl = `/api/storage/occurrences/batch?knownSig=${encodeURIComponent(_lastKnownBatchSig || '')}&_t=${Date.now()}`;
+            const res = await fetch(batchUrl, { method: 'GET' });
 
-          if (res.ok) {
-            const payload = await res.json();
-            if (payload && payload.unchanged && cached && Array.isArray(cached.rows)) {
-              const effMtime = Number(payload?.maxMtimeMs ?? payload?.mtimeMs ?? cached.mtimeMs);
-              const effSize = Number(payload?.totalSize ?? payload?.size ?? cached.size);
-              cached.mtimeMs = effMtime;
-              cached.size = effSize;
-              if (typeof window !== 'undefined' && typeof window.syncFreshCsvMeta === 'function') {
-                window.syncFreshCsvMeta(fileName, effMtime, effSize);
+            if (res.ok) {
+              const payload = await res.json();
+              if (payload && payload.unchanged && cached && Array.isArray(cached.rows)) {
+                const effMtime = Number(payload?.maxMtimeMs ?? payload?.mtimeMs ?? cached.mtimeMs);
+                const effSize = Number(payload?.totalSize ?? payload?.size ?? cached.size);
+                cached.mtimeMs = effMtime;
+                cached.size = effSize;
+                if (typeof window !== 'undefined' && typeof window.syncFreshCsvMeta === 'function') {
+                  window.syncFreshCsvMeta(fileName, effMtime, effSize);
+                }
+                return cached.rows.slice();
               }
+
+              const files = Array.isArray(payload?.files) ? payload.files : [];
+              const activeNames = new Set(files.map(f => f.name));
+              if (payload?.legacyRawText) activeNames.add('__legacy_ocorrencias.csv__');
+              for (const k of _individualOccFileCache.keys()) {
+                if (!activeNames.has(k)) _individualOccFileCache.delete(k);
+              }
+
+              let allRows = [];
+              const chunkSize = 128;
+              for (let i = 0; i < files.length; i += chunkSize) {
+                const slice = files.slice(i, i + chunkSize);
+                const decodedLists = await Promise.all(
+                  slice.map(f =>
+                    this._decryptIndividualOccurrenceText(f.name, f.rawText, f.mtimeMs, f.size).catch(err => {
+                      console.warn(`[StorageService] Ignorando arquivo de ocorrência inválido (${f.name}):`, err);
+                      return [];
+                    })
+                  )
+                );
+                for (const list of decodedLists) {
+                  for (const r of list) allRows.push(r);
+                }
+                if (i + chunkSize < files.length) {
+                  await new Promise(r => setTimeout(r, 0));
+                }
+              }
+
+              let legacyRows = [];
+              if (payload?.legacyRawText && String(payload.legacyRawText).trim()) {
+                try {
+                  legacyRows = await this._decryptIndividualOccurrenceText(
+                    '__legacy_ocorrencias.csv__',
+                    payload.legacyRawText,
+                    payload.maxMtimeMs || payload.mtimeMs,
+                    payload.totalSize || payload.size
+                  );
+                } catch (legacyDecErr) {
+                  console.warn('[StorageService] Falha ao descriptografar base legada batch:', legacyDecErr);
+                }
+              }
+
+              let consolidated;
+              if (files.length === 0 && legacyRows.length > 0) {
+                consolidated = legacyRows;
+              } else {
+                for (const r of legacyRows) allRows.push(r);
+                if (allRows.length > 5000) await new Promise(r => setTimeout(r, 0));
+                consolidated = consolidateVersionedRows(allRows);
+              }
+
+              const finalMtime = Number(payload?.maxMtimeMs ?? payload?.mtimeMs ?? Date.now());
+              const finalSize = Number(payload?.totalSize ?? payload?.size ?? 0);
+              const batchSig = String(payload?.sig || `${files.length}:${finalMtime}:${finalSize}`);
+              _lastKnownBatchSig = batchSig;
+
+              _rawFileCache.set(fileName, {
+                rawSig: batchSig,
+                rows: consolidated,
+                mtimeMs: finalMtime,
+                size: finalSize
+              });
+              if (typeof window !== 'undefined' && typeof window.syncFreshCsvMeta === 'function') {
+                window.syncFreshCsvMeta(fileName, finalMtime, finalSize);
+              }
+
+              return consolidated;
+            }
+          } catch (batchNetErr) {
+            console.warn('[StorageService] Falha na rota batch de ocorrências, acionando fallback direto:', batchNetErr);
+          }
+
+          // Fallback resiliente direto para ocorrencias.csv via readRawFileWithMeta
+          try {
+            const { rawText, mtimeMs, size } = await this.readRawFileWithMeta('ocorrencias.csv');
+            if (rawText && rawText.trim()) {
+              const legacyRows = await this._decryptIndividualOccurrenceText(
+                '__legacy_ocorrencias.csv__',
+                rawText,
+                mtimeMs,
+                size
+              );
+              const batchSig = `1:${mtimeMs}:${size}`;
+              _lastKnownBatchSig = batchSig;
+              _rawFileCache.set(fileName, {
+                rawSig: batchSig,
+                rows: legacyRows,
+                mtimeMs: mtimeMs || Date.now(),
+                size: size || rawText.length
+              });
+              if (typeof window !== 'undefined' && typeof window.syncFreshCsvMeta === 'function') {
+                window.syncFreshCsvMeta(fileName, mtimeMs, size);
+              }
+              return legacyRows;
+            }
+          } catch (directErr) {
+            console.warn('[StorageService] Falha na leitura direta de ocorrencias.csv:', directErr);
+            if (cached && Array.isArray(cached.rows)) {
               return cached.rows.slice();
             }
-
-            const files = Array.isArray(payload?.files) ? payload.files : [];
-            const activeNames = new Set(files.map(f => f.name));
-            if (payload?.legacyRawText) activeNames.add('__legacy_ocorrencias.csv__');
-            for (const k of _individualOccFileCache.keys()) {
-              if (!activeNames.has(k)) _individualOccFileCache.delete(k);
-            }
-
-            let allRows = [];
-            const chunkSize = 128;
-            for (let i = 0; i < files.length; i += chunkSize) {
-              const slice = files.slice(i, i + chunkSize);
-              const decodedLists = await Promise.all(
-                slice.map(f =>
-                  this._decryptIndividualOccurrenceText(f.name, f.rawText, f.mtimeMs, f.size).catch(err => {
-                    console.warn(`[StorageService] Ignorando arquivo de ocorrência inválido (${f.name}):`, err);
-                    return [];
-                  })
-                )
-              );
-              for (const list of decodedLists) {
-                for (const r of list) allRows.push(r);
-              }
-              if (i + chunkSize < files.length) {
-                await new Promise(r => setTimeout(r, 0));
-              }
-            }
-
-            let legacyRows = [];
-            if (payload?.legacyRawText && String(payload.legacyRawText).trim()) {
-              try {
-                legacyRows = await this._decryptIndividualOccurrenceText(
-                  '__legacy_ocorrencias.csv__',
-                  payload.legacyRawText,
-                  payload.maxMtimeMs || payload.mtimeMs,
-                  payload.totalSize || payload.size
-                );
-              } catch {}
-            }
-
-            let consolidated;
-            if (files.length === 0 && legacyRows.length > 0) {
-              consolidated = legacyRows;
-            } else {
-              for (const r of legacyRows) allRows.push(r);
-              if (allRows.length > 5000) await new Promise(r => setTimeout(r, 0));
-              consolidated = consolidateVersionedRows(allRows);
-            }
-
-            const finalMtime = Number(payload?.maxMtimeMs ?? payload?.mtimeMs ?? Date.now());
-            const finalSize = Number(payload?.totalSize ?? payload?.size ?? 0);
-            const batchSig = String(payload?.sig || `${files.length}:${finalMtime}:${finalSize}`);
-            _lastKnownBatchSig = batchSig;
-
-            _rawFileCache.set(fileName, {
-              rawSig: batchSig,
-              rows: consolidated,
-              mtimeMs: finalMtime,
-              size: finalSize
-            });
-            if (typeof window !== 'undefined' && typeof window.syncFreshCsvMeta === 'function') {
-              window.syncFreshCsvMeta(fileName, finalMtime, finalSize);
-            }
-
-            return consolidated;
+            if (options?.optional) return [];
+            throw directErr;
           }
         }
 
