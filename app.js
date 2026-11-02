@@ -2516,84 +2516,131 @@ async function persistEditedOccurrence(d,editingBeforeSubmit,photoPaths,initialD
   throw Error('Não foi possível confirmar a alteração da ocorrência.');
 }
 async function saveOcc(ev){
-ev.preventDefault();
-if(S.submitting)return;
-const form=ev.currentTarget,d=captureOccurrenceDraft(form)||{},editingBeforeSubmit={...(S.editing||{})};
-if(hasProfile(S.user,'Operador')&&d.id_ocorrencia){cleanup();S.editing={};denyOperatorAccess();return}
-let submitButton=form.querySelector('button[type="submit"],button:not([type])'),savedPhotoPaths=[],loadingShown=false,persisted=false,errorMessage='',errorCategory='Falha no salvamento';
-try{
-await refreshAccessContext();
-validateOccurrenceForm(form,d);
-if(!canRegisterOccurrence(S.user))throw Error('Usuário sem permissão para registrar ocorrências.');
-S.errorPopup=null;S.submitting=true;
-const pendingFlow=shouldQueueForValidation(),isEdit=!!d.id_ocorrencia;
-showLoading(isEdit?'Salvando alterações...':pendingFlow?'Enviando para validação...':'Salvando ocorrência...',{kicker:'Processamento corporativo',title:isEdit?'Atualizando ocorrência...':pendingFlow?'Enviando para validação...':'Salvando ocorrência...',progress:12,overlayId:'pdfProgressOverlay'});
-loadingShown=true;
-if(submitButton){submitButton.disabled=true;submitButton.textContent='Salvando...'}
-await ensureDataWritePermission();
-const time=now();
+  ev.preventDefault();
+  if(S.submitting)return;
+  const form=ev.currentTarget,d=captureOccurrenceDraft(form)||{},editingBeforeSubmit={...(S.editing||{})};
+  if(hasProfile(S.user,'Operador')&&d.id_ocorrencia){cleanup();S.editing={};denyOperatorAccess();return}
+  let submitButton=form.querySelector('button[type="submit"],button:not([type])'),savedPhotoPaths=[];
+  try{
+    await refreshAccessContext();
+    validateOccurrenceForm(form,d);
+    if(!canRegisterOccurrence(S.user))throw Error('Usuário sem permissão para registrar ocorrências.');
+    S.errorPopup=null;
+    const pendingFlow=shouldQueueForValidation(),isEdit=!!d.id_ocorrencia;
+    const time=now();
 
-let saveResult = null;
-for (let saveAttempt = 0; saveAttempt < 3; saveAttempt++) {
-  try {
-    saveResult = await withWriteLock('occurrences', async () => {
-      assertUnitAccess(d.unidade);
-      const supervision = supervisionForUnit(d.unidade);
-      if (!supervision) throw new DataScopeError('A unidade selecionada não está vinculada a uma Supervisão.');
-      let editDisk = null;
-      if (isEdit) {
-        editDisk = await read('ocorrencias.csv', { force: true });
-        const current = await CSVService.findById('ocorrencias.csv', d.id_ocorrencia, 'id_ocorrencia');
-        if (!current) throw new DataScopeError('Registro não encontrado ou sem autorização para acessá-lo.');
-        assertUnitAccess(current.unidade);
-      }
-      return isEdit
-        ? await persistEditedOccurrence(d, editingBeforeSubmit, savedPhotoPaths, editDisk)
-        : await persistNewOccurrence(d, time, savedPhotoPaths);
-    }, 0);
-    if (saveResult && (saveResult.numero_protocolo || saveResult.row?.numero_protocolo)) break;
-  } catch (saveErr) {
-    if (isOccurrenceStateConflict(saveErr) && saveAttempt < 2) {
-      console.warn(`[SIGESP] Conflito concorrente detectado, repetindo salvamento (tentativa ${saveAttempt + 2}/3)...`);
-      await new Promise(r => setTimeout(r, 80 + Math.random() * 120));
-      continue;
+    // 1. Determinação determinística de Identificadores no milissegundo 0
+    const nextIds=gerarProximoId(S.occ,S.pending);
+    const protocol=isEdit
+      ?(d.numero_protocolo||editingBeforeSubmit.numero_protocolo||nextIds.proximoProtocolo)
+      :(d.numero_protocolo||S.activeReservation?.protocol||nextIds.proximoProtocolo);
+    const idOcc=isEdit?(d.id_ocorrencia||editingBeforeSubmit.id_ocorrencia||nextIds.proximoId):(d.id_ocorrencia||nextIds.proximoId);
+    const idInt=isEdit?(d.id_interno||editingBeforeSubmit.id_interno||idOcc):(d.id_interno||gerarIdUnicoUniversal());
+    const supervision=supervisionForUnit(d.unidade);
+
+    // 2. Snapshot para Rollback defensivo em caso de falha física no disco
+    const prevOcc=[...(S.occ||[])];
+    const prevPending=[...(S.pending||[])];
+    const prevEditing=S.editing;
+    const prevNewPhotos=[...S.newPhotos];
+    const prevExisting=[...S.existing];
+    const prevRemoved=[...S.removed];
+
+    // 3. Objeto Otimista em Memória
+    const photoRefs=[...S.existing.map(x=>x.path),...S.newPhotos.map((p,idx)=>`${protocol}/foto_${String(idx+1).padStart(3,'0')}.jpg`)].filter(Boolean);
+    const optimisticRow=normalizeOccurrenceRow({
+      ...(isEdit?(editingBeforeSubmit||{}):{}),
+      ...d,
+      id_ocorrencia:String(idOcc),
+      id_interno:String(idInt),
+      numero_protocolo:String(protocol),
+      supervisao:supervision?.nome||d.supervisao||'GSP/SP',
+      status:pendingFlow?'pendente':(d.status||'Registrada'),
+      status_validacao:pendingFlow?'Pendente de validação':'Validada',
+      anexos_referencias:photoRefs.join('|'),
+      data_registro:isEdit?(editingBeforeSubmit.data_registro||time):time,
+      versao_registro:isEdit?String((+editingBeforeSubmit.versao_registro||0)+1):'1',
+      data_atualizacao:time,
+      usuario_ultima_alteracao:S.user.login,
+      responsavel_registro:isEdit?(editingBeforeSubmit.responsavel_registro||S.user.login):S.user.login
+    },0,S.occ||[]);
+
+    // 4. ATUALIZAÇÃO INSTANTÂNEA DA INTERFACE (0 ms)
+    if(isEdit){
+      S.occ=S.occ.map(x=>(String(x.id_ocorrencia)===String(idOcc)||String(x.id_interno)===String(idInt)||String(x.numero_protocolo)===String(protocol))?optimisticRow:x);
+    }else{
+      S.occ=[optimisticRow,...S.occ];
     }
-    throw saveErr;
+    S.pending=S.occ.filter(isPendingOccurrence);
+    _occFilterMemo={rowsRef:null,query:'',result:[]};
+    _histFilterMemo={rowsRef:null,filterKey:'',result:[]};
+    _dashSeriesMemo={rowsRef:null,result:null};
+
+    S.editing=null;
+    S.submitting=false;
+    cleanup();
+    S.message='';
+    S.successPopup={
+      protocolo:protocol,
+      unidade:optimisticRow.unidade,
+      dataRegistro:optimisticRow.data_registro||time,
+      usuario:S.user.login,
+      idOcorrencia:idOcc,
+      kind:pendingFlow?'pending':(isEdit?'edit':'create')
+    };
+    render();
+
+    // 5. PERSISTÊNCIA ASSÍNCRONA EM BACKGROUND COM RESILIÊNCIA E WRITE LOCK
+    (async()=>{
+      try{
+        await ensureDataWritePermission();
+        if(prevNewPhotos.length){
+          savedPhotoPaths=await savePhotos(protocol,[]);
+        }
+        if(prevRemoved.length){
+          await removeFiles();
+        }
+        await withWriteLock('occurrences',async()=>{
+          let editDisk=isEdit?await read('ocorrencias.csv',{force:true}):null;
+          let saveResult=isEdit
+            ?await persistEditedOccurrence(d,editingBeforeSubmit,savedPhotoPaths,editDisk)
+            :await persistNewOccurrence(d,time,savedPhotoPaths);
+          const row=saveResult?.row||saveResult;
+          if(row){
+            const consolidated=window.StorageService?.consolidateVersionedRows
+              ?window.StorageService.consolidateVersionedRows([...(S.occ||[]),row])
+              :[...(S.occ||[]),row];
+            S.occ=consolidated.map((x,idx)=>normalizeOccurrenceRow(x,idx,consolidated)).filter(Boolean);
+            S.pending=S.occ.filter(isPendingOccurrence);
+            if(typeof CSVService!=='undefined'){
+              CSVService.buildEntry('ocorrencias.csv',S.occ);
+            }
+            window.StorageService?.IndexedDBEngine?.saveRecordsBulkLocally('ocorrencias.csv',S.occ).catch(()=>{});
+          }
+        },0);
+      }catch(bgErr){
+        console.error('[Rollback] Falha ao persistir ocorrência no disco:',bgErr);
+        S.occ=prevOcc;
+        S.pending=prevPending;
+        S.editing=prevEditing;
+        S.newPhotos=prevNewPhotos;
+        S.existing=prevExisting;
+        S.removed=prevRemoved;
+        S.successPopup=null;
+        render();
+        showToast(bgErr.message||'Falha ao gravar no disco. Ocorrência restaurada.','error','Erro de Gravação');
+      }
+    })();
+  }catch(error){
+    S.submitting=false;
+    if(submitButton){submitButton.disabled=false;submitButton.textContent='Salvar ocorrência'}
+    if(error instanceof OccurrenceValidationError){
+      showOccurrenceValidationError(error.message,'Validação do formulário');
+    }else{
+      console.error('Falha ao validar ocorrência no SIGESP.',error);
+      showOccurrenceValidationError(occurrenceSaveErrorMessage(error),'Falha no salvamento');
+    }
   }
-}
-
-const row = saveResult?.row || saveResult;
-const nextOcc = saveResult?.nextOcc;
-if(!row||!row.numero_protocolo){
-  throw new Error('Falha na confirmação da gravação física da ocorrência.');
-}
-
-// Sincronia atômica de estado: S.occ e S.pending são atualizados SOMENTE após a gravação física confirmada
-if (Array.isArray(nextOcc)) {
-  S.occ = nextOcc;
-  S.pending = S.occ.filter(isPendingOccurrence);
-} else if (row) {
-  const consolidated = window.StorageService?.consolidateVersionedRows
-    ? window.StorageService.consolidateVersionedRows([...(S.occ||[]), row])
-    : [...(S.occ||[]), row];
-  S.occ = consolidated.map((x,idx)=>normalizeOccurrenceRow(x,idx,consolidated)).filter(Boolean);
-  S.pending = S.occ.filter(isPendingOccurrence);
-}
-
-persisted=true;S.editing=null;cleanup();S.message='';
-S.successPopup={protocolo:row.numero_protocolo,unidade:row.unidade,dataRegistro:row.data_registro||time,usuario:S.user.login,idOcorrencia:row.id_ocorrencia,kind:pendingFlow?'pending':(isEdit?'edit':'create')};
-}catch(error){
-persisted=false;S.successPopup=null;
-S.editing={...editingBeforeSubmit,...d};
-if(savedPhotoPaths.length)await removeSavedPhotos(savedPhotoPaths).catch(()=>{});
-if(error instanceof OccurrenceValidationError){errorMessage=error.message;errorCategory='Validação do formulário'}
-else{console.error('Falha ao salvar ocorrência no SIGESP.',error);errorMessage=occurrenceSaveErrorMessage(error)}
-}finally{
-S.submitting=false;
-if(submitButton&&!persisted){submitButton.disabled=false;submitButton.textContent='Salvar ocorrência'}
-if(loadingShown)hideLoading()
-}
-if(persisted)render();else showOccurrenceValidationError(errorMessage,errorCategory)
 }
 let _toastTimer=null;
 function renderToastPortal(){
@@ -2660,231 +2707,208 @@ async function savePendingDraft(form){
   if(!canValidateOccurrence(S.user))return fail('Sem permissão para alterar ocorrências pendentes.');
   const id=String(form.elements['id_ocorrencia']?.value||'').trim();
   if(!id)return;
-  showLoading('Salvando alterações...',{kicker:'Revisão de ocorrência',title:'Salvando...',progress:25,overlayId:'pdfProgressOverlay'});
-  try{
-    await ensureDataWritePermission();
-    await withWriteLock('occurrences',async()=>{
-      await refreshAccessContext();
-      const rawText=await fetchFreshRawCsv('ocorrencias.csv');
-      const occDisk=parseAndConsolidateCsv(rawText);
-      const current=occDisk.find(x=>String(x.id_ocorrencia||'').trim()===id||String(x.id_interno||'').trim()===id||String(x.numero_protocolo||'').trim()===id);
-      if(!current)throw new DataScopeError('Ocorrência pendente não encontrada.');
-      if(!isPendingOccurrence(current)){
-        throw new Error('Esta ocorrência já foi validada e não está mais na fila de validação.');
+
+  const current=(S.occ||[]).find(x=>String(x.id_ocorrencia||'').trim()===id||String(x.id_interno||'').trim()===id||String(x.numero_protocolo||'').trim()===id);
+  if(!current)return fail('Ocorrência pendente não encontrada.');
+
+  const raw=Object.fromEntries(new FormData(form));
+  if(raw.tipo_vinculo==='Grupo CSN'){
+    raw.documento='';
+    raw.gerencia_envolvido=raw.gerencia_envolvido||raw.gerencia||'';
+    raw.gerencia=raw.gerencia_envolvido;
+    raw.gerencia_geral=raw.gerencia_geral||'';
+    raw.diretoria=raw.diretoria||'';
+  }else if(raw.tipo_vinculo){
+    raw.matricula_id='';
+    raw.gerencia_envolvido='';
+    raw.gerencia='';
+    raw.gerencia_geral='';
+    raw.diretoria='';
+  }
+  const finalUnit=raw.unidade||current.unidade;
+  const linkedSupervision=supervisionForUnit(finalUnit);
+
+  // Snapshot anterior para rollback defensivo
+  const prevOcc=[...(S.occ||[])];
+  const prevPending=[...(S.pending||[])];
+  const prevNewPhotos=[...S.newPhotos];
+  const prevRemoved=[...S.removed];
+
+  const photoPaths=[...S.existing.map(x=>x.path),...S.newPhotos.map((p,idx)=>`${current.numero_protocolo}/foto_${String(idx+1).padStart(3,'0')}.jpg`)];
+  const updated={
+    ...current,
+    ...raw,
+    id_ocorrencia:current.id_ocorrencia,
+    id_interno:current.id_interno||current.id_ocorrencia,
+    numero_protocolo:current.numero_protocolo,
+    supervisao:linkedSupervision?.nome||raw.supervisao||current.supervisao,
+    unidade:finalUnit,
+    anexos_referencias:photoPaths.join('|'),
+    status:'pendente',
+    status_validacao:'Pendente de validação',
+    observacao_validacao:raw.observacoes??current.observacao_validacao??'',
+    versao_registro:String((+current.versao_registro||0)+1),
+    usuario_ultima_alteracao:S.user.login,
+    data_atualizacao:now()
+  };
+
+  // 1. ATUALIZAÇÃO INSTANTÂNEA DA INTERFACE (0 ms)
+  S.occ=S.occ.map(x=>(String(x.id_ocorrencia)===id||String(x.id_interno)===id)?updated:x);
+  S.pending=S.occ.filter(isPendingOccurrence);
+  S.validationModal=null;
+  cleanup();
+  hideLoading();
+  render();
+  showToast('Alterações salvas com sucesso','success');
+
+  // 2. PERSISTÊNCIA ASSÍNCRONA EM BACKGROUND COM WRITE LOCK
+  (async()=>{
+    try{
+      await ensureDataWritePermission();
+      let savedNew=[];
+      if(prevNewPhotos.length){
+        savedNew=await savePhotos(current.numero_protocolo,[]);
       }
-      assertUnitAccess(current.unidade);
-      const raw=Object.fromEntries(new FormData(form));
-      if(raw.tipo_vinculo==='Grupo CSN'){
-        raw.documento='';
-        raw.gerencia_envolvido=raw.gerencia_envolvido||raw.gerencia||'';
-        raw.gerencia=raw.gerencia_envolvido;
-        raw.gerencia_geral=raw.gerencia_geral||'';
-        raw.diretoria=raw.diretoria||'';
-      }else if(raw.tipo_vinculo){
-        raw.matricula_id='';
-        raw.gerencia_envolvido='';
-        raw.gerencia='';
-        raw.gerencia_geral='';
-        raw.diretoria='';
-      }
-      assertUnitAccess(raw.unidade||current.unidade);
-      const linkedSupervision=supervisionForUnit(raw.unidade||current.unidade);
-      let photoPaths=S.existing.map(x=>x.path);
-      if(S.newPhotos.length){
-        const savedNew=await savePhotos(current.numero_protocolo,[]);
-        photoPaths=[...photoPaths,...savedNew];
-      }
-      if(S.removed.length){
+      if(prevRemoved.length){
         await removeFiles();
       }
-      const updated={
-        ...current,
-        ...raw,
-        id_ocorrencia:current.id_ocorrencia,
-        id_interno:current.id_interno||current.id_ocorrencia,
-        numero_protocolo:current.numero_protocolo,
-        supervisao:linkedSupervision?.nome||raw.supervisao||current.supervisao,
-        unidade:raw.unidade||current.unidade,
-        anexos_referencias:photoPaths.join('|'),
-        status:'pendente',
-        status_validacao:'Pendente de validação',
-        observacao_validacao:raw.observacoes??current.observacao_validacao??'',
-        versao_registro:String((+current.versao_registro||0)+1),
-        usuario_ultima_alteracao:S.user.login,
-        data_atualizacao:now()
-      };
-      let savedResult=null;
-      if(window.StorageService?.appendSingleRecord){
-        savedResult=await window.StorageService.appendSingleRecord('ocorrencias.csv',updated,H.occ,{isNewRecord:false});
-      }else{
-        savedResult=await CSVService.append('ocorrencias.csv',updated,H.occ);
-      }
-      const rawCombined=savedResult?._allRows||[...occDisk,updated];
-      const consolidated=window.StorageService?.consolidateVersionedRows
-        ? window.StorageService.consolidateVersionedRows(rawCombined)
-        : rawCombined;
-      S.occ=consolidated.map((x,idx)=>normalizeOccurrenceRow(x,idx,consolidated)).filter(Boolean);
-      S.pending=S.occ.filter(isPendingOccurrence);
-    });
-    S.validationModal=null;
-    cleanup();
-    hideLoading();
-    render();
-    showToast('Alterações salvas com sucesso','success');
-  }catch(error){
-    hideLoading();
-    console.error('Falha ao salvar alterações da ocorrência pendente.',error);
-    showToast(error.message||'Não foi possível salvar as alterações da ocorrência pendente.','error','Erro ao salvar');
-  }finally{
-    hideLoading();
-  }
+      await withWriteLock('occurrences',async()=>{
+        const updatedWithPhotos={
+          ...updated,
+          anexos_referencias:[...S.existing.map(x=>x.path),...savedNew].join('|')
+        };
+        let savedResult=null;
+        if(window.StorageService?.appendSingleRecord){
+          savedResult=await window.StorageService.appendSingleRecord('ocorrencias.csv',updatedWithPhotos,H.occ,{isNewRecord:false});
+        }else{
+          savedResult=await CSVService.append('ocorrencias.csv',updatedWithPhotos,H.occ);
+        }
+        if(typeof CSVService!=='undefined'){
+          CSVService.buildEntry('ocorrencias.csv',S.occ);
+        }
+        window.StorageService?.IndexedDBEngine?.saveRecordsBulkLocally('ocorrencias.csv',S.occ).catch(()=>{});
+      });
+    }catch(err){
+      console.error('[Rollback] Falha ao persistir rascunho de validação no disco:',err);
+      S.occ=prevOcc;
+      S.pending=prevPending;
+      render();
+      showToast(err.message||'Falha ao gravar no disco. Rascunho restaurado.','error','Erro ao salvar');
+    }
+  })();
 }
 async function validatePendingOcc(id,form=null){
   if(hasProfile(S.user,'Operador'))return denyOperatorAccess();
   if(!canValidateOccurrence(S.user))return fail('Somente administradores e supervisores podem validar ocorrências.');
-  showLoading('Validando ocorrência...',{kicker:'Aprovação corporativa',title:'Validando ocorrência...',progress:18,overlayId:'pdfProgressOverlay'});
-  let wasAlreadyValidated=false;
-  try{
-    await ensureDataWritePermission();
-    await withWriteLock('occurrences',async()=>{
-      await refreshAccessContext();
-      if(!canValidateOccurrence(S.user))throw new DataScopeError('Seu perfil não pode validar ocorrências.');
 
-      const normId=String(id??'').trim();
-      const rawText=await fetchFreshRawCsv('ocorrencias.csv');
-      const freshRows=rawText?parseAndConsolidateCsv(rawText):(S.occ||[]);
-      const current=freshRows.find(x=>String(x.id_ocorrencia||'').trim()===normId||String(x.id_interno||'').trim()===normId||String(x.numero_protocolo||'').trim().toUpperCase()===normId.toUpperCase())
-        ||(S.occ||[]).find(x=>String(x.id_ocorrencia||'').trim()===normId||String(x.id_interno||'').trim()===normId||String(x.numero_protocolo||'').trim().toUpperCase()===normId.toUpperCase());
+  const normId=String(id??'').trim();
+  const current=(S.occ||[]).find(x=>String(x.id_ocorrencia||'').trim()===normId||String(x.id_interno||'').trim()===normId||String(x.numero_protocolo||'').trim().toUpperCase()===normId.toUpperCase());
+  if(!current)return fail('Ocorrência não encontrada na base de dados.');
 
-      if(!current){
-        throw new DataScopeError('Ocorrência não encontrada na base de dados.');
-      }
-
-      if(!isPendingOccurrence(current)){
-        wasAlreadyValidated=true;
-        S.validationModal=null;
-        S.occ=freshRows.map((x,idx)=>normalizeOccurrenceRow(x,idx,freshRows)).filter(Boolean);
-        S.pending=filteredPendingOccurrences();
-        cleanup();
-        render();
-        showToast('Esta ocorrência já foi validada por outro administrador.','error','Validação Concorrente');
-        return;
-      }
-
-      assertUnitAccess(current.unidade);
-      const formData=form?Object.fromEntries(new FormData(form)):{};
-      if(formData.tipo_vinculo==='Grupo CSN'){
-        formData.documento='';
-        formData.gerencia_envolvido=formData.gerencia_envolvido||formData.gerencia||'';
-        formData.gerencia=formData.gerencia_envolvido;
-        formData.gerencia_geral=formData.gerencia_geral||'';
-        formData.diretoria=formData.diretoria||'';
-      }else if(formData.tipo_vinculo){
-        formData.matricula_id='';
-        formData.gerencia_envolvido='';
-        formData.gerencia='';
-        formData.gerencia_geral='';
-        formData.diretoria='';
-      }
-      const finalUnit=formData.unidade||current.unidade;
-      assertUnitAccess(finalUnit);
-      const linkedSupervision=supervisionForUnit(finalUnit);
-      if(!isAdministratorUser(S.user)&&(!linkedSupervision||linkedSupervision.id_supervisao!==S.user.supervisao_id)){
-        throw new DataScopeError('Registro não encontrado ou sem autorização para acessá-lo.');
-      }
-      let photoPaths=S.existing.map(x=>x.path);
-      if(S.newPhotos.length){
-        const savedNew=await savePhotos(current.numero_protocolo,[]);
-        photoPaths=[...photoPaths,...savedNew];
-      }
-      if(S.removed.length){
-        await removeFiles();
-      }
-
-      // Preserva a integridade do protocolo e dos identificadores originais da ocorrência validada
-      const idIntVal=String(current.id_interno||formData.id_interno||current.id_ocorrencia||'').trim()||String(current.id_ocorrencia||'').trim();
-      const timeNow=now();
-      const updatedRow={
-        ...current,
-        ...formData,
-        id_ocorrencia:String(current.id_ocorrencia),
-        id_interno:idIntVal,
-        numero_protocolo:String(current.numero_protocolo),
-        supervisao:linkedSupervision?.nome||formData.supervisao||current.supervisao,
-        unidade:finalUnit,
-        anexos_referencias:photoPaths.join('|'),
-        status:'Registrada',
-        status_validacao:'Validada',
-        data_validacao:timeNow,
-        validado_por:S.user.login,
-        observacao_validacao:formData.observacoes||current.observacao_validacao||current.observacoes||'Aprovado pela validação',
-        versao_registro:String((+current.versao_registro||0)+1),
-        usuario_ultima_alteracao:S.user.login,
-        data_atualizacao:timeNow
-      };
-
-      let savedResult=null;
-      if(window.StorageService?.appendSingleRecord){
-        savedResult=await window.StorageService.appendSingleRecord('ocorrencias.csv',updatedRow,H.occ,{isNewRecord:false});
-      }else{
-        savedResult=await CSVService.append('ocorrencias.csv',updatedRow,H.occ);
-      }
-
-      const targetInt=String(updatedRow.id_interno||'').trim();
-      const targetOcc=String(updatedRow.id_ocorrencia||'').trim();
-      const targetProto=String(updatedRow.numero_protocolo||'').trim().toUpperCase();
-
-      const baseList=(savedResult?._allRows&&savedResult._allRows.length>0)
-        ? savedResult._allRows
-        : ((freshRows&&freshRows.length>0)?freshRows:(S.occ&&S.occ.length>0?S.occ:[]));
-      const consolidated=window.StorageService?.consolidateVersionedRows
-        ? window.StorageService.consolidateVersionedRows([...baseList,updatedRow])
-        : [...baseList,updatedRow];
-
-      S.occ=consolidated.map((x,idx)=>{
-        const xInt=String(x.id_interno||'').trim();
-        const xOcc=String(x.id_ocorrencia||'').trim();
-        const xProto=String(x.numero_protocolo||'').trim().toUpperCase();
-        const isMatch=(targetInt&&xInt&&targetInt===xInt)||
-                      (targetOcc&&xOcc&&targetOcc===xOcc)||
-                      (targetProto&&xProto&&targetProto===xProto);
-        if(isMatch){
-          return normalizeOccurrenceRow({...x,...updatedRow,status:'Registrada',status_validacao:'Validada'},idx,consolidated);
-        }
-        return normalizeOccurrenceRow(x,idx,consolidated);
-      }).filter(Boolean);
-
-      if(typeof CSVService!=='undefined'){
-        CSVService.buildEntry('ocorrencias.csv',S.occ);
-      }
-      window.StorageService?.IndexedDBEngine?.saveRecordsBulkLocally('ocorrencias.csv',S.occ).catch(()=>{});
-
-      if(window.StorageService?.processBackgroundSyncQueue){
-        await window.StorageService.processBackgroundSyncQueue().catch(()=>{});
-      }
-      const stat=await window.StorageService?.getFileStat('ocorrencias.csv').catch(()=>null);
-      if(stat){
-        _freshCsvMeta.set('ocorrencias.csv',{mtimeMs:stat.mtimeMs,size:stat.size,rawSig:''});
-      }
-
-      _apuracaoFilterMemo={rowsRef:null,fKey:'',result:[]};
-      _occFilterMemo={rowsRef:null,query:'',result:[]};
-      _histFilterMemo={rowsRef:null,filterKey:'',result:[]};
-      S.pending=filteredPendingOccurrences();
-    });
-    if(wasAlreadyValidated)return;
+  if(!isPendingOccurrence(current)){
     S.validationModal=null;
     cleanup();
-    hideLoading();
     render();
-    showToast('Ocorrência validada com sucesso','success');
-  }catch(error){
-    hideLoading();
-    console.error('Falha ao validar ocorrência no SIGESP.',error);
-    showToast(error instanceof DataScopeError?'Registro não encontrado ou sem autorização para acessá-lo.':occurrenceSaveErrorMessage(error),'error','Falha na validação');
-  }finally{
-    hideLoading();
+    showToast('Esta ocorrência já foi validada por outro administrador.','error','Validação Concorrente');
+    return;
   }
+
+  const formData=form?Object.fromEntries(new FormData(form)):{};
+  if(formData.tipo_vinculo==='Grupo CSN'){
+    formData.documento='';
+    formData.gerencia_envolvido=formData.gerencia_envolvido||formData.gerencia||'';
+    formData.gerencia=formData.gerencia_envolvido;
+    formData.gerencia_geral=formData.gerencia_geral||'';
+    formData.diretoria=formData.diretoria||'';
+  }else if(formData.tipo_vinculo){
+    formData.matricula_id='';
+    formData.gerencia_envolvido='';
+    formData.gerencia='';
+    formData.gerencia_geral='';
+    formData.diretoria='';
+  }
+  const finalUnit=formData.unidade||current.unidade;
+  const linkedSupervision=supervisionForUnit(finalUnit);
+
+  const prevOcc=[...(S.occ||[])];
+  const prevPending=[...(S.pending||[])];
+  const prevNewPhotos=[...S.newPhotos];
+  const prevRemoved=[...S.removed];
+
+  const idIntVal=String(current.id_interno||formData.id_interno||current.id_ocorrencia||'').trim()||String(current.id_ocorrencia||'').trim();
+  const timeNow=now();
+  const photoPaths=[...S.existing.map(x=>x.path),...S.newPhotos.map((p,idx)=>`${current.numero_protocolo}/foto_${String(idx+1).padStart(3,'0')}.jpg`)];
+
+  const updatedRow={
+    ...current,
+    ...formData,
+    id_ocorrencia:String(current.id_ocorrencia),
+    id_interno:idIntVal,
+    numero_protocolo:String(current.numero_protocolo),
+    supervisao:linkedSupervision?.nome||formData.supervisao||current.supervisao,
+    unidade:finalUnit,
+    anexos_referencias:photoPaths.join('|'),
+    status:'Registrada',
+    status_validacao:'Validada',
+    data_validacao:timeNow,
+    validado_por:S.user.login,
+    observacao_validacao:formData.observacoes||current.observacao_validacao||current.observacoes||'Aprovado pela validação',
+    versao_registro:String((+current.versao_registro||0)+1),
+    usuario_ultima_alteracao:S.user.login,
+    data_atualizacao:timeNow
+  };
+
+  // 1. ATUALIZAÇÃO INSTANTÂNEA DA INTERFACE (0 ms)
+  S.validationModal=null;
+  cleanup();
+  hideLoading();
+  S.occ=S.occ.map(x=>(String(x.id_ocorrencia)===normId||String(x.id_interno)===normId||String(x.numero_protocolo)===String(current.numero_protocolo))?updatedRow:x);
+  S.pending=S.occ.filter(isPendingOccurrence);
+  _apuracaoFilterMemo={rowsRef:null,fKey:'',result:[]};
+  _occFilterMemo={rowsRef:null,query:'',result:[]};
+  _histFilterMemo={rowsRef:null,filterKey:'',result:[]};
+  render();
+  showToast('Ocorrência validada com sucesso','success');
+
+  // 2. PERSISTÊNCIA ASSÍNCRONA EM BACKGROUND COM RESILIÊNCIA E WRITE LOCK
+  (async()=>{
+    try{
+      await ensureDataWritePermission();
+      let savedNew=[];
+      if(prevNewPhotos.length){
+        savedNew=await savePhotos(current.numero_protocolo,[]);
+      }
+      if(prevRemoved.length){
+        await removeFiles();
+      }
+      await withWriteLock('occurrences',async()=>{
+        const finalRow={
+          ...updatedRow,
+          anexos_referencias:[...S.existing.map(x=>x.path),...savedNew].join('|')
+        };
+        let savedResult=null;
+        if(window.StorageService?.appendSingleRecord){
+          savedResult=await window.StorageService.appendSingleRecord('ocorrencias.csv',finalRow,H.occ,{isNewRecord:false});
+        }else{
+          savedResult=await CSVService.append('ocorrencias.csv',finalRow,H.occ);
+        }
+        if(typeof CSVService!=='undefined'){
+          CSVService.buildEntry('ocorrencias.csv',S.occ);
+        }
+        window.StorageService?.IndexedDBEngine?.saveRecordsBulkLocally('ocorrencias.csv',S.occ).catch(()=>{});
+        const stat=await window.StorageService?.getFileStat('ocorrencias.csv').catch(()=>null);
+        if(stat){
+          _freshCsvMeta.set('ocorrencias.csv',{mtimeMs:stat.mtimeMs,size:stat.size,rawSig:''});
+        }
+      });
+    }catch(bgErr){
+      console.error('[Rollback] Falha ao persistir validação no disco:',bgErr);
+      S.occ=prevOcc;
+      S.pending=prevPending;
+      render();
+      showToast(bgErr.message||'Falha ao gravar validação no disco. Ocorrência restaurada.','error','Erro na Validação');
+    }
+  })();
 }
 async function deletePendingOcc(id){
   if(hasProfile(S.user,'Operador'))return denyOperatorAccess();
@@ -3354,9 +3378,162 @@ function findMasterRecord(entity,id){return masterEntityRecords(entity).find(ite
 function openMasterEditor(entity,id=''){if(!hasProfile(S.user,'Administrador')){S.accessDenied=true;return render()}const record=id?findMasterRecord(entity,id):null;S.masterConfirmation=null;S.masterEditor={entity,id,data:record?{...record}: {}};render()}
 function masterRows(entity,before,data,id){const type=entity==='supervision'?'SUPERVISAO':entity==='unit'?'UNIDADE':'';if(entity==='nature'){const current=before.find(item=>item.id_natureza===id);return before.map(item=>item.id_natureza===id?{...item,nome:data.nome,aliases:masterAliases(current?.aliases,current?.nome,data.nome)}:item).concat(current?[]:[{id_natureza:id,nome:data.nome,ativo:'1',aliases:'[]'}])}const current=before.find(item=>item.tipo===type&&item.id===id),next=before.map(item=>item.tipo===type&&item.id===id?{...item,nome:data.nome,supervisao_id:entity==='unit'?data.supervisao_id:'',aliases:entity==='unit'?masterAliases(item.aliases,item.nome,data.nome):''}:item);if(!current)next.push({tipo:type,id,nome:data.nome,supervisao_id:entity==='unit'?data.supervisao_id:'',ativo:'1',aliases:'[]'});return next}
 function masterAliases(serialized,oldName,newName){const aliases=(()=>{try{return JSON.parse(serialized||'[]')}catch{return[]}})(),values=[...aliases];if(oldName&&normalizedMasterName(oldName)!==normalizedMasterName(newName)&&!values.some(value=>normalizedMasterName(value)===normalizedMasterName(oldName)))values.push(oldName);return JSON.stringify(values)}
-async function saveMasterData(ev){ev.preventDefault();if(S.masterBusy)return;const form=ev.target,editor=S.masterEditor;if(!editor)return;S.masterBusy=true;showLoading('Salvando configuração...',{kicker:'Administração de dados mestres',title:'Salvando configuração...',progress:18,overlayId:'pdfProgressOverlay'});let success='',recordName='',failure=null;try{const data=Object.fromEntries(new FormData(form)),entity=editor.entity,id=editor.id||uid(),name=String(data.nome||'').trim();await refreshAccessContext();assertAdministrator();await ensureDataWritePermission();if(!name)throw new UserFormValidationError(`Informe o nome de ${masterEntityName(entity)}.`);await withWriteLock('organization-catalog',async()=>{const before=await read(entity==='nature'?'naturezas_ocorrencias.csv':'supervisoes_unidades.csv'),duplicate=entity==='nature'?before.some(item=>item.id_natureza!==editor.id&&normalizedMasterName(item.nome)===normalizedMasterName(name)):before.some(item=>item.tipo===(entity==='unit'?'UNIDADE':'SUPERVISAO')&&item.id!==editor.id&&normalizedMasterName(item.nome)===normalizedMasterName(name));if(duplicate)throw new UserFormValidationError(`Já existe ${entity==='nature'?'uma natureza':`uma ${masterEntityName(entity)}`} com esse nome.`);if(entity==='unit'&&!S.supervisions.some(item=>item.id_supervisao===data.supervisao_id&&activeMaster(item)))throw new UserFormValidationError('Selecione uma Supervisão ativa para a Unidade.');const after=masterRows(entity,before,{...data,nome:name},id);await commitOrganizationChange(entity==='nature'?'naturezas_ocorrencias.csv':'supervisoes_unidades.csv',entity==='nature'?H.nature:H.org,before,after,`${entity.toUpperCase()}_${editor.id?'ALTERADA':'CADASTRADA'}`,id,name);if(entity==='unit'||entity==='supervision'){setOrganizationContext(after);CSVService.buildEntry('supervisoes_unidades.csv',after);try{if(entity==='unit'){const curUnits=organizationUnits(after).map(u=>({id_unidade:u.id_unidade,nome:u.nome,id_supervisao:u.id_supervisao}));await write('unidades.csv',curUnits,H.units).catch(()=>{});}else{const curSups=organizationSupervisions(after).map(s=>({id_supervisao:s.id_supervisao,nome:s.nome}));await write('supervisoes.csv',curSups,H.supervisions).catch(()=>{});}}catch(mirrorErr){console.debug('[saveMasterData] Espelho:',mirrorErr);}}else if(entity==='nature'){S.natureCatalog=after;CSVService.buildEntry('naturezas_ocorrencias.csv',after);}recordName=name});_lastAccessCtxSig='';CSVService.invalidateCache('supervisoes_unidades.csv');CSVService.invalidateCache('naturezas_ocorrencias.csv');await refreshAccessContext();S.masterEditor=null;S.masterConfirmation=null;S.message='';success=`${masterEntityName(editor.entity)} ${editor.id?'alterada':'cadastrada'} com sucesso.`}catch(error){failure=error;console.error('Falha ao salvar configuração mestre.',error)}finally{S.masterBusy=false;hideLoading()}render();if(success)showUserResult('success',success,`${recordName} foi persistida e confirmada no CSV.`,'','Configuração salva');else{const reason=failure instanceof UserFormValidationError?failure.message:userSaveError(failure).message;showUserResult('error','Não foi possível salvar a configuração',reason,'Configurações','Configuração salva','Fechar')}}
+async function saveMasterData(ev){
+  ev.preventDefault();
+  if(S.masterBusy)return;
+  const form=ev.target,editor=S.masterEditor;
+  if(!editor)return;
+
+  const data=Object.fromEntries(new FormData(form)),entity=editor.entity,id=editor.id||uid(),name=String(data.nome||'').trim();
+  if(!name){
+    showUserResult('error','Não foi possível salvar a configuração',`Informe o nome de ${masterEntityName(entity)}.`,'Configurações','Configuração salva','Fechar');
+    return;
+  }
+
+  // Pre-validate uniqueness in-memory
+  const currentCatalog=masterEntityRecords(entity);
+  const duplicate=entity==='nature'?currentCatalog.some(item=>item.id_natureza!==editor.id&&normalizedMasterName(item.nome)===normalizedMasterName(name)):currentCatalog.some(item=>(entity==='unit'?item.id_unidade:item.id_supervisao)!==editor.id&&normalizedMasterName(item.nome)===normalizedMasterName(name));
+  if(duplicate){
+    showUserResult('error','Não foi possível salvar a configuração',`Já existe ${entity==='nature'?'uma natureza':`uma ${masterEntityName(entity)}`} com esse nome.`,'Configurações','Configuração salva','Fechar');
+    return;
+  }
+  if(entity==='unit'&&!S.supervisions.some(item=>item.id_supervisao===data.supervisao_id&&activeMaster(item))){
+    showUserResult('error','Não foi possível salvar a configuração','Selecione uma Supervisão ativa para a Unidade.','Configurações','Configuração salva','Fechar');
+    return;
+  }
+
+  // Snapshots for defensive rollback
+  const prevSupervisions=[...S.supervisions];
+  const prevUnits=[...S.unitCatalog];
+  const prevNatures=[...S.natureCatalog];
+
+  // Optimistic UI: update catalogs immediately (0ms)
+  if(entity==='nature'){
+    const current=S.natureCatalog.find(item=>item.id_natureza===id);
+    S.natureCatalog=S.natureCatalog.map(item=>item.id_natureza===id?{...item,nome:name,aliases:masterAliases(current?.aliases,current?.nome,name)}:item).concat(current?[]:[{id_natureza:id,nome:name,ativo:'1',aliases:'[]'}]);
+    CSVService.buildEntry('naturezas_ocorrencias.csv',S.natureCatalog);
+  }else if(entity==='unit'){
+    const current=S.unitCatalog.find(item=>item.id_unidade===id);
+    S.unitCatalog=S.unitCatalog.map(item=>item.id_unidade===id?{...item,nome:name,id_supervisao:data.supervisao_id,aliases:masterAliases(item.aliases,item.nome,name)}:item).concat(current?[]:[{id_unidade:id,nome:name,id_supervisao:data.supervisao_id,ativo:'1',aliases:'[]'}]);
+  }else if(entity==='supervision'){
+    const current=S.supervisions.find(item=>item.id_supervisao===id);
+    S.supervisions=S.supervisions.map(item=>item.id_supervisao===id?{...item,nome:name}:item).concat(current?[]:[{id_supervisao:id,nome:name,ativo:'1'}]);
+  }
+
+  S.masterEditor=null;
+  S.masterConfirmation=null;
+  S.message='';
+  hideLoading();
+  render();
+  showUserResult('success',`${masterEntityName(editor.entity)} ${editor.id?'alterada':'cadastrada'} com sucesso.`,`${name} foi salva com sucesso.`,'','Configuração salva');
+
+  // Background worker: persist to disk with write locks and audit trail
+  (async()=>{
+    S.masterBusy=true;
+    try{
+      await refreshAccessContext();
+      assertAdministrator();
+      await ensureDataWritePermission();
+      await withWriteLock('organization-catalog',async()=>{
+        const before=await read(entity==='nature'?'naturezas_ocorrencias.csv':'supervisoes_unidades.csv');
+        const after=masterRows(entity,before,{...data,nome:name},id);
+        await commitOrganizationChange(entity==='nature'?'naturezas_ocorrencias.csv':'supervisoes_unidades.csv',entity==='nature'?H.nature:H.org,before,after,`${entity.toUpperCase()}_${editor.id?'ALTERADA':'CADASTRADA'}`,id,name);
+        if(entity==='unit'||entity==='supervision'){
+          setOrganizationContext(after);
+          CSVService.buildEntry('supervisoes_unidades.csv',after);
+          try{
+            if(entity==='unit'){
+              const curUnits=organizationUnits(after).map(u=>({id_unidade:u.id_unidade,nome:u.nome,id_supervisao:u.id_supervisao}));
+              await write('unidades.csv',curUnits,H.units).catch(()=>{});
+            }else{
+              const curSups=organizationSupervisions(after).map(s=>({id_supervisao:s.id_supervisao,nome:s.nome}));
+              await write('supervisoes.csv',curSups,H.supervisions).catch(()=>{});
+            }
+          }catch(mirrorErr){console.debug('[saveMasterData] Espelho:',mirrorErr);}
+        }else if(entity==='nature'){
+          S.natureCatalog=after;
+          CSVService.buildEntry('naturezas_ocorrencias.csv',after);
+        }
+      });
+      _lastAccessCtxSig='';
+      CSVService.invalidateCache('supervisoes_unidades.csv');
+      CSVService.invalidateCache('naturezas_ocorrencias.csv');
+      await refreshAccessContext();
+    }catch(error){
+      console.error('Falha ao salvar configuração mestre em segundo plano:',error);
+      S.supervisions=prevSupervisions;
+      S.unitCatalog=prevUnits;
+      S.natureCatalog=prevNatures;
+      render();
+      const reason=error instanceof UserFormValidationError?error.message:userSaveError(error).message;
+      showUserResult('error','Não foi possível salvar a configuração',reason,'Configurações','Configuração salva','Fechar');
+    }finally{
+      S.masterBusy=false;
+    }
+  })();
+}
 async function requestMasterDeactivation(entity,id){if(S.masterBusy)return;S.masterBusy=true;let failure=null;try{await refreshAccessContext();assertAdministrator();const record=findMasterRecord(entity,id);if(!record)throw new OrganizationPersistenceError();const turningOn=!activeMaster(record),name=record.nome;let dependencies=[];if(entity==='supervision'){const linkedUnits=S.unitCatalog.filter(unit=>unit.id_supervisao===id),linkedUsers=S.users.filter(user=>effectiveSupervisionId(user)===id);dependencies=[`${linkedUnits.length} Unidade(s) vinculada(s)`,`${linkedUsers.length} usuário(s) vinculado(s)`]}else if(entity==='unit'){const aliasSet=new Set([name,...aliasesOf(record)].map(normalizedMasterName)),[occ,pending,keys]=await Promise.all([read('ocorrencias.csv'),read('ocorrencias_pendentes.csv',{optional:true}),read('chaves.csv')]),userCount=S.users.filter(user=>assignedUnitIds(user).includes(id)).length;let historyCount=0;for(let i=0;i<occ.length;i++)if(aliasSet.has(normalizedMasterName(occ[i].unidade)))historyCount++;for(let i=0;i<pending.length;i++)if(aliasSet.has(normalizedMasterName(pending[i].unidade)))historyCount++;const keyCount=keys.filter(item=>aliasSet.has(normalizedMasterName(item.unidade))).length;dependencies=[`${userCount} usuário(s) vinculado(s)`,`${historyCount} ocorrência(s) histórica(s)`,`${keyCount} chave(s) vinculada(s)`]}else{const aliasSet=new Set([name,...aliasesOf(record)].map(normalizedMasterName)),[occ,pending]=await Promise.all([read('ocorrencias.csv'),read('ocorrencias_pendentes.csv',{optional:true})]);let count=0;for(let i=0;i<occ.length;i++)if(aliasSet.has(normalizedMasterName(occ[i].natureza_ocorrencia)))count++;for(let i=0;i<pending.length;i++)if(aliasSet.has(normalizedMasterName(pending[i].natureza_ocorrencia)))count++;dependencies=[`${count} ocorrência(s) histórica(s)`]}S.masterConfirmation={entity,id,name,active:turningOn,dependencies:dependencies.filter(text=>!/^0 /.test(text))};if(!S.masterConfirmation.dependencies.length)S.masterConfirmation.dependencies=['Nenhuma dependência encontrada'];}catch(error){failure=error;console.error('Falha ao verificar dependências da configuração.',error);S.masterConfirmation={error:userSaveError(error).message}}finally{S.masterBusy=false}render()}
-async function deactivateMasterRecord(){if(S.masterBusy||!S.masterConfirmation||S.masterConfirmation.error)return;const confirmation=S.masterConfirmation;S.masterBusy=true;showLoading(confirmation.active?'Reativando configuração...':'Inativando configuração...',{kicker:'Administração de dados mestres',title:'Atualizando configuração...',progress:22,overlayId:'pdfProgressOverlay'});let success='',failure=null;try{await refreshAccessContext();assertAdministrator();await ensureDataWritePermission();await withWriteLock('organization-catalog',async()=>{const isNature=confirmation.entity==='nature',file=isNature?'naturezas_ocorrencias.csv':'supervisoes_unidades.csv',headers=isNature?H.nature:H.org,before=await read(file);if(confirmation.active&&confirmation.entity==='unit'){const unit=before.find(item=>item.tipo==='UNIDADE'&&item.id===confirmation.id);if(!S.supervisions.some(item=>item.id_supervisao===unit?.supervisao_id&&activeMaster(item)))throw new UserFormValidationError('Reative primeiro a Supervisão vinculada à Unidade.')}let changed=false;const nextStatus=confirmation.active?'1':'0',after=before.map(item=>{const id=isNature?item.id_natureza:item.id;if(id!==confirmation.id)return item;if(String(item.ativo??'1')!==nextStatus)changed=true;return{...item,ativo:nextStatus}});if(!changed)throw new UserFormValidationError('A configuração já está com esse status.');await commitOrganizationChange(file,headers,before,after,`${confirmation.entity.toUpperCase()}_${confirmation.active?'REATIVADA':'INATIVADA'}`,confirmation.id,confirmation.name)});await refreshAccessContext();success=`${masterEntityName(confirmation.entity)} ${confirmation.active?'reativada':'inativada'} com sucesso.`;S.masterConfirmation=null}catch(error){failure=error;console.error('Falha ao alterar status da configuração.',error)}finally{S.masterBusy=false;hideLoading()}render();if(success)showUserResult('success',success,`${confirmation.name} foi atualizada sem apagar referências históricas.`,'','Configuração atualizada');else showUserResult('error','Não foi possível atualizar a configuração',failure instanceof UserFormValidationError?failure.message:userSaveError(failure).message,'Configurações','Configuração atualizada','Fechar')}
+async function deactivateMasterRecord(){
+  if(S.masterBusy||!S.masterConfirmation||S.masterConfirmation.error)return;
+  const confirmation=S.masterConfirmation;
+
+  // Snapshots for rollback
+  const prevSupervisions=[...S.supervisions];
+  const prevUnits=[...S.unitCatalog];
+  const prevNatures=[...S.natureCatalog];
+  const nextStatus=confirmation.active?'1':'0';
+
+  // Optimistic UI: update catalogs immediately (0ms)
+  if(confirmation.entity==='nature'){
+    S.natureCatalog=S.natureCatalog.map(item=>item.id_natureza===confirmation.id?{...item,ativo:nextStatus}:item);
+    CSVService.buildEntry('naturezas_ocorrencias.csv',S.natureCatalog);
+  }else if(confirmation.entity==='unit'){
+    S.unitCatalog=S.unitCatalog.map(item=>item.id_unidade===confirmation.id?{...item,ativo:nextStatus}:item);
+  }else if(confirmation.entity==='supervision'){
+    S.supervisions=S.supervisions.map(item=>item.id_supervisao===confirmation.id?{...item,ativo:nextStatus}:item);
+  }
+
+  S.masterConfirmation=null;
+  hideLoading();
+  render();
+  showUserResult('success',`${masterEntityName(confirmation.entity)} ${confirmation.active?'reativada':'inativada'} com sucesso.`,`${confirmation.name} foi atualizada sem apagar referências históricas.`,'','Configuração atualizada');
+
+  // Background worker: persist to disk
+  (async()=>{
+    S.masterBusy=true;
+    try{
+      await refreshAccessContext();
+      assertAdministrator();
+      await ensureDataWritePermission();
+      await withWriteLock('organization-catalog',async()=>{
+        const isNature=confirmation.entity==='nature',file=isNature?'naturezas_ocorrencias.csv':'supervisoes_unidades.csv',headers=isNature?H.nature:H.org,before=await read(file);
+        if(confirmation.active&&confirmation.entity==='unit'){
+          const unit=before.find(item=>item.tipo==='UNIDADE'&&item.id===confirmation.id);
+          if(!S.supervisions.some(item=>item.id_supervisao===unit?.supervisao_id&&activeMaster(item)))throw new UserFormValidationError('Reative primeiro a Supervisão vinculada à Unidade.');
+        }
+        let changed=false;
+        const after=before.map(item=>{
+          const id=isNature?item.id_natureza:item.id;
+          if(id!==confirmation.id)return item;
+          if(String(item.ativo??'1')!==nextStatus)changed=true;
+          return{...item,ativo:nextStatus};
+        });
+        if(!changed)throw new UserFormValidationError('A configuração já está com esse status.');
+        await commitOrganizationChange(file,headers,before,after,`${confirmation.entity.toUpperCase()}_${confirmation.active?'REATIVADA':'INATIVADA'}`,confirmation.id,confirmation.name);
+      });
+      await refreshAccessContext();
+    }catch(error){
+      console.error('Falha ao alterar status da configuração em segundo plano:',error);
+      S.supervisions=prevSupervisions;
+      S.unitCatalog=prevUnits;
+      S.natureCatalog=prevNatures;
+      render();
+      showUserResult('error','Não foi possível atualizar a configuração',error instanceof UserFormValidationError?error.message:userSaveError(error).message,'Configurações','Configuração atualizada','Fechar');
+    }finally{
+      S.masterBusy=false;
+    }
+  })();
+}
 function denyUserTargetAccess(){S.userPasswordTarget=null;if(S.editing?.kind==='user')S.editing=null;S.accessDenied='user-target';render()}
 function handleUserTargetDenied(error){if(!(error instanceof UserTargetRestrictedError))return false;denyUserTargetAccess();return true}
 function userPasswordError(error){
@@ -3429,47 +3606,73 @@ throw new UserRemovalRollbackError()
 }
 }
 async function removeUser(id){
-if(userRemovalInProgress)return;
-if(!id||!canManageUsers()||S.page!=='usuarios'){showUserResult('error','Não foi possível remover o usuário','Seu perfil não possui autorização para remover este usuário.','Permissão insuficiente','','Fechar');return}
-userRemovalInProgress=true;
-showLoading('Removendo usuário...',{kicker:'Administração de usuários',title:'Removendo usuário...',progress:18,overlayId:'pdfProgressOverlay'});
-let removed=false,failure=null;
-try{
-await ensureDataWritePermission();
-await withWriteLock('users',async()=>{
-await refreshAccessContext();
-await ensureDataWritePermission();
-const users=await read('usuarios.csv'),matches=users.map((user,index)=>({user,index})).filter(entry=>entry.user.id_usuario===id);
-if(matches.length!==1)throw new UserRemovalNotFoundError();
-const{user:target,index}=matches[0];
-assertUserTargetPermission(target);
-if(!manageableUsers().some(user=>user.id_usuario===target.id_usuario))throw new UserRemovalNotFoundError();
-if(S.user.id_usuario===target.id_usuario)throw new UserRemovalBlockedError('Não é possível remover o usuário atualmente conectado.');
-const activeAdministrators=users.filter(user=>isAdministratorUser(user)&&user.status==='Ativo');
-if(isAdministratorUser(target)&&target.status==='Ativo'&&activeAdministrators.length<=1)throw new UserRemovalBlockedError('Não é possível remover o último Administrador ativo do sistema.');
-const next=users.filter(user=>user.id_usuario!==target.id_usuario);
-const confirmed=await write('usuarios.csv',next,H.users);
-if(confirmed.some(user=>user.id_usuario===target.id_usuario)||csv(confirmed,H.users)!==csv(next,H.users)){
-if(!confirmed.some(user=>user.id_usuario===target.id_usuario))await restoreRemovedUser(target,index);
-throw new UserRemovalPersistenceError()
-}
-S.users=normalizedUsers(confirmed);
-try{await auditRemovedUser(target)}catch(error){console.error('Falha ao registrar a remoção do usuário na auditoria.',error);await restoreRemovedUser(target,index);throw error instanceof UserRemovalAuditError?error:new UserRemovalAuditError()}
-});
-S.userRemovalTarget=null;S.userPasswordTarget=null;
-if(S.editing?.kind==='user'&&S.editing.data?.id_usuario===id)S.editing=null;
-removed=true
-}catch(error){
-failure=error;
-if(error instanceof UserTargetRestrictedError){denyUserRemovalTargetAccess();return}
-if(!(error instanceof UserRemovalBlockedError)&&!(error instanceof UserRemovalNotFoundError)&&!(error instanceof UserRemovalAuditError)&&!(error instanceof UserRemovalRollbackError)&&error?.name!=='UserPermissionError')console.error('Falha ao remover usuário no SIGESP.',error)
-}finally{
-userRemovalInProgress=false;
-hideLoading()
-}
-render();
-if(removed)showUserResult('success','Usuário removido com sucesso','O acesso do usuário foi removido e os registros históricos foram preservados.','','Remoção concluída');
-else showUserResult('error','Não foi possível remover o usuário',userRemovalError(failure),failure instanceof UserRemovalBlockedError?'Operação não permitida':failure?.name==='UserPermissionError'?'Permissão insuficiente':'Falha ao remover','','Fechar')
+  if(userRemovalInProgress)return;
+  if(!id||!canManageUsers()||S.page!=='usuarios'){
+    showUserResult('error','Não foi possível remover o usuário','Seu perfil não possui autorização para remover este usuário.','Permissão insuficiente','','Fechar');
+    return;
+  }
+  const target=S.users.find(user=>user.id_usuario===id);
+  if(!target){
+    showUserResult('error','Não foi possível remover o usuário','O usuário selecionado não está mais disponível. Atualize a lista e tente novamente.','Usuário indisponível','','Fechar');
+    return;
+  }
+  if(S.user?.id_usuario===target.id_usuario){
+    showUserResult('error','Não foi possível remover o usuário','Não é possível remover o usuário atualmente conectado.','Operação não permitida','','Fechar');
+    return;
+  }
+  const activeAdministrators=S.users.filter(user=>isAdministratorUser(user)&&user.status==='Ativo');
+  if(isAdministratorUser(target)&&target.status==='Ativo'&&activeAdministrators.length<=1){
+    showUserResult('error','Não foi possível remover o usuário','Não é possível remover o último Administrador ativo do sistema.','Operação não permitida','','Fechar');
+    return;
+  }
+
+  // Snapshots for defensive rollback
+  const prevUsers=[...S.users];
+  const targetIndex=S.users.findIndex(user=>user.id_usuario===id);
+
+  // Optimistic UI: remove immediately (0ms)
+  S.users=S.users.filter(user=>user.id_usuario!==id);
+  S.userRemovalTarget=null;
+  S.userPasswordTarget=null;
+  if(S.editing?.kind==='user'&&S.editing.data?.id_usuario===id)S.editing=null;
+  hideLoading();
+  render();
+  showUserResult('success','Usuário removido com sucesso','O acesso do usuário foi removido e os registros históricos foram preservados.','','Remoção concluída');
+
+  // Background worker: persist to disk with write lock and audit trail
+  (async()=>{
+    userRemovalInProgress=true;
+    try{
+      await ensureDataWritePermission();
+      await withWriteLock('users',async()=>{
+        await refreshAccessContext();
+        await ensureDataWritePermission();
+        const users=await read('usuarios.csv'),matches=users.map((user,index)=>({user,index})).filter(entry=>entry.user.id_usuario===id);
+        if(matches.length!==1)throw new UserRemovalNotFoundError();
+        const{user:diskTarget,index}=matches[0];
+        assertUserTargetPermission(diskTarget);
+        if(!manageableUsers().some(user=>user.id_usuario===diskTarget.id_usuario))throw new UserRemovalNotFoundError();
+        if(S.user.id_usuario===diskTarget.id_usuario)throw new UserRemovalBlockedError('Não é possível remover o usuário atualmente conectado.');
+        const diskAdmins=users.filter(user=>isAdministratorUser(user)&&user.status==='Ativo');
+        if(isAdministratorUser(diskTarget)&&diskTarget.status==='Ativo'&&diskAdmins.length<=1)throw new UserRemovalBlockedError('Não é possível remover o último Administrador ativo do sistema.');
+        const next=users.filter(user=>user.id_usuario!==diskTarget.id_usuario);
+        const confirmed=await write('usuarios.csv',next,H.users);
+        if(confirmed.some(user=>user.id_usuario===diskTarget.id_usuario)||csv(confirmed,H.users)!==csv(next,H.users)){
+          if(!confirmed.some(user=>user.id_usuario===diskTarget.id_usuario))await restoreRemovedUser(diskTarget,index);
+          throw new UserRemovalPersistenceError();
+        }
+        S.users=normalizedUsers(confirmed);
+        try{await auditRemovedUser(diskTarget)}catch(error){console.error('Falha ao registrar a remoção do usuário na auditoria.',error);await restoreRemovedUser(diskTarget,index);throw error instanceof UserRemovalAuditError?error:new UserRemovalAuditError()}
+      });
+    }catch(error){
+      console.error('Falha ao remover usuário em segundo plano:',error);
+      S.users=prevUsers;
+      render();
+      showUserResult('error','Não foi possível remover o usuário',userRemovalError(error),error instanceof UserRemovalBlockedError?'Operação não permitida':error?.name==='UserPermissionError'?'Permissão insuficiente':'Falha ao remover','','Fechar');
+    }finally{
+      userRemovalInProgress=false;
+    }
+  })();
 }
 async function openUserPassword(id){
 if(denyOperatorAccess()||denyUserManagement())return;
@@ -3482,133 +3685,330 @@ const target=manageableUsers().find(user=>user.id_usuario===S.userPasswordTarget
 return `<div class="modalbg popup-backdrop"><div class="card modal" style="max-width:480px"><button id="closeUserPassword" class="close" type="button" aria-label="Fechar">×</button><h2>Alterar Senha</h2><p class="muted">Usuário: ${esc(target.nome)} (${esc(target.login)})</p><form id="userPasswordForm" class="stack" novalidate><input type="hidden" name="id_usuario" value="${esc(target.id_usuario)}"><label for="newUserPassword">Nova senha</label><input id="newUserPassword" class="field" name="senha" type="password" autocomplete="new-password" required><label for="confirmUserPassword">Confirmar nova senha</label><input id="confirmUserPassword" class="field" name="confirmar_senha" type="password" autocomplete="new-password" required><div class="row"><button type="submit" class="btn primary">Salvar nova senha</button><button id="cancelUserPassword" type="button" class="btn">Cancelar</button></div></form></div></div>`
 }
 async function saveUserPassword(ev){
-ev.preventDefault();if(userPasswordInProgress)return;
-if(denyOperatorAccess()||denyUserManagement())return;
-if(!canManageUsers()){fail('Seu perfil não possui autorização para alterar senhas.');return}
-userPasswordInProgress=true;const form=ev.currentTarget,data=Object.fromEntries(new FormData(form)),id=String(data.id_usuario||'');let saved=false,saveError=null;
-try{
-await ensureDataWritePermission();
-await withWriteLock('users',async()=>{
-const disk=await read('usuarios.csv'),target=disk.find(user=>user.id_usuario===id);if(!target)throw new UserPasswordNotFoundError();assertUserTargetPermission(target);
-const password=String(data.senha||''),confirmation=String(data.confirmar_senha||'');
-if(password.length<8)throw new UserPasswordValidationError('A senha deve ter no mínimo 8 caracteres.');
-if(password!==confirmation)throw new UserPasswordValidationError('A nova senha e a confirmação não conferem.');
-const time=now(),row={...target,senha_hash:await hash(password),versao_registro:String((+target.versao_registro||0)+1),data_atualizacao:time,usuario_ultima_alteracao:S.user.login},next=disk.map(user=>user.id_usuario===id?row:user);
-const confirmed=await write('usuarios.csv',next,H.users),persisted=confirmed.find(user=>user.id_usuario===id&&user.senha_hash===row.senha_hash&&user.versao_registro===row.versao_registro);
-if(!persisted)throw new UserPasswordPersistenceError();
-S.users=confirmed;
-try{await auditUser('USUARIO_SENHA_ALTERADA',persisted,`${persisted.nome}; senha alterada`)}catch(error){
-console.error('Falha ao registrar a alteração de senha na auditoria.',error);
-try{
-const latest=await read('usuarios.csv'),current=latest.find(user=>user.id_usuario===id);if(!sameUserRecord(current,row))throw new UserRollbackError();
-const restored=latest.map(user=>user.id_usuario===id?target:user);const checked=await write('usuarios.csv',restored,H.users);
-if(!sameUserRecord(checked.find(user=>user.id_usuario===id),target))throw new UserRollbackError();S.users=checked
-}catch(rollbackError){console.error('Falha ao restaurar a senha após erro na auditoria.',rollbackError);try{S.users=await read('usuarios.csv')}catch(readError){console.error('Falha ao confirmar o estado do usuário após rollback.',readError)}throw new UserRollbackError()}
-if(error instanceof UserTargetRestrictedError)throw error;
-throw new UserPasswordAuditError()
-}
-});
-saved=true;S.userPasswordTarget=null;S.message=''
-}catch(error){saveError=error;if(!(error instanceof UserPasswordValidationError)&&!(error instanceof UserTargetRestrictedError)&&error?.name!=='UserPermissionError')console.error('Falha ao alterar a senha do usuário no SIGESP.',error)}
-finally{userPasswordInProgress=false}
-if(handleUserTargetDenied(saveError))return;
-if(saved){render();showUserResult('success','Senha alterada com sucesso','A nova senha foi salva e está disponível no sistema.','','Alteração concluída');return}
-const failure=userPasswordError(saveError);render();showUserResult('error','Não foi possível alterar a senha',failure.message,failure.category,'','Fechar')
+  ev.preventDefault();
+  if(userPasswordInProgress)return;
+  if(denyOperatorAccess()||denyUserManagement())return;
+  if(!canManageUsers()){fail('Seu perfil não possui autorização para alterar senhas.');return;}
+
+  const form=ev.currentTarget,data=Object.fromEntries(new FormData(form)),id=String(data.id_usuario||'');
+  const password=String(data.senha||''),confirmation=String(data.confirmar_senha||'');
+
+  if(password.length<8){
+    showUserResult('error','Não foi possível alterar a senha','A senha deve ter no mínimo 8 caracteres.','Validação de senha','','Fechar');
+    return;
+  }
+  if(password!==confirmation){
+    showUserResult('error','Não foi possível alterar a senha','A nova senha e a confirmação não conferem.','Validação de senha','','Fechar');
+    return;
+  }
+
+  // Snapshots for defensive rollback
+  const prevUsers=[...S.users];
+
+  // Optimistic UI: close modal immediately (0ms)
+  S.userPasswordTarget=null;
+  S.message='';
+  hideLoading();
+  render();
+  showUserResult('success','Senha alterada com sucesso','A nova senha foi salva e está disponível no sistema.','','Alteração concluída');
+
+  // Background worker: hash password, persist to disk with write lock and audit trail
+  (async()=>{
+    userPasswordInProgress=true;
+    try{
+      await ensureDataWritePermission();
+      await withWriteLock('users',async()=>{
+        const disk=await read('usuarios.csv'),target=disk.find(user=>user.id_usuario===id);
+        if(!target)throw new UserPasswordNotFoundError();
+        assertUserTargetPermission(target);
+        const time=now(),newHash=await hash(password);
+        const row={...target,senha_hash:newHash,versao_registro:String((+target.versao_registro||0)+1),data_atualizacao:time,usuario_ultima_alteracao:S.user.login};
+        const next=disk.map(user=>user.id_usuario===id?row:user);
+        const confirmed=await write('usuarios.csv',next,H.users);
+        const persisted=confirmed.find(user=>user.id_usuario===id&&user.senha_hash===row.senha_hash&&user.versao_registro===row.versao_registro);
+        if(!persisted)throw new UserPasswordPersistenceError();
+        S.users=confirmed;
+        try{await auditUser('USUARIO_SENHA_ALTERADA',persisted,`${persisted.nome}; senha alterada`)}catch(error){
+          console.error('Falha ao registrar a alteração de senha na auditoria.',error);
+          try{
+            const latest=await read('usuarios.csv'),current=latest.find(user=>user.id_usuario===id);if(!sameUserRecord(current,row))throw new UserRollbackError();
+            const restored=latest.map(user=>user.id_usuario===id?target:user);const checked=await write('usuarios.csv',restored,H.users);
+            if(!sameUserRecord(checked.find(user=>user.id_usuario===id),target))throw new UserRollbackError();S.users=checked;
+          }catch(rollbackError){console.error('Falha ao restaurar a senha após erro na auditoria.',rollbackError);throw new UserRollbackError()}
+          if(error instanceof UserTargetRestrictedError)throw error;
+          throw new UserPasswordAuditError();
+        }
+      });
+    }catch(error){
+      console.error('Falha ao alterar senha do usuário em segundo plano:',error);
+      S.users=prevUsers;
+      render();
+      const failure=userPasswordError(error);
+      showUserResult('error','Não foi possível alterar a senha',failure.message,failure.category,'','Fechar');
+    }finally{
+      userPasswordInProgress=false;
+    }
+  })();
 }
 async function saveUser(ev){
-ev.preventDefault();
-if(userSaveInProgress)return;
-if(denyOperatorAccess()||denyUserManagement())return;
-userSaveInProgress=true;
-const form=ev.currentTarget,d=captureUserDraft(form),edit=!!d.id_usuario,submitButton=form.querySelector('button[type="submit"],button:not([type])');
-let saved=false,loadingShown=false,saveError=null,persistedUser=null;
-try{
-if(!canManageUsers()){const error=Error('Sem permissão para administrar usuários.');error.name='UserPermissionError';throw error}
-await refreshAccessContext();
-const profile=canonicalPerfil(d.perfil),lockedForeignScope=Boolean(edit&&hasProfile(S.user,'Supervisor')&&S.users.some(user=>user.id_usuario===d.id_usuario&&effectiveSupervisionId(user)!==effectiveSupervisionId(S.user)&&normalizePerfil(user.perfil)===normalizePerfil(d.perfil)));
-if(profile==='Administrador'){d.supervisao_id='';d.unidades_permitidas='*'}
-else if(profile==='Supervisor'&&!lockedForeignScope)d.unidades_permitidas='';
-else if(!lockedForeignScope)d.unidades_permitidas=userUnitNames(d.unidades_permitidas).join('|');
-validateUserForm(form,d,edit);
-S.editing={kind:'user',data:{...d}};
-S.errorPopup=null;
-showLoading('Salvando usuário...',{kicker:'Processamento corporativo',title:'Salvando usuário...',progress:14,overlayId:'pdfProgressOverlay'});loadingShown=true;
-if(submitButton){submitButton.disabled=true;submitButton.textContent='Salvando...'}
-await ensureDataWritePermission();
-await withWriteLock('users',async()=>{
-const disk=await read('usuarios.csv'),time=now(),login=String(d.login).trim();
-if(edit){const target=disk.find(x=>x.id_usuario===d.id_usuario);if(!target)throw Error('Usuário não encontrado.');assertUserTargetPermission(target)}
-if(disk.some(x=>String(x.login??'').trim().toLowerCase()===login.toLowerCase()&&x.id_usuario!==d.id_usuario))throw new UserDuplicateError();
-let row,next,action;
-if(edit){
-const cur=disk.find(x=>x.id_usuario===d.id_usuario);
-if(!cur)throw Error('Usuário não encontrado.');
-assertUserTargetPermission(cur);
-if(hasProfile(S.user,'Supervisor')&&cur.supervisao_id!==S.user.supervisao_id&&(d.supervisao_id!==cur.supervisao_id||d.unidades_permitidas!==cur.unidades_permitidas||canonicalPerfil(d.perfil)!==canonicalPerfil(cur.perfil)))throw new UserFormValidationError('Supervisores podem alterar apenas os dados básicos de usuários de outras Supervisões.');
-if(cur.login==='admin'&&d.status!=='Ativo')throw Error('O administrador principal não pode ser bloqueado.');
-row={...cur,nome:String(d.nome).trim(),login,perfil:canonicalPerfil(d.perfil),unidades_permitidas:d.unidades_permitidas,supervisao_id:d.supervisao_id,status:d.status,senha_hash:cur.senha_hash,versao_registro:String((+cur.versao_registro||0)+1),data_atualizacao:time,usuario_ultima_alteracao:S.user.login};
-next=disk.map(x=>x.id_usuario===cur.id_usuario?row:x);action='USUARIO_EDITADO'
-}else{
-row={id_usuario:uid(),nome:String(d.nome).trim(),login,senha_hash:await hash(d.senha),perfil:canonicalPerfil(d.perfil),unidades_permitidas:d.unidades_permitidas,supervisao_id:d.supervisao_id,status:d.status,data_criacao:time,ultimo_acesso:'',versao_registro:'1',data_atualizacao:time,usuario_ultima_alteracao:S.user.login};
-next=[row,...disk];action='USUARIO_CADASTRADO'
-}
-const confirmed=await write('usuarios.csv',next,H.users),persisted=confirmed.find(x=>x.id_usuario===row.id_usuario&&x.login===row.login&&x.senha_hash===row.senha_hash&&x.perfil===row.perfil&&x.unidades_permitidas===row.unidades_permitidas&&x.supervisao_id===row.supervisao_id&&x.status===row.status);
-if(!persisted)throw new UserPersistenceError();
-S.users=confirmed;
-persistedUser=persisted;
-try{await auditUser(action,persisted,`${persisted.nome}; ${persisted.perfil}; ${persisted.status}`)}catch(error){
-console.error('Falha ao registrar o cadastro de usuário na auditoria.',error);
-try{
-const latest=await read('usuarios.csv'),current=latest.find(x=>x.id_usuario===row.id_usuario),original=disk.find(x=>x.id_usuario===row.id_usuario);
-let restored;
-if(edit){
-if(sameUserRecord(current,row))restored=latest.map(x=>x.id_usuario===row.id_usuario?original:x);
-else if(sameUserRecord(current,original))restored=latest;
-else throw new UserRollbackError()
-}else if(!current)restored=latest;
-else if(sameUserRecord(current,row))restored=latest.filter(x=>x.id_usuario!==row.id_usuario);
-else throw new UserRollbackError();
-const checked=csv(restored,H.users)!==csv(latest,H.users)?await write('usuarios.csv',restored,H.users):latest;
-if(csv(checked,H.users)!==csv(restored,H.users))throw new UserRollbackError();
-S.users=checked
-}catch(rollbackError){
-console.error('Falha ao desfazer o cadastro após erro na auditoria.',rollbackError);
-try{S.users=await read('usuarios.csv')}catch(readError){console.error('Falha ao verificar o estado do arquivo de usuários após o rollback.',readError)}
-throw new UserRollbackError()
-}
-throw new UserAuditError(edit?'Não foi possível registrar as alterações na auditoria. As alterações foram desfeitas; tente novamente.':'Não foi possível registrar o cadastro na auditoria. O usuário não foi cadastrado; tente novamente.')
-}
-});
-saved=true;
-if(edit&&persistedUser?.id_usuario===S.user?.id_usuario)S.user=persistedUser.status==='Ativo'?{...persistedUser,perfil:canonicalPerfil(persistedUser.perfil)}:null;
-S.editing=null;S.message='';
-}catch(error){
-saveError=error;
-if(!(error instanceof UserFormValidationError)&&!(error instanceof UserDuplicateError)&&!(error instanceof UserTargetRestrictedError)&&error?.name!=='UserPermissionError')console.error('Falha ao salvar usuário no SIGESP.',error);
-S.editing={kind:'user',data:{...d}};
-S.message='';
-}finally{
-userSaveInProgress=false;
-if(submitButton&&!saved){submitButton.disabled=false;submitButton.textContent='Salvar usuário'}
-if(loadingShown)hideLoading()
-}
-if(handleUserTargetDenied(saveError))return;
-if(saved){
-render();
-showUserResult('success',edit?'Usuário atualizado com sucesso':'Usuário cadastrado com sucesso',edit?'As alterações foram salvas e estão disponíveis no sistema.':'O novo usuário foi cadastrado e está disponível no sistema.','',edit?'Alteração concluída':'Cadastro concluído');
-}else{
-const failure=userSaveError(saveError);
-render();showUserResult('error',edit?'Não foi possível salvar o usuário':'Não foi possível cadastrar o usuário',failure.message,failure.category)
-}
+  ev.preventDefault();
+  if(userSaveInProgress)return;
+  if(denyOperatorAccess()||denyUserManagement())return;
+  if(!canManageUsers()){fail('Sem permissão para administrar usuários.');return;}
+
+  const form=ev.currentTarget,d=captureUserDraft(form),edit=!!d.id_usuario;
+  const profile=canonicalPerfil(d.perfil);
+  const lockedForeignScope=Boolean(edit&&hasProfile(S.user,'Supervisor')&&S.users.some(user=>user.id_usuario===d.id_usuario&&effectiveSupervisionId(user)!==effectiveSupervisionId(S.user)&&normalizePerfil(user.perfil)===normalizePerfil(d.perfil)));
+  if(profile==='Administrador'){d.supervisao_id='';d.unidades_permitidas='*'}
+  else if(profile==='Supervisor'&&!lockedForeignScope)d.unidades_permitidas='';
+  else if(!lockedForeignScope)d.unidades_permitidas=userUnitNames(d.unidades_permitidas).join('|');
+
+  try{
+    validateUserForm(form,d,edit);
+  }catch(err){
+    const failure=userSaveError(err);
+    showUserResult('error',edit?'Não foi possível salvar o usuário':'Não foi possível cadastrar o usuário',failure.message,failure.category);
+    return;
+  }
+
+  const login=String(d.login).trim();
+  if(S.users.some(x=>String(x.login??'').trim().toLowerCase()===login.toLowerCase()&&x.id_usuario!==d.id_usuario)){
+    showUserResult('error',edit?'Não foi possível salvar o usuário':'Não foi possível cadastrar o usuário','Já existe um usuário com esse login. Escolha outro login.','Usuário duplicado');
+    return;
+  }
+
+  // Snapshots for defensive rollback
+  const prevUsers=[...S.users];
+  const prevUserSession=S.user?{...S.user}:null;
+  const time=now();
+
+  let optimisticRow;
+  if(edit){
+    const cur=S.users.find(x=>x.id_usuario===d.id_usuario);
+    if(!cur){
+      showUserResult('error','Não foi possível salvar o usuário','Usuário não encontrado.','Validação do cadastro');
+      return;
+    }
+    optimisticRow={...cur,nome:String(d.nome).trim(),login,perfil:canonicalPerfil(d.perfil),unidades_permitidas:d.unidades_permitidas,supervisao_id:d.supervisao_id,status:d.status,senha_hash:cur.senha_hash,versao_registro:String((+cur.versao_registro||0)+1),data_atualizacao:time,usuario_ultima_alteracao:S.user.login};
+    S.users=S.users.map(x=>x.id_usuario===cur.id_usuario?optimisticRow:x);
+  }else{
+    optimisticRow={id_usuario:uid(),nome:String(d.nome).trim(),login,senha_hash:'',perfil:canonicalPerfil(d.perfil),unidades_permitidas:d.unidades_permitidas,supervisao_id:d.supervisao_id,status:d.status,data_criacao:time,ultimo_acesso:'',versao_registro:'1',data_atualizacao:time,usuario_ultima_alteracao:S.user.login};
+    S.users=[optimisticRow,...S.users];
+  }
+
+  if(edit&&optimisticRow.id_usuario===S.user?.id_usuario)S.user=optimisticRow.status==='Ativo'?{...optimisticRow,perfil:canonicalPerfil(optimisticRow.perfil)}:null;
+
+  // Optimistic UI: complete immediately (0ms)
+  S.editing=null;
+  S.message='';
+  hideLoading();
+  render();
+  showUserResult('success',edit?'Usuário atualizado com sucesso':'Usuário cadastrado com sucesso',edit?'As alterações foram salvas e estão disponíveis no sistema.':'O novo usuário foi cadastrado e está disponível no sistema.','',edit?'Alteração concluída':'Cadastro concluído');
+
+  // Background worker: hash password (if new), persist to disk with write locks and audit trail
+  (async()=>{
+    userSaveInProgress=true;
+    try{
+      await refreshAccessContext();
+      await ensureDataWritePermission();
+      let persistedUser=null;
+      await withWriteLock('users',async()=>{
+        const disk=await read('usuarios.csv');
+        if(edit){const target=disk.find(x=>x.id_usuario===d.id_usuario);if(!target)throw Error('Usuário não encontrado.');assertUserTargetPermission(target)}
+        if(disk.some(x=>String(x.login??'').trim().toLowerCase()===login.toLowerCase()&&x.id_usuario!==d.id_usuario))throw new UserDuplicateError();
+        let row,next,action;
+        if(edit){
+          const cur=disk.find(x=>x.id_usuario===d.id_usuario);
+          if(!cur)throw Error('Usuário não encontrado.');
+          assertUserTargetPermission(cur);
+          if(hasProfile(S.user,'Supervisor')&&cur.supervisao_id!==S.user.supervisao_id&&(d.supervisao_id!==cur.supervisao_id||d.unidades_permitidas!==cur.unidades_permitidas||canonicalPerfil(d.perfil)!==canonicalPerfil(cur.perfil)))throw new UserFormValidationError('Supervisores podem alterar apenas os dados básicos de usuários de outras Supervisões.');
+          if(cur.login==='admin'&&d.status!=='Ativo')throw Error('O administrador principal não pode ser bloqueado.');
+          row={...cur,nome:String(d.nome).trim(),login,perfil:canonicalPerfil(d.perfil),unidades_permitidas:d.unidades_permitidas,supervisao_id:d.supervisao_id,status:d.status,senha_hash:cur.senha_hash,versao_registro:String((+cur.versao_registro||0)+1),data_atualizacao:time,usuario_ultima_alteracao:S.user.login};
+          next=disk.map(x=>x.id_usuario===cur.id_usuario?row:x);action='USUARIO_EDITADO';
+        }else{
+          row={id_usuario:optimisticRow.id_usuario,nome:String(d.nome).trim(),login,senha_hash:await hash(d.senha),perfil:canonicalPerfil(d.perfil),unidades_permitidas:d.unidades_permitidas,supervisao_id:d.supervisao_id,status:d.status,data_criacao:time,ultimo_acesso:'',versao_registro:'1',data_atualizacao:time,usuario_ultima_alteracao:S.user.login};
+          next=[row,...disk];action='USUARIO_CADASTRADO';
+        }
+        const confirmed=await write('usuarios.csv',next,H.users),persisted=confirmed.find(x=>x.id_usuario===row.id_usuario&&x.login===row.login&&x.senha_hash===row.senha_hash&&x.perfil===row.perfil&&x.unidades_permitidas===row.unidades_permitidas&&x.supervisao_id===row.supervisao_id&&x.status===row.status);
+        if(!persisted)throw new UserPersistenceError();
+        S.users=confirmed;
+        persistedUser=persisted;
+        try{await auditUser(action,persisted,`${persisted.nome}; ${persisted.perfil}; ${persisted.status}`)}catch(error){
+          console.error('Falha ao registrar o cadastro de usuário na auditoria.',error);
+          try{
+            const latest=await read('usuarios.csv'),current=latest.find(x=>x.id_usuario===row.id_usuario),original=disk.find(x=>x.id_usuario===row.id_usuario);
+            let restored;
+            if(edit){
+              if(sameUserRecord(current,row))restored=latest.map(x=>x.id_usuario===row.id_usuario?original:x);
+              else if(sameUserRecord(current,original))restored=latest;
+              else throw new UserRollbackError();
+            }else if(!current)restored=latest;
+            else if(sameUserRecord(current,row))restored=latest.filter(x=>x.id_usuario!==row.id_usuario);
+            else throw new UserRollbackError();
+            const checked=csv(restored,H.users)!==csv(latest,H.users)?await write('usuarios.csv',restored,H.users):latest;
+            if(csv(checked,H.users)!==csv(restored,H.users))throw new UserRollbackError();
+            S.users=checked;
+          }catch(rollbackError){console.error('Falha ao desfazer o cadastro após erro na auditoria.',rollbackError);throw new UserRollbackError()}
+          throw new UserAuditError(edit?'Não foi possível registrar as alterações na auditoria. As alterações foram desfeitas; tente novamente.':'Não foi possível registrar o cadastro na auditoria. O usuário não foi cadastrado; tente novamente.');
+        }
+      });
+      if(edit&&persistedUser?.id_usuario===S.user?.id_usuario)S.user=persistedUser.status==='Ativo'?{...persistedUser,perfil:canonicalPerfil(persistedUser.perfil)}:null;
+    }catch(error){
+      console.error('Falha ao salvar usuário em segundo plano:',error);
+      S.users=prevUsers;
+      S.user=prevUserSession;
+      S.editing={kind:'user',data:{...d}};
+      render();
+      const failure=userSaveError(error);
+      showUserResult('error',edit?'Não foi possível salvar o usuário':'Não foi possível cadastrar o usuário',failure.message,failure.category);
+    }finally{
+      userSaveInProgress=false;
+    }
+  })();
 }
 async function toggleUser(id){
-if(denyOperatorAccess()||denyUserManagement())return;if(!canManageUsers())return fail('Sem permissão para administrar usuários.');
-let status;
-try{await withWriteLock('users',async()=>{const disk=await read('usuarios.csv'),cur=disk.find(user=>user.id_usuario===id);if(!cur)throw Error('Usuário não encontrado.');assertUserTargetPermission(cur);if(cur.login==='admin')throw Error('O administrador principal não pode ser bloqueado.');status=cur.status==='Ativo'?'Inativo':'Ativo';const row={...cur,status,versao_registro:String((+cur.versao_registro||0)+1),data_atualizacao:now(),usuario_ultima_alteracao:S.user.login},next=disk.map(user=>user.id_usuario===id?row:user);const confirmed=await write('usuarios.csv',next,H.users);if(!confirmed.some(user=>sameUserRecord(user,row)))throw Error('Não foi possível confirmar a alteração do usuário.');S.users=confirmed;await auditUser(status==='Ativo'?'USUARIO_REATIVADO':'USUARIO_BLOQUEADO',row,`${row.nome}; ${row.perfil}`)});S.message=status==='Ativo'?'Usuário reativado.':'Usuário bloqueado.';render()}
-catch(error){if(handleUserTargetDenied(error))return;if(error?.name!=='UserPermissionError')console.error('Falha ao alterar o status do usuário.',error);fail(error?.name==='UserPermissionError'?'Sem permissão para administrar usuários.':error?.message||'Não foi possível alterar o usuário.')}
+  if(denyOperatorAccess()||denyUserManagement())return;
+  if(!canManageUsers())return fail('Sem permissão para administrar usuários.');
+
+  const cur=S.users.find(user=>user.id_usuario===id);
+  if(!cur)return fail('Usuário não encontrado.');
+  if(cur.login==='admin')return fail('O administrador principal não pode ser bloqueado.');
+
+  // Snapshots for defensive rollback
+  const prevUsers=[...S.users];
+  const status=cur.status==='Ativo'?'Inativo':'Ativo';
+  const row={...cur,status,versao_registro:String((+cur.versao_registro||0)+1),data_atualizacao:now(),usuario_ultima_alteracao:S.user.login};
+
+  // Optimistic UI: update immediately (0ms)
+  S.users=S.users.map(user=>user.id_usuario===id?row:user);
+  S.message=status==='Ativo'?'Usuário reativado.':'Usuário bloqueado.';
+  render();
+  showToast(S.message,'success');
+
+  // Background worker: persist to disk with write locks and audit trail
+  (async()=>{
+    try{
+      await ensureDataWritePermission();
+      await withWriteLock('users',async()=>{
+        const disk=await read('usuarios.csv'),diskCur=disk.find(user=>user.id_usuario===id);
+        if(!diskCur)throw Error('Usuário não encontrado.');
+        assertUserTargetPermission(diskCur);
+        if(diskCur.login==='admin')throw Error('O administrador principal não pode ser bloqueado.');
+        const diskRow={...diskCur,status,versao_registro:String((+diskCur.versao_registro||0)+1),data_atualizacao:now(),usuario_ultima_alteracao:S.user.login};
+        const next=disk.map(user=>user.id_usuario===id?diskRow:user);
+        const confirmed=await write('usuarios.csv',next,H.users);
+        if(!confirmed.some(user=>sameUserRecord(user,diskRow)))throw Error('Não foi possível confirmar a alteração do usuário.');
+        S.users=confirmed;
+        await auditUser(status==='Ativo'?'USUARIO_REATIVADO':'USUARIO_BLOQUEADO',diskRow,`${diskRow.nome}; ${diskRow.perfil}`);
+      });
+    }catch(error){
+      console.error('Falha ao alterar o status do usuário em segundo plano:',error);
+      S.users=prevUsers;
+      render();
+      fail(error?.name==='UserPermissionError'?'Sem permissão para administrar usuários.':error?.message||'Não foi possível alterar o usuário.');
+    }
+  })();
 }
 // saveKey implementation consolidated in Chaves Module
-async function saveAmbientalInspection(ev){ev.preventDefault();const form=ev.currentTarget;if(!form.reportValidity())return;const raw=Object.fromEntries(new FormData(form));if(!S.user){fail('Sessão inválida.');return}const input=normalizeAmbientalRow(raw),edit=Boolean(raw.id),isSim=String(input.realizar_monitoramento||'Sim').trim()==='Sim';if(!input.data){fail('Informe a data da inspeção.');return}if(isSim){if(!input.placa||!input.transportadora||!input.laudo||!input.observacao){fail('Preencha todos os campos obrigatórios da inspeção.');return}}else if(!input.motivo_nao_execucao){fail('Selecione a justificativa da não execução.');return}const loggedNome=S.user.nome||'';const loggedMatricula=String(S.user.login||S.user.matricula||'').trim();const responsavelFinal=raw.responsavel?.trim()||(loggedMatricula?`${loggedNome} (${loggedMatricula})`:loggedNome);const matriculaFinal=raw.matricula_responsavel?.trim()||loggedMatricula;try{await refreshAccessContext();await ensureDataWritePermission();if(!canAccessPage('inspecao-veicular'))throw new DataScopeError('Seu perfil não possui autorização para registrar inspeções.');showLoading(edit?'Salvando alterações...':'Registrando inspeção...',{kicker:'Processamento corporativo',title:edit?'Salvando alterações...':'Registrando inspeção...',progress:18,overlayId:'pdfProgressOverlay'});await withWriteLock('ambiental',async()=>{const disk=await read(ENVIRONMENTAL_FILE,{force:true}),time=now(),userUnits=authorizedUnitRecords(S.user),defaultUnit=(userUnits.length?userUnits[0].nome:'')||assignedUnitIds(S.user)[0]||'',defaultSupervisao=effectiveSupervisionId(S.user)||(supervisionForUnit(defaultUnit)?.nome)||'';let next=[],row;if(edit){const current=disk.find(item=>String(item.id)===String(input.id));if(!current)throw new DataScopeError('Inspeção não encontrada.');row={...current,...input,nota:'',responsavel:responsavelFinal,matricula_responsavel:matriculaFinal,usuario_registro:current.usuario_registro||S.user.login,unidade:String(input.unidade||current.unidade||defaultUnit),supervisao:String(input.supervisao||current.supervisao||defaultSupervisao),data_hora_registro:current.data_hora_registro||time,data_hora_alteracao:time,alterado_por:S.user.login};if(row.realizar_monitoramento==='Sim'){row.motivo_nao_execucao='';}else{row.placa='';row.transportadora='';row.nota='';row.laudo='';row.observacao='';}next=disk.map(item=>String(item.id)===String(row.id)?row:item);if(window.StorageService?.appendSingleRecord){await window.StorageService.appendSingleRecord(ENVIRONMENTAL_FILE,row,H.inspecoes,{isNewRecord:false});S.inspecoes=next;CSVService.buildEntry(ENVIRONMENTAL_FILE,S.inspecoes)}else{const confirmed=await write(ENVIRONMENTAL_FILE,next,H.inspecoes);if(!confirmed.some(item=>String(item.id)===String(row.id)))throw new Error('Não foi possível confirmar a inspeção no CSV.');S.inspecoes=confirmed;CSVService.buildEntry(ENVIRONMENTAL_FILE,confirmed)}}else{const newId=uid();row={id:newId,...input,nota:'',responsavel:responsavelFinal,matricula_responsavel:matriculaFinal,usuario_registro:S.user.login,data_hora_registro:time,data_hora_alteracao:'',alterado_por:'',unidade:String(input.unidade||defaultUnit),supervisao:String(input.supervisao||defaultSupervisao)};if(row.realizar_monitoramento==='Sim'){row.motivo_nao_execucao='';}else{row.placa='';row.transportadora='';row.nota='';row.laudo='';row.observacao='';}if(window.StorageService?.appendRecord){await window.StorageService.appendRecord(ENVIRONMENTAL_FILE,row,H.inspecoes,{isNewRecord:true});S.inspecoes=[...(disk||[]),row];CSVService.buildEntry(ENVIRONMENTAL_FILE,S.inspecoes)}else{next=[row,...disk.filter(item=>String(item.id)!==String(newId))];const confirmed=await write(ENVIRONMENTAL_FILE,next,H.inspecoes);if(!confirmed.some(item=>String(item.id)===String(row.id)))throw new Error('Não foi possível confirmar a inspeção no CSV.');S.inspecoes=confirmed;CSVService.buildEntry(ENVIRONMENTAL_FILE,confirmed)}}_scopeAmbientalMemo={rowsRef:null,userKey:'',orgVer:-1,result:[]};_ambientalFilterMemo={rowsRef:null,filterKey:'',result:[]};});S.editing=null;S.page='hist-inspecoes';S.activeMenu='meio-ambiente';S.message=edit?'Inspeção alterada com sucesso':'Inspeção registrada com sucesso';hideLoading();render();showToast(edit?'Inspeção alterada com sucesso':'Inspeção registrada com sucesso','success');}catch(error){hideLoading();console.error('Falha ao salvar inspeção ambiental.',error);fail(error instanceof DataScopeError?error.message:error.message||'Não foi possível salvar a inspeção.')}}
+async function saveAmbientalInspection(ev){
+  ev.preventDefault();
+  const form=ev.currentTarget;
+  if(!form.reportValidity())return;
+  const raw=Object.fromEntries(new FormData(form));
+  if(!S.user){fail('Sessão inválida.');return;}
+
+  const input=normalizeAmbientalRow(raw),edit=Boolean(raw.id),isSim=String(input.realizar_monitoramento||'Sim').trim()==='Sim';
+  if(!input.data){fail('Informe a data da inspeção.');return;}
+  if(isSim){
+    if(!input.placa||!input.transportadora||!input.laudo||!input.observacao){
+      fail('Preencha todos os campos obrigatórios da inspeção.');
+      return;
+    }
+  }else if(!input.motivo_nao_execucao){
+    fail('Selecione a justificativa da não execução.');
+    return;
+  }
+
+  const loggedNome=S.user.nome||'';
+  const loggedMatricula=String(S.user.login||S.user.matricula||'').trim();
+  const responsavelFinal=raw.responsavel?.trim()||(loggedMatricula?`${loggedNome} (${loggedMatricula})`:loggedNome);
+  const matriculaFinal=raw.matricula_responsavel?.trim()||loggedMatricula;
+
+  const time=now();
+  const userUnits=authorizedUnitRecords(S.user);
+  const defaultUnit=(userUnits.length?userUnits[0].nome:'')||assignedUnitIds(S.user)[0]||'';
+  const defaultSupervisao=effectiveSupervisionId(S.user)||(supervisionForUnit(defaultUnit)?.nome)||'';
+
+  let row;
+  if(edit){
+    const current=(S.inspecoes||[]).find(item=>String(item.id)===String(input.id));
+    if(!current){fail('Inspeção não encontrada.');return;}
+    row={...current,...input,nota:'',responsavel:responsavelFinal,matricula_responsavel:matriculaFinal,usuario_registro:current.usuario_registro||S.user.login,unidade:String(input.unidade||current.unidade||defaultUnit),supervisao:String(input.supervisao||current.supervisao||defaultSupervisao),data_hora_registro:current.data_hora_registro||time,data_hora_alteracao:time,alterado_por:S.user.login};
+  }else{
+    const newId=uid();
+    row={id:newId,...input,nota:'',responsavel:responsavelFinal,matricula_responsavel:matriculaFinal,usuario_registro:S.user.login,data_hora_registro:time,data_hora_alteracao:'',alterado_por:'',unidade:String(input.unidade||defaultUnit),supervisao:String(input.supervisao||defaultSupervisao)};
+  }
+
+  if(row.realizar_monitoramento==='Sim'){
+    row.motivo_nao_execucao='';
+  }else{
+    row.placa='';row.transportadora='';row.nota='';row.laudo='';row.observacao='';
+  }
+
+  // Snapshots for defensive rollback
+  const prevInspecoes=[...(S.inspecoes||[])];
+
+  // Optimistic UI: update immediately (0ms)
+  if(edit){
+    S.inspecoes=(S.inspecoes||[]).map(item=>String(item.id)===String(row.id)?row:item);
+  }else{
+    S.inspecoes=[row,...(S.inspecoes||[])];
+  }
+  CSVService.buildEntry(ENVIRONMENTAL_FILE,S.inspecoes);
+  _scopeAmbientalMemo={rowsRef:null,userKey:'',orgVer:-1,result:[]};
+  _ambientalFilterMemo={rowsRef:null,filterKey:'',result:[]};
+
+  S.editing=null;
+  S.page='hist-inspecoes';
+  S.activeMenu='meio-ambiente';
+  S.message=edit?'Inspeção alterada com sucesso':'Inspeção registrada com sucesso';
+  hideLoading();
+  render();
+  showToast(edit?'Inspeção alterada com sucesso':'Inspeção registrada com sucesso','success');
+
+  // Background worker: persist to disk with write locks
+  (async()=>{
+    try{
+      await refreshAccessContext();
+      await ensureDataWritePermission();
+      if(!canAccessPage('inspecao-veicular'))throw new DataScopeError('Seu perfil não possui autorização para registrar inspeções.');
+      await withWriteLock('ambiental',async()=>{
+        const disk=await read(ENVIRONMENTAL_FILE,{force:true});
+        if(edit){
+          const next=disk.map(item=>String(item.id)===String(row.id)?row:item);
+          if(window.StorageService?.appendSingleRecord){
+            await window.StorageService.appendSingleRecord(ENVIRONMENTAL_FILE,row,H.inspecoes,{isNewRecord:false});
+          }else{
+            await write(ENVIRONMENTAL_FILE,next,H.inspecoes);
+          }
+        }else{
+          if(window.StorageService?.appendRecord){
+            await window.StorageService.appendRecord(ENVIRONMENTAL_FILE,row,H.inspecoes,{isNewRecord:true});
+          }else{
+            const next=[row,...disk.filter(item=>String(item.id)!==String(row.id))];
+            await write(ENVIRONMENTAL_FILE,next,H.inspecoes);
+          }
+        }
+      });
+    }catch(error){
+      console.error('Falha ao salvar inspeção ambiental em segundo plano:',error);
+      S.inspecoes=prevInspecoes;
+      CSVService.buildEntry(ENVIRONMENTAL_FILE,S.inspecoes);
+      render();
+      fail(error instanceof DataScopeError?error.message:error.message||'Não foi possível salvar a inspeção.');
+    }
+  })();
+}
 function folderSelectionModal(){if(!S.folderModal)return'';const currentFolder=S.dir?.name||'dados';return `<div class="modalbg popup-backdrop"><div class="card modal" style="max-width:540px"><button type="button" class="close cancelFolderModal" aria-label="Fechar">×</button><h2>Gerenciar Pasta de Dados</h2><p class="muted">Os dados do SIGESP são persistidos nos arquivos CSV contidos na pasta de dados.</p><div style="margin:16px 0;padding:12px;background:#f8fafc;border:1px solid #dce5f2;border-radius:10px;font-size:13px"><div style="display:flex;align-items:center;gap:8px"><span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#16a34a"></span><span>Pasta atualmente em uso: <b>${esc(currentFolder)}</b></span></div><p style="margin:6px 0 0;color:#65758f;font-size:12px">Referência padrão: pasta <b>dados</b> na mesma pasta do <code>index.html</code>.</p></div><div class="stack" style="gap:10px"><button type="button" id="chooseAutoFolder" class="btn primary" style="text-align:left;padding:12px"><div style="font-weight:700">1. Usar pasta automática “dados” (Recomendado)</div><small style="opacity:.9;font-weight:400">Conecta diretamente à pasta dados ao lado do index.html com persistência direta e leitura rápida.</small></button><button type="button" id="chooseNativeFolder" class="btn" style="text-align:left;padding:12px"><div style="font-weight:700">2. Selecionar pasta no computador (File System API)</div><small style="color:#65758f;font-weight:400">Abre o seletor nativo do sistema operacional / navegador para escolher uma pasta no seu disco.</small></button><label class="btn" style="text-align:left;padding:12px;cursor:pointer;display:block"><div style="font-weight:700">3. Importar pasta de arquivos CSV...</div><small style="color:#65758f;font-weight:400">Compatível com todos os navegadores e quadros incorporados (seleciona a pasta via navegador).</small><input id="folderPickerInput" class="hidden" type="file" webkitdirectory directory multiple></label></div><div class="row" style="justify-content:flex-end;margin-top:18px"><button type="button" id="cancelFolderModal" class="btn">Fechar</button></div></div></div>`}
 function restoringV(){
   return `<div class="center"><div class="card" style="max-width:440px;text-align:center"><div style="font-size:32px;margin-bottom:12px">⏳</div><h1>SIGESP</h1><p class="muted">Verificando integridade e permissões da pasta de dados...</p></div></div>`;
@@ -4749,125 +5149,63 @@ async function saveApuracao(id,form){
   if(!hasProfile(S.user,'Administrador','Supervisor','Líder')&&!isAdministratorUser(S.user)){
     return fail('Seu perfil não possui autorização para apurar ocorrências.');
   }
-  showLoading('Gravando apuração corporativa...',{kicker:'Gestão de Segurança',title:'Salvando apuração...',progress:30,overlayId:'pdfProgressOverlay'});
   try{
-    await ensureDataWritePermission();
-    await refreshAccessContext();
     if(typeof syncApuracaoFormState==='function')syncApuracaoFormState();
     const normId=String(id).trim();
 
     // Identifica ocorrência e protocolo de forma imediata em memória
-    const currentMemory=(S.occ||[]).find(x=>String(x.id_ocorrencia||'').trim()===normId||String(x.id_interno||'').trim()===normId||String(x.numero_protocolo||'').trim()===normId);
-    const protocolName=String(currentMemory?.numero_protocolo||currentMemory?.id_ocorrencia||id).trim();
+    const current=(S.occ||[]).find(x=>String(x.id_ocorrencia||'').trim()===normId||String(x.id_interno||'').trim()===normId||String(x.numero_protocolo||'').trim()===normId);
+    if(!current)return fail('Ocorrência não encontrada na base de dados.');
+    const protocolName=String(current.numero_protocolo||current.id_ocorrencia||id).trim();
 
-    // 1. Grava os PDFs em paralelo FORA do lock do CSV (mesmo esquema de alta performance de savePhotos)
-    let newlySavedPdfPaths=[];
-    if(S.apuracaoNewPdfs&&S.apuracaoNewPdfs.length>0){
-      newlySavedPdfPaths=await saveApuracaoPdfs(protocolName, S.apuracaoNewPdfs);
-    }
+    const formData=form?Object.fromEntries(new FormData(form)):{};
+    const newStatus=formData.status_apuracao||S.apuracaoModal?.status_apuracao||formData.status||current.status||'Em Apuração';
+    const newPrioridade=formData.prioridade||S.apuracaoModal?.prioridade||current.prioridade||'Média';
+    const notas=String(formData.notas_investigativas!=null?formData.notas_investigativas:(S.apuracaoModal?.apuracao_notas||'')).trim();
+    const conclusao=String(formData.conclusao!=null?formData.conclusao:(S.apuracaoModal?.apuracao_conclusao||'')).trim();
+    const planoAcao=String(formData.plano_acao!=null?formData.plano_acao:(S.apuracaoModal?.apuracao_plano_acao||'')).trim();
+    const timeNow=now();
+    const apuradorNome=S.user.nome?`${S.user.nome} (${S.user.login})`:S.user.login;
 
-    let updatedRecord=null;
-    // 2. Transação atômica rápida dedicada exclusivamente à persistência da linha CSV
-    await withWriteLock('occurrences',async()=>{
-      const rawText=await fetchFreshRawCsv('ocorrencias.csv');
-      const freshRows=rawText?parseAndConsolidateCsv(rawText):(S.occ||[]);
-      const current=freshRows.find(x=>String(x.id_ocorrencia||'').trim()===normId||String(x.id_interno||'').trim()===normId||String(x.numero_protocolo||'').trim().toUpperCase()===normId.toUpperCase())
-        ||(currentMemory||(S.occ||[]).find(x=>String(x.id_ocorrencia||'').trim()===normId||String(x.id_interno||'').trim()===normId||String(x.numero_protocolo||'').trim().toUpperCase()===normId.toUpperCase()));
-      if(!current||!current.unidade)throw new DataScopeError('Ocorrência não encontrada na base de dados.');
-      assertUnitAccess(current.unidade);
+    // Snapshot para rollback defensivo
+    const prevOcc=[...(S.occ||[])];
+    const prevNewPdfs=[...(S.apuracaoNewPdfs||[])];
+    const prevExistingPdfs=[...(S.apuracaoExistingPdfs||[])];
 
-      if(typeof syncApuracaoFormState==='function')syncApuracaoFormState();
-      const formData=form?Object.fromEntries(new FormData(form)):{};
-      const newStatus=formData.status_apuracao||S.apuracaoModal?.status_apuracao||formData.status||current.status||'Em Apuração';
-      const newPrioridade=formData.prioridade||S.apuracaoModal?.prioridade||current.prioridade||'Média';
-      const notas=String(formData.notas_investigativas!=null?formData.notas_investigativas:(S.apuracaoModal?.apuracao_notas||'')).trim();
-      const conclusao=String(formData.conclusao!=null?formData.conclusao:(S.apuracaoModal?.apuracao_conclusao||'')).trim();
-      const planoAcao=String(formData.plano_acao!=null?formData.plano_acao:(S.apuracaoModal?.apuracao_plano_acao||'')).trim();
-      const timeNow=now();
-      const apuradorNome=S.user.nome?`${S.user.nome} (${S.user.login})`:S.user.login;
+    const existingRefs=String(current.anexos_referencias||'').split('|').map(p=>p.trim()).filter(Boolean);
+    const nonPdfRefs=existingRefs.filter(p=>!/\.pdf$/i.test(p));
+    const retainedPdfRefs=(S.apuracaoExistingPdfs||[]).map(p=>p.path);
+    const newPdfsEstimated=prevNewPdfs.map(item=>`${protocolName}/laudo_${(item.name||'laudo.pdf').replace(/[^a-zA-Z0-9._-]/g,'_')}`);
+    const allAnexos=[...nonPdfRefs, ...retainedPdfRefs, ...newPdfsEstimated];
 
-      // Concatena fotos e laudos PDF de forma consistente
-      const existingRefs=String(current.anexos_referencias||'').split('|').map(p=>p.trim()).filter(Boolean);
-      const nonPdfRefs=existingRefs.filter(p=>!/\.pdf$/i.test(p));
-      const retainedPdfRefs=(S.apuracaoExistingPdfs||[]).map(p=>p.path);
-      const allAnexos=[...nonPdfRefs, ...retainedPdfRefs, ...newlySavedPdfPaths];
-      const mergedAnexosRef=allAnexos.join('|');
-
-      const formattedObs=formatApuracaoObservacao(current.observacao_validacao||current.observacoes,{
-        notas,
-        conclusao,
-        planoAcao,
-        responsavel:apuradorNome,
-        data:timeNow
-      });
-
-      const updatedRow={
-        ...current,
-        status:newStatus,
-        status_apuracao:newStatus,
-        status_validacao:'Validada',
-        prioridade:newPrioridade,
-        anexos_referencias:mergedAnexosRef,
-        providencias_adotadas:planoAcao||current.providencias_adotadas||'',
-        observacao_validacao:formattedObs,
-        apuracao_notas:notas,
-        apuracao_conclusao:conclusao,
-        apuracao_plano_acao:planoAcao,
-        apuracao_responsavel:apuradorNome,
-        apuracao_data:timeNow,
-        versao_registro:String((+current.versao_registro||0)+1),
-        usuario_ultima_alteracao:S.user.login,
-        data_atualizacao:timeNow
-      };
-
-      let savedResult=null;
-      if(window.StorageService?.appendSingleRecord){
-        savedResult=await window.StorageService.appendSingleRecord('ocorrencias.csv',updatedRow,H.occ,{isNewRecord:false});
-      }else{
-        savedResult=await CSVService.append('ocorrencias.csv',updatedRow,H.occ);
-      }
-
-      const baseList=(savedResult?._allRows&&savedResult._allRows.length>0)
-        ? savedResult._allRows
-        : ((freshRows&&freshRows.length>0)?freshRows:(S.occ&&S.occ.length>0?S.occ:[]));
-      const consolidated=window.StorageService?.consolidateVersionedRows
-        ? window.StorageService.consolidateVersionedRows([...baseList,updatedRow])
-        : [...baseList,updatedRow];
-
-      S.occ=consolidated.map((x,idx)=>{
-        const isMatch=(String(x.id_ocorrencia||'').trim()===normId)||
-                      (String(x.id_interno||'').trim()===normId)||
-                      (String(x.numero_protocolo||'').trim().toUpperCase()===String(updatedRow.numero_protocolo||'').trim().toUpperCase());
-        if(isMatch){
-          return normalizeOccurrenceRow({...x,...updatedRow,status:newStatus,status_apuracao:newStatus,status_validacao:'Validada'},idx,consolidated);
-        }
-        return normalizeOccurrenceRow(x,idx,consolidated);
-      }).filter(Boolean);
-
-      if(typeof CSVService!=='undefined'){
-        CSVService.buildEntry('ocorrencias.csv',S.occ);
-      }
-      window.StorageService?.IndexedDBEngine?.saveRecordsBulkLocally('ocorrencias.csv',S.occ).catch(()=>{});
-
-      if(window.StorageService?.processBackgroundSyncQueue){
-        await window.StorageService.processBackgroundSyncQueue().catch(()=>{});
-      }
-      const stat=await window.StorageService?.getFileStat('ocorrencias.csv').catch(()=>null);
-      if(stat){
-        _freshCsvMeta.set('ocorrencias.csv',{mtimeMs:stat.mtimeMs,size:stat.size,rawSig:''});
-      }
-
-      _apuracaoFilterMemo={rowsRef:null,fKey:'',result:[]};
-      _occFilterMemo={rowsRef:null,query:'',result:[]};
-      _histFilterMemo={rowsRef:null,filterKey:'',result:[]};
-      S.pending=filteredPendingOccurrences();
-      updatedRecord=updatedRow;
+    const formattedObs=formatApuracaoObservacao(current.observacao_validacao||current.observacoes,{
+      notas,
+      conclusao,
+      planoAcao,
+      responsavel:apuradorNome,
+      data:timeNow
     });
 
-    if(updatedRecord){
-      await auditApuracaoAction('APURACAO_ATUALIZADA',updatedRecord,`Status: ${updatedRecord.status} | Gravidade: ${updatedRecord.prioridade}`);
-    }
+    const updatedRow={
+      ...current,
+      status:newStatus,
+      status_apuracao:newStatus,
+      status_validacao:'Validada',
+      prioridade:newPrioridade,
+      anexos_referencias:allAnexos.join('|'),
+      providencias_adotadas:planoAcao||current.providencias_adotadas||'',
+      observacao_validacao:formattedObs,
+      apuracao_notas:notas,
+      apuracao_conclusao:conclusao,
+      apuracao_plano_acao:planoAcao,
+      apuracao_responsavel:apuradorNome,
+      apuracao_data:timeNow,
+      versao_registro:String((+current.versao_registro||0)+1),
+      usuario_ultima_alteracao:S.user.login,
+      data_atualizacao:timeNow
+    };
 
+    // 1. ATUALIZAÇÃO INSTANTÂNEA DA INTERFACE (0 ms)
     if(S.apuracaoPhotos&&S.apuracaoPhotos.length){
       S.apuracaoPhotos.forEach(p=>p.url&&URL.revokeObjectURL(p.url));
       S.apuracaoPhotos=[];
@@ -4876,14 +5214,52 @@ async function saveApuracao(id,form){
     S.apuracaoExistingPdfs=[];
     S.apuracaoModal=null;
     hideLoading();
+
+    S.occ=S.occ.map(x=>(String(x.id_ocorrencia)===normId||String(x.id_interno)===normId||String(x.numero_protocolo)===String(current.numero_protocolo))?updatedRow:x);
+    _apuracaoFilterMemo={rowsRef:null,fKey:'',result:[]};
+    _occFilterMemo={rowsRef:null,query:'',result:[]};
+    _histFilterMemo={rowsRef:null,filterKey:'',result:[]};
     render();
-    showToast(`Apuração do protocolo ${updatedRecord?.numero_protocolo||id} salva com sucesso!`,'success','Apuração Atualizada');
+    showToast(`Apuração do protocolo ${protocolName} salva com sucesso!`,'success','Apuração Atualizada');
+
+    // 2. PERSISTÊNCIA ASSÍNCRONA EM BACKGROUND COM RESILIÊNCIA E WRITE LOCK
+    (async()=>{
+      try{
+        await ensureDataWritePermission();
+        let newlySavedPdfPaths=[];
+        if(prevNewPdfs.length>0){
+          newlySavedPdfPaths=await saveApuracaoPdfs(protocolName,prevNewPdfs);
+        }
+        await withWriteLock('occurrences',async()=>{
+          const finalAllAnexos=[...nonPdfRefs, ...retainedPdfRefs, ...newlySavedPdfPaths].join('|');
+          const finalRow={...updatedRow, anexos_referencias:finalAllAnexos};
+          let savedResult=null;
+          if(window.StorageService?.appendSingleRecord){
+            savedResult=await window.StorageService.appendSingleRecord('ocorrencias.csv',finalRow,H.occ,{isNewRecord:false});
+          }else{
+            savedResult=await CSVService.append('ocorrencias.csv',finalRow,H.occ);
+          }
+          if(typeof CSVService!=='undefined'){
+            CSVService.buildEntry('ocorrencias.csv',S.occ);
+          }
+          window.StorageService?.IndexedDBEngine?.saveRecordsBulkLocally('ocorrencias.csv',S.occ).catch(()=>{});
+          const stat=await window.StorageService?.getFileStat('ocorrencias.csv').catch(()=>null);
+          if(stat){
+            _freshCsvMeta.set('ocorrencias.csv',{mtimeMs:stat.mtimeMs,size:stat.size,rawSig:''});
+          }
+        });
+        await auditApuracaoAction('APURACAO_ATUALIZADA',updatedRow,`Status: ${updatedRow.status} | Gravidade: ${updatedRow.prioridade}`);
+      }catch(bgErr){
+        console.error('[Rollback] Falha ao persistir apuração no disco:',bgErr);
+        S.occ=prevOcc;
+        render();
+        showToast(bgErr.message||'Falha ao gravar apuração no disco. Operação desfeita.','error','Erro na Apuração');
+      }
+    })();
   }catch(error){
     hideLoading();
-    console.error('Falha ao salvar apuração da ocorrência:',error);
+    console.error('Falha ao processar apuração:',error);
     showToast(error.message||'Não foi possível salvar a apuração da ocorrência.','error','Erro na Apuração');
-  }finally{
-    hideLoading();
   }
 }
 
@@ -5065,48 +5441,57 @@ async function executeKeyWithdrawal(keyId,formData){
     usuario_ultima_alteracao:S.user.login
   };
 
-  showLoading('Registrando retirada de chave...',{kicker:'Claviculário Operacional',title:'Processando Cautela...',progress:30,overlayId:'pdfProgressOverlay'});
+  // Optimistic UI: snapshot previous state for rollback guarantee
+  const prevKeys=[...S.keys];
+  const prevMoves=[...S.moves];
 
-  try{
-    await ensureDataWritePermission();
-    await withWriteLock('moves',async()=>{
-      const diskMoves=await read('movimentacao_chaves.csv',{force:true});
-      if(window.StorageService?.appendRecord){
-        await window.StorageService.appendRecord('movimentacao_chaves.csv',moveRow,H.moves,{isNewRecord:true});
-        S.moves=[...(diskMoves||[]),moveRow];
-        CSVService.buildEntry('movimentacao_chaves.csv',S.moves);
-      }else{
-        const nextMoves=[moveRow,...(diskMoves||[])];
-        S.moves=await write('movimentacao_chaves.csv',nextMoves,H.moves);
-        CSVService.buildEntry('movimentacao_chaves.csv',S.moves);
-      }
-    });
+  // Update in-memory state and UI immediately (0ms latency)
+  S.moves=[moveRow,...(S.moves||[])];
+  S.keys=S.keys.map(k=>k.id_chave===updatedKey.id_chave?updatedKey:k);
+  CSVService.buildEntry('movimentacao_chaves.csv',S.moves);
+  CSVService.buildEntry('chaves.csv',S.keys);
 
-    await withWriteLock('keys',async()=>{
-      const diskKeys=await read('chaves.csv',{force:true});
-      const nextKeys=diskKeys.map(k=>k.id_chave===updatedKey.id_chave?updatedKey:k);
-      if(window.StorageService?.appendSingleRecord){
-        await window.StorageService.appendSingleRecord('chaves.csv',updatedKey,H.keys,{isNewRecord:false});
-        S.keys=nextKeys;
-        CSVService.buildEntry('chaves.csv',S.keys);
-      }else{
-        S.keys=await write('chaves.csv',nextKeys,H.keys);
-        CSVService.buildEntry('chaves.csv',S.keys);
-      }
-    });
+  S.keyWithdrawTarget=null;
+  S.keyModalErrors={};
+  hideLoading();
+  render();
+  showToast(`Chave ${key.codigo} retirada com sucesso por ${formData.nome}.`,'success');
 
-    await auditKeyAction('CHAVE_RETIRADA',updatedKey,`Chave ${key.codigo} retirada por ${formData.nome} (${formData.matricula})`);
+  // Background worker: persist to disk with write locks and audit trail
+  (async()=>{
+    try{
+      await ensureDataWritePermission();
+      await withWriteLock('moves',async()=>{
+        const diskMoves=await read('movimentacao_chaves.csv',{force:true});
+        if(window.StorageService?.appendRecord){
+          await window.StorageService.appendRecord('movimentacao_chaves.csv',moveRow,H.moves,{isNewRecord:true});
+        }else{
+          const nextMoves=[moveRow,...(diskMoves||[])];
+          await write('movimentacao_chaves.csv',nextMoves,H.moves);
+        }
+      });
 
-    hideLoading();
-    S.keyWithdrawTarget=null;
-    S.keyModalErrors={};
-    render();
-    showToast(`Chave ${key.codigo} retirada com sucesso por ${formData.nome}.`,'success');
-  }catch(err){
-    hideLoading();
-    console.error('Falha ao processar retirada de chave:',err);
-    fail(err.message||'Não foi possível registrar a retirada da chave.');
-  }
+      await withWriteLock('keys',async()=>{
+        const diskKeys=await read('chaves.csv',{force:true});
+        const nextKeys=diskKeys.map(k=>k.id_chave===updatedKey.id_chave?updatedKey:k);
+        if(window.StorageService?.appendSingleRecord){
+          await window.StorageService.appendSingleRecord('chaves.csv',updatedKey,H.keys,{isNewRecord:false});
+        }else{
+          await write('chaves.csv',nextKeys,H.keys);
+        }
+      });
+
+      await auditKeyAction('CHAVE_RETIRADA',updatedKey,`Chave ${key.codigo} retirada por ${formData.nome} (${formData.matricula})`);
+    }catch(err){
+      console.error('Falha ao processar retirada de chave em segundo plano:',err);
+      S.keys=prevKeys;
+      S.moves=prevMoves;
+      CSVService.buildEntry('movimentacao_chaves.csv',S.moves);
+      CSVService.buildEntry('chaves.csv',S.keys);
+      render();
+      fail(err.message||'Não foi possível registrar a retirada da chave.');
+    }
+  })();
 }
 
 async function executeKeyReturn(keyId,formData){
@@ -5155,61 +5540,71 @@ async function executeKeyReturn(keyId,formData){
     usuario_ultima_alteracao:S.user.login
   };
 
-  showLoading('Registrando devolução de chave...',{kicker:'Claviculário Operacional',title:'Processando Devolução...',progress:30,overlayId:'pdfProgressOverlay'});
+  // Optimistic UI: snapshot previous state for rollback guarantee
+  const prevKeys=[...S.keys];
+  const prevMoves=[...S.moves];
 
-  try{
-    await ensureDataWritePermission();
-    await withWriteLock('moves',async()=>{
-      const diskMoves=await read('movimentacao_chaves.csv',{force:true});
-      let nextMoves;
-      if(activeMove){
-        nextMoves=diskMoves.map(m=>m.id_movimento===updatedMove.id_movimento?updatedMove:m);
-        if(window.StorageService?.appendSingleRecord){
-          await window.StorageService.appendSingleRecord('movimentacao_chaves.csv',updatedMove,H.moves,{isNewRecord:false});
-          S.moves=nextMoves;
-          CSVService.buildEntry('movimentacao_chaves.csv',S.moves);
-        }else{
-          S.moves=await write('movimentacao_chaves.csv',nextMoves,H.moves);
-          CSVService.buildEntry('movimentacao_chaves.csv',S.moves);
-        }
-      }else{
-        nextMoves=[updatedMove,...(diskMoves||[])];
-        if(window.StorageService?.appendRecord){
-          await window.StorageService.appendRecord('movimentacao_chaves.csv',updatedMove,H.moves,{isNewRecord:true});
-          S.moves=nextMoves;
-          CSVService.buildEntry('movimentacao_chaves.csv',S.moves);
-        }else{
-          S.moves=await write('movimentacao_chaves.csv',nextMoves,H.moves);
-          CSVService.buildEntry('movimentacao_chaves.csv',S.moves);
-        }
-      }
-    });
-
-    await withWriteLock('keys',async()=>{
-      const diskKeys=await read('chaves.csv',{force:true});
-      const nextKeys=diskKeys.map(k=>k.id_chave===updatedKey.id_chave?updatedKey:k);
-      if(window.StorageService?.appendSingleRecord){
-        await window.StorageService.appendSingleRecord('chaves.csv',updatedKey,H.keys,{isNewRecord:false});
-        S.keys=nextKeys;
-        CSVService.buildEntry('chaves.csv',S.keys);
-      }else{
-        S.keys=await write('chaves.csv',nextKeys,H.keys);
-        CSVService.buildEntry('chaves.csv',S.keys);
-      }
-    });
-
-    await auditKeyAction('CHAVE_DEVOLVIDA',updatedKey,`Chave ${key.codigo} devolvida por ${formData.nome} (${formData.matricula})`);
-
-    hideLoading();
-    S.keyReturnTarget=null;
-    S.keyModalErrors={};
-    render();
-    showToast(`Chave ${key.codigo} devolvida ao claviculário com sucesso.`,'success');
-  }catch(err){
-    hideLoading();
-    console.error('Falha ao processar devolução de chave:',err);
-    fail(err.message||'Não foi possível registrar a devolução da chave.');
+  // Update in-memory state and UI immediately (0ms latency)
+  if(activeMove){
+    S.moves=S.moves.map(m=>m.id_movimento===updatedMove.id_movimento?updatedMove:m);
+  }else{
+    S.moves=[updatedMove,...(S.moves||[])];
   }
+  S.keys=S.keys.map(k=>k.id_chave===updatedKey.id_chave?updatedKey:k);
+  CSVService.buildEntry('movimentacao_chaves.csv',S.moves);
+  CSVService.buildEntry('chaves.csv',S.keys);
+
+  S.keyReturnTarget=null;
+  S.keyModalErrors={};
+  hideLoading();
+  render();
+  showToast(`Chave ${key.codigo} devolvida ao claviculário com sucesso.`,'success');
+
+  // Background worker: persist to disk with write locks and audit trail
+  (async()=>{
+    try{
+      await ensureDataWritePermission();
+      await withWriteLock('moves',async()=>{
+        const diskMoves=await read('movimentacao_chaves.csv',{force:true});
+        let nextMoves;
+        if(activeMove){
+          nextMoves=diskMoves.map(m=>m.id_movimento===updatedMove.id_movimento?updatedMove:m);
+          if(window.StorageService?.appendSingleRecord){
+            await window.StorageService.appendSingleRecord('movimentacao_chaves.csv',updatedMove,H.moves,{isNewRecord:false});
+          }else{
+            await write('movimentacao_chaves.csv',nextMoves,H.moves);
+          }
+        }else{
+          nextMoves=[updatedMove,...(diskMoves||[])];
+          if(window.StorageService?.appendRecord){
+            await window.StorageService.appendRecord('movimentacao_chaves.csv',updatedMove,H.moves,{isNewRecord:true});
+          }else{
+            await write('movimentacao_chaves.csv',nextMoves,H.moves);
+          }
+        }
+      });
+
+      await withWriteLock('keys',async()=>{
+        const diskKeys=await read('chaves.csv',{force:true});
+        const nextKeys=diskKeys.map(k=>k.id_chave===updatedKey.id_chave?updatedKey:k);
+        if(window.StorageService?.appendSingleRecord){
+          await window.StorageService.appendSingleRecord('chaves.csv',updatedKey,H.keys,{isNewRecord:false});
+        }else{
+          await write('chaves.csv',nextKeys,H.keys);
+        }
+      });
+
+      await auditKeyAction('CHAVE_DEVOLVIDA',updatedKey,`Chave ${key.codigo} devolvida por ${formData.nome} (${formData.matricula})`);
+    }catch(err){
+      console.error('Falha ao processar devolução de chave em segundo plano:',err);
+      S.keys=prevKeys;
+      S.moves=prevMoves;
+      CSVService.buildEntry('movimentacao_chaves.csv',S.moves);
+      CSVService.buildEntry('chaves.csv',S.keys);
+      render();
+      fail(err.message||'Não foi possível registrar a devolução da chave.');
+    }
+  })();
 }
 
 async function saveKey(ev){
@@ -5265,46 +5660,55 @@ async function saveKey(ev){
     };
   }
 
-  showLoading(isEdit?'Atualizando cadastro da chave...':'Cadastrando nova chave...',{kicker:'Cadastro de Chaves',title:'Salvando Chave...',progress:40,overlayId:'pdfProgressOverlay'});
-  try{
-    await ensureDataWritePermission();
-    await withWriteLock('keys',async()=>{
-      const diskKeys=await read('chaves.csv',{force:true});
-      let nextKeys;
-      if(isEdit){
-        nextKeys=diskKeys.map(k=>k.id_chave===keyRow.id_chave?keyRow:k);
-        if(window.StorageService?.appendSingleRecord){
-          await window.StorageService.appendSingleRecord('chaves.csv',keyRow,H.keys,{isNewRecord:false});
-          S.keys=nextKeys;
-          CSVService.buildEntry('chaves.csv',S.keys);
-        }else{
-          S.keys=await write('chaves.csv',nextKeys,H.keys);
-          CSVService.buildEntry('chaves.csv',S.keys);
-        }
-      }else{
-        nextKeys=[keyRow,...(diskKeys||[])];
-        if(window.StorageService?.appendRecord){
-          await window.StorageService.appendRecord('chaves.csv',keyRow,H.keys,{isNewRecord:true});
-          S.keys=nextKeys;
-          CSVService.buildEntry('chaves.csv',S.keys);
-        }else{
-          S.keys=await write('chaves.csv',nextKeys,H.keys);
-          CSVService.buildEntry('chaves.csv',S.keys);
-        }
-      }
-    });
+  // Optimistic UI: snapshot previous state
+  const prevKeys=[...S.keys];
 
-    await auditKeyAction(isEdit?'CHAVE_ALTERADA':'CHAVE_CADASTRADA',keyRow,`Chave ${keyRow.codigo} (${keyRow.descricao}) salva na unidade ${keyRow.unidade}`);
-
-    hideLoading();
-    S.editing=null;
-    render();
-    showToast(`Chave ${keyRow.codigo} salva com sucesso.`,'success');
-  }catch(err){
-    hideLoading();
-    console.error('Falha ao salvar chave:',err);
-    fail(err.message||'Não foi possível salvar o cadastro da chave.');
+  // Update in-memory state and UI immediately (0ms latency)
+  if(isEdit){
+    S.keys=S.keys.map(k=>k.id_chave===keyRow.id_chave?keyRow:k);
+  }else{
+    S.keys=[keyRow,...(S.keys||[])];
   }
+  CSVService.buildEntry('chaves.csv',S.keys);
+
+  S.editing=null;
+  hideLoading();
+  render();
+  showToast(`Chave ${keyRow.codigo} salva com sucesso.`,'success');
+
+  // Background worker: persist to disk with write lock and audit trail
+  (async()=>{
+    try{
+      await ensureDataWritePermission();
+      await withWriteLock('keys',async()=>{
+        const diskKeys=await read('chaves.csv',{force:true});
+        let nextKeys;
+        if(isEdit){
+          nextKeys=diskKeys.map(k=>k.id_chave===keyRow.id_chave?keyRow:k);
+          if(window.StorageService?.appendSingleRecord){
+            await window.StorageService.appendSingleRecord('chaves.csv',keyRow,H.keys,{isNewRecord:false});
+          }else{
+            await write('chaves.csv',nextKeys,H.keys);
+          }
+        }else{
+          nextKeys=[keyRow,...(diskKeys||[])];
+          if(window.StorageService?.appendRecord){
+            await window.StorageService.appendRecord('chaves.csv',keyRow,H.keys,{isNewRecord:true});
+          }else{
+            await write('chaves.csv',nextKeys,H.keys);
+          }
+        }
+      });
+
+      await auditKeyAction(isEdit?'CHAVE_ALTERADA':'CHAVE_CADASTRADA',keyRow,`Chave ${keyRow.codigo} (${keyRow.descricao}) salva na unidade ${keyRow.unidade}`);
+    }catch(err){
+      console.error('Falha ao salvar chave em segundo plano:',err);
+      S.keys=prevKeys;
+      CSVService.buildEntry('chaves.csv',S.keys);
+      render();
+      fail(err.message||'Não foi possível salvar o cadastro da chave.');
+    }
+  })();
 }
 
 // Modais do Módulo de Chaves
