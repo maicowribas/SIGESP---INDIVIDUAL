@@ -376,6 +376,7 @@ function normalizeOccurrenceRow(raw,index=0,existingList=[]){
     raw.supervisao=raw.local_ocorrencia;
   }
 
+  const isCanonicalSchema=('id_ocorrencia' in raw)&&('numero_protocolo' in raw)&&('relato_detalhado' in raw)&&!('arma_envolvida' in raw)&&!('local_ocorrencia' in raw);
   let normalizedKeys=null;
   function getNormalizedMap(){
     if(!normalizedKeys){
@@ -392,14 +393,18 @@ function normalizeOccurrenceRow(raw,index=0,existingList=[]){
   function getField(canonicalName){
     const direct=raw[canonicalName];
     if(direct!==undefined&&direct!==null){
-      const s=String(direct).trim();
+      const s=typeof direct==='string'?direct.trim():String(direct).trim();
       if(s!==''){
         if(canonicalName==='responsavel_registro'||canonicalName==='matricula_responsavel'){
           if(!isInvalidResponsibleValue(s))return s;
         }else{
           return s;
         }
+      }else if(isCanonicalSchema){
+        return'';
       }
+    }else if(isCanonicalSchema){
+      return'';
     }
     const synonyms=OCC_FIELD_SYNONYMS[canonicalName];
     if(synonyms&&synonyms.length){
@@ -428,11 +433,7 @@ function normalizeOccurrenceRow(raw,index=0,existingList=[]){
   let idInt=getField('id_interno');
   let proto=getField('numero_protocolo');
   if(!idOcc){
-    const maxExisting=existingList.reduce((max,r)=>{
-      const n=parseInt(r.id_ocorrencia||r.id||'0',10);
-      return !isNaN(n)&&n>max?n:max;
-    },0);
-    idOcc=String(maxExisting+index+1);
+    idOcc=String(index+1);
   }
   if(!idInt){
     idInt=uid();
@@ -542,28 +543,49 @@ function normalizeOccurrenceRow(raw,index=0,existingList=[]){
   Object.defineProperty(resObj,'_norm',{value:true,enumerable:false,configurable:true});
   return resObj;
 }
+let _userLookupRef=null,_userLookupMap=null;
+function getUserLookupMap(){
+  const list=S.users||[];
+  if(_userLookupRef===list&&_userLookupMap)return _userLookupMap;
+  const map=new Map();
+  for(let i=0,len=list.length;i<len;i++){
+    const u=list[i];
+    if(!u)continue;
+    const uLogin=String(u.login||'').trim().toLowerCase();
+    const uNome=String(u.nome||'').trim().toLowerCase();
+    const uId=String(u.id_usuario||'').trim().toLowerCase();
+    const uMat=String(u.matricula||'').trim().toLowerCase();
+    if(uLogin&&!map.has(uLogin))map.set(uLogin,u);
+    if(uNome&&!map.has(uNome))map.set(uNome,u);
+    if(uId&&!map.has(uId))map.set(uId,u);
+    if(uMat&&!map.has(uMat))map.set(uMat,u);
+  }
+  _userLookupRef=list;
+  _userLookupMap=map;
+  return map;
+}
 function getOccurrenceResponsibleUser(x){
   if(!x)return null;
   let rawResp=String(x.responsavel_registro||x.responsavel||x.operador_responsavel||x.usuario_registro||'').trim();
   if(isInvalidResponsibleValue(rawResp))rawResp='';
   let rawMat=String(x.matricula_responsavel||x.responsavel_matricula||x.id_operador||x.id_usuario||'').trim();
   if(isInvalidResponsibleValue(rawMat))rawMat='';
-  const parenMatch=/\(([^)]+)\)/.exec(rawResp);
-  const parenVal=parenMatch?parenMatch[1].trim():'';
-  const cleanName=rawResp.replace(/\s*\([^)]+\)/g,'').trim();
-
-  const list=S.users||[];
-  for(let i=0,len=list.length;i<len;i++){
-    const u=list[i];
-    if(!u)continue;
-    const uLogin=String(u.login||'').toLowerCase();
-    const uNome=String(u.nome||'').toLowerCase();
-    const uId=String(u.id_usuario||'').toLowerCase();
-    const uMat=String(u.matricula||'').toLowerCase();
-    if(rawResp&&(uLogin===rawResp.toLowerCase()||uNome===rawResp.toLowerCase()||uId===rawResp.toLowerCase()))return u;
-    if(cleanName&&(uNome===cleanName.toLowerCase()||uLogin===cleanName.toLowerCase()))return u;
-    if(parenVal&&(uLogin===parenVal.toLowerCase()||uId===parenVal.toLowerCase()||uMat===parenVal.toLowerCase()))return u;
-    if(rawMat&&(uId===rawMat.toLowerCase()||uMat===rawMat.toLowerCase()||uLogin===rawMat.toLowerCase()))return u;
+  if(!rawResp&&!rawMat)return null;
+  const map=getUserLookupMap();
+  if(rawResp){
+    const direct=map.get(rawResp.toLowerCase());
+    if(direct)return direct;
+    if(rawResp.includes('(')){
+      const parenMatch=/\(([^)]+)\)/.exec(rawResp);
+      const parenVal=parenMatch?parenMatch[1].trim().toLowerCase():'';
+      const cleanName=rawResp.replace(/\s*\([^)]+\)/g,'').trim().toLowerCase();
+      if(cleanName&&map.has(cleanName))return map.get(cleanName);
+      if(parenVal&&map.has(parenVal))return map.get(parenVal);
+    }
+  }
+  if(rawMat){
+    const byMat=map.get(rawMat.toLowerCase());
+    if(byMat)return byMat;
   }
   return null;
 }
@@ -1200,7 +1222,7 @@ throw new DataScopeError('Registro não encontrado ou sem autorização para ace
 console.log('[PERMISSAO] Validação concluída:',{usuario:user.login,perfil:user.perfil,id_ocorrencia:occurrence.id_ocorrencia,protocolo:occurrence.numero_protocolo,unidade:occurrence.unidade,autor:occurrence.responsavel_registro,acesso:'ACESSO_AUTORIZADO'});
 return occurrence;
 }
-async function load(forceReload=false){
+async function load(forceReload=false,skipRender=false){
   if(forceReload===true||forceReload?.type==='click')CSVService.invalidateCache();
   await ensureAmbientalCsv();
   const[u,o,k,m,a,organization,natures,inspecoes,delRecs]=await Promise.all([
@@ -1236,7 +1258,6 @@ async function load(forceReload=false){
         await write('ocorrencias.csv',merged,H.occ);
         o.splice(0,o.length,...merged);
       }
-      // Limpa ocorrencias_pendentes.csv após migração para nunca reinserir pendências já validadas
       await write('ocorrencias_pendentes.csv',[],H.occ).catch(()=>{});
     }
   }catch(err){
@@ -1245,10 +1266,20 @@ async function load(forceReload=false){
   setOrganizationContext(organization);
   S.users=normalizedUsers(u);
   S.natureCatalog=natures;
-  const consolidatedOcc=window.StorageService?.consolidateVersionedRows
-    ? window.StorageService.consolidateVersionedRows(o||[])
-    : (o||[]);
-  S.occ=consolidatedOcc.map((x,idx)=>normalizeOccurrenceRow(x,idx,consolidatedOcc)).filter(Boolean);
+  const rawOccList=o||[];
+  const consolidatedOcc=(rawOccList._consolidated||!window.StorageService?.consolidateVersionedRows)
+    ? rawOccList
+    : window.StorageService.consolidateVersionedRows(rawOccList);
+  const normOcc=[];
+  const totalOcc=consolidatedOcc.length;
+  for(let idx=0;idx<totalOcc;idx++){
+    const normItem=normalizeOccurrenceRow(consolidatedOcc[idx],idx,consolidatedOcc);
+    if(normItem)normOcc.push(normItem);
+    if((idx&4095)===4095){
+      await new Promise(r=>setTimeout(r,0));
+    }
+  }
+  S.occ=normOcc;
   S.pending=S.occ.filter(isPendingOccurrence);
   S.keys=k;
   S.moves=m;
@@ -1268,10 +1299,11 @@ async function load(forceReload=false){
   S.permissionNeeded=false;
   S.restoring=false;
   S.lastSyncTime=new Date();
-  render();
+  if(!skipRender)render();
   updateSyncIndicatorElement();
 }
-async function prepare(handle){
+let _isConnectingFolder=false;
+async function prepare(handle,options={}){
   if(window.SIGESP_PERF_TRACE&&console.time)console.time('[SIGESP:Perf] autorizacao e listagem da pasta');
   S.dir=handle;
   CSVService.invalidateCache();
@@ -1287,10 +1319,23 @@ async function prepare(handle){
   await initializeOrganizationCatalog();
   await handle.getDirectoryHandle('anexos',{create:true});
   if(window.SIGESP_PERF_TRACE&&console.timeEnd)console.timeEnd('[SIGESP:Perf] autorizacao e listagem da pasta');
-  await load(false);
+  await load(false,Boolean(options?.skipRender));
   startBackgroundPolling();
 }
-async function connectDataFolder(silent=false){const h=new ServerDirectoryHandle(DATA_FOLDER,'');await prepare(h);if(!silent)S.message='Pasta dados sincronizada com sucesso.';render()}
+async function connectDataFolder(silent=false){
+  if(_isConnectingFolder)return;
+  _isConnectingFolder=true;
+  try{
+    const h=new ServerDirectoryHandle(DATA_FOLDER,'');
+    await prepare(h,{skipRender:!silent});
+    if(!silent){
+      S.message='Pasta dados sincronizada com sucesso.';
+      render();
+    }
+  }finally{
+    _isConnectingFolder=false;
+  }
+}
 const connectServerFolder=connectDataFolder;
 let _isFilePickerActive=false;
 let _filePickerCooldownUntil=0;
@@ -1313,7 +1358,7 @@ function markFilePickerClosed(cooldownMs=1500){
   }
 }
 function isFilePickerBlockingSync(){
-  return _isFilePickerActive||Date.now()<_filePickerCooldownUntil;
+  return _isFilePickerActive||_isConnectingFolder||Date.now()<_filePickerCooldownUntil;
 }
 function triggerFallbackFolderInput(msg){
   if(msg)S.message=msg;
@@ -1333,22 +1378,32 @@ async function selectFolder(){if(denyOperatorAccess())return;S.folderModal=true;
 async function pickFolderWithPicker(ev){
   if(ev&&typeof ev.preventDefault==='function')ev.preventDefault();
   if(denyOperatorAccess())return;
-  if(_isFilePickerActive)return;
+  if(_isFilePickerActive||_isConnectingFolder)return;
   if(typeof window.showDirectoryPicker==='function'){
     markFilePickerOpening();
     try{
       // IMPORTANTE: showDirectoryPicker deve ser a PRIMEIRA chamada assíncrona no clique para preservar a Transient User Activation
       const handle=await window.showDirectoryPicker({mode:'readwrite'});
       markFilePickerClosed(2000);
-      await DirectoryPersistence.saveDirectoryHandle(handle);
-      S.savedHandle=handle;
-      S.permissionNeeded=false;
-      await prepare(handle);
-      S.folderModal=false;
-      S.message=`Pasta "${handle.name}" conectada com sucesso.`;
+      _isConnectingFolder=true;
+      showLoading('Conectando e sincronizando pasta selecionada...',{kicker:'File System Access API',title:`Carregando dados da pasta "${handle.name}"...`,progress:25,overlayId:'pdfProgressOverlay'});
+      try{
+        await new Promise(r=>setTimeout(r,0));
+        await DirectoryPersistence.saveDirectoryHandle(handle);
+        S.savedHandle=handle;
+        S.permissionNeeded=false;
+        S.folderModal=false;
+        await prepare(handle,{skipRender:true});
+        S.message=`Pasta "${handle.name}" conectada com sucesso.`;
+      }finally{
+        _isConnectingFolder=false;
+        hideLoading();
+      }
       render();
       return;
     }catch(err){
+      _isConnectingFolder=false;
+      hideLoading();
       markFilePickerClosed(800);
       if(err?.name==='AbortError')return;
       console.warn('showDirectoryPicker cancelado ou bloqueado:',err);
@@ -1483,6 +1538,7 @@ async function restoreFolder(){
 }
 async function authorizeSaved(){
   if(denyOperatorAccess())return;
+  if(_isConnectingFolder)return;
   const handle=S.savedHandle||S.dir;
   if(!handle){
     S.permissionNeeded=false;
@@ -1498,10 +1554,12 @@ async function authorizeSaved(){
       }
     }
     if(p==='granted'){
+      _isConnectingFolder=true;
       S.permissionNeeded=false;
-      S.restoring=false;
+      S.restoring=true;
       render();
       try{
+        await new Promise(r=>setTimeout(r,0));
         for await(const _entry of handle.keys()){
           break;
         }
@@ -1514,15 +1572,20 @@ async function authorizeSaved(){
           S.dir=null;
           S.savedHandle=null;
           S.permissionNeeded=false;
+          S.restoring=false;
           S.message='A pasta selecionada não foi encontrada no computador (pode ter sido excluída ou renomeada). Por favor, selecione a pasta novamente.';
           render();
           return;
         }
         throw fsErr;
+      }finally{
+        _isConnectingFolder=false;
       }
     }
     fail('Permissão de acesso à pasta não foi concedida pelo navegador.');
   }catch(err){
+    _isConnectingFolder=false;
+    S.restoring=false;
     if(err?.name==='NotFoundError'||/not found/i.test(err?.message||'')){
       await DirectoryPersistence.clearDirectoryHandle();
       S.dir=null;

@@ -247,9 +247,10 @@ const StorageService = (() => {
    * Detecta automaticamente o delimitador do CSV (;, ,, \t)
    */
   function detectDelimiter(text) {
-    const s = String(text ?? '').replace(/^\ufeff/, '').trim();
+    const s = String(text ?? '').replace(/^\ufeff/, '').trimStart();
     if (!s) return ';';
-    const firstLine = s.split(/\r?\n/)[0] || '';
+    const nlIdx = s.indexOf('\n');
+    const firstLine = (nlIdx >= 0 ? s.slice(0, nlIdx) : s).replace(/\r$/, '');
     let inQuotes = false;
     let semicolons = 0, commas = 0, tabs = 0;
     for (let i = 0; i < firstLine.length; i++) {
@@ -338,13 +339,16 @@ const StorageService = (() => {
     const result = [];
     for (let i = 1; i < rows.length; i++) {
       const r = rows[i];
-      if (r.length === 1 && r[0] === '') continue;
-      if (String(r[0] ?? '').trim().toLowerCase() === 'id_ocorrencia' && String(r[1] ?? '').trim().toLowerCase() === 'id_interno') continue;
-      let hasAnyValue = false;
-      for (let k = 0; k < r.length; k++) {
-        if (String(r[k] ?? '').trim() !== '') {
-          hasAnyValue = true;
-          break;
+      if (!r || r.length === 0 || (r.length === 1 && r[0] === '')) continue;
+      const c0 = String(r[0] ?? '').trim();
+      if (c0.toLowerCase() === 'id_ocorrencia' && String(r[1] ?? '').trim().toLowerCase() === 'id_interno') continue;
+      let hasAnyValue = c0 !== '';
+      if (!hasAnyValue) {
+        for (let k = 1; k < r.length; k++) {
+          if (String(r[k] ?? '').trim() !== '') {
+            hasAnyValue = true;
+            break;
+          }
         }
       }
       if (!hasAnyValue) continue;
@@ -413,6 +417,95 @@ const StorageService = (() => {
         }
       }
 
+      const obj = {};
+      for (let j = 0; j < headers.length; j++) {
+        obj[headers[j]] = r[j] ?? '';
+      }
+      result.push(obj);
+    }
+    return result;
+  }
+
+  async function parseCsvAsync(text) {
+    const s = String(text ?? '').replace(/^\ufeff/, '');
+    if (s.length <= 250000) {
+      return parseCsv(s);
+    }
+    const delimiter = detectDelimiter(s);
+    const rows = [];
+    let row = [];
+    let field = '';
+    let inQuotes = false;
+    let nextYieldAt = 300000;
+
+    for (let i = 0; i < s.length; i++) {
+      if (i >= nextYieldAt) {
+        nextYieldAt = i + 300000;
+        await new Promise(r => setTimeout(r, 0));
+      }
+      const ch = s[i];
+      if (inQuotes) {
+        if (ch === '"') {
+          if (s[i + 1] === '"') {
+            field += '"';
+            i++;
+          } else {
+            inQuotes = false;
+          }
+        } else {
+          field += ch;
+        }
+      } else {
+        if (ch === '"') {
+          inQuotes = true;
+        } else if (ch === delimiter) {
+          row.push(field);
+          field = '';
+        } else if (ch === '\n') {
+          if (field.endsWith('\r')) field = field.slice(0, -1);
+          row.push(field);
+          rows.push(row);
+          row = [];
+          field = '';
+        } else if (ch === '\r') {
+          if (s[i + 1] !== '\n') {
+            row.push(field);
+            rows.push(row);
+            row = [];
+            field = '';
+          }
+        } else {
+          field += ch;
+        }
+      }
+    }
+    if (field || row.length > 0) {
+      if (field.endsWith('\r')) field = field.slice(0, -1);
+      row.push(field);
+      rows.push(row);
+    }
+
+    if (rows.length === 0) return [];
+    const headers = rows[0].map(h => String(h || '').replace(/^["'\s]+|["'\s]+$/g, '').trim());
+    const result = [];
+    for (let i = 1; i < rows.length; i++) {
+      if ((i & 4095) === 0) {
+        await new Promise(r => setTimeout(r, 0));
+      }
+      const r = rows[i];
+      if (!r || r.length === 0 || (r.length === 1 && r[0] === '')) continue;
+      const c0 = String(r[0] ?? '').trim();
+      if (c0.toLowerCase() === 'id_ocorrencia' && String(r[1] ?? '').trim().toLowerCase() === 'id_interno') continue;
+      let hasAnyValue = c0 !== '';
+      if (!hasAnyValue) {
+        for (let k = 1; k < r.length; k++) {
+          if (String(r[k] ?? '').trim() !== '') {
+            hasAnyValue = true;
+            break;
+          }
+        }
+      }
+      if (!hasAnyValue) continue;
       const obj = {};
       for (let j = 0; j < headers.length; j++) {
         obj[headers[j]] = r[j] ?? '';
@@ -503,7 +596,7 @@ const StorageService = (() => {
       if (!key) continue;
 
       if (!map.has(key)) {
-        map.set(key, { ...r });
+        map.set(key, r);
         order.push(key);
       } else {
         const existing = map.get(key);
@@ -564,7 +657,9 @@ const StorageService = (() => {
         }
       }
     }
-    return order.map(k => map.get(k)).filter(Boolean);
+    const out = order.map(k => map.get(k)).filter(Boolean);
+    Object.defineProperty(out, '_consolidated', { value: true, enumerable: false, configurable: true });
+    return out;
   }
 
   /**
@@ -681,6 +776,7 @@ const StorageService = (() => {
 
     async saveRecordsBulkLocally(fileName, records) {
       if (typeof indexedDB === 'undefined' || !Array.isArray(records) || !records.length) return;
+      if (records.length > 500) return;
       try {
         const db = await this.open();
         if (!db || !db.objectStoreNames.contains('records')) return;
@@ -1051,6 +1147,18 @@ const StorageService = (() => {
       }
 
       if (dir.isServer && !dir.relPath) {
+        if (fileName === 'ocorrencias.csv') {
+          try {
+            const batchUrl = `/api/storage/occurrences/batch?knownSig=${encodeURIComponent(_lastKnownBatchSig || '')}&_t=${Date.now()}`;
+            const res = await fetch(batchUrl, { method: 'GET', headers: { 'Cache-Control': 'no-cache' } });
+            if (res.ok) {
+              const payload = await res.json();
+              const size = Number(payload?.totalSize ?? payload?.size ?? 0);
+              const mtimeMs = Number(payload?.maxMtimeMs ?? payload?.mtimeMs ?? 0);
+              return { exists: size > 0 || (payload?.count || 0) > 0, size, mtimeMs, sig: payload?.sig || '' };
+            }
+          } catch {}
+        }
         if (typeof fetchServerStorage !== 'function') {
           throw new Error('fetchServerStorage indisponível no cliente.');
         }
@@ -1073,9 +1181,10 @@ const StorageService = (() => {
       if (fileName === 'ocorrencias.csv') {
         try {
           const handles = await this._listNativeOccurrenceFileHandles(dir);
+          let totalSize = 0;
+          let maxMtime = 0;
+          let hasAny = handles.length > 0;
           if (handles.length > 0) {
-            let totalSize = 0;
-            let maxMtime = 0;
             const chunkSize = 64;
             for (let i = 0; i < handles.length; i += chunkSize) {
               const slice = handles.slice(i, i + chunkSize);
@@ -1092,8 +1201,19 @@ const StorageService = (() => {
                 if (st.mtimeMs > maxMtime) maxMtime = st.mtimeMs;
               }
             }
-            return { exists: true, size: totalSize, mtimeMs: maxMtime };
           }
+          try {
+            const fh = await dir.getFileHandle(fileName, { create: false });
+            const f = await fh.getFile();
+            const fSize = Number(f.size || 0);
+            const fMtime = Number(f.lastModified || 0);
+            if (fSize > 0) {
+              hasAny = true;
+              totalSize += fSize;
+              if (fMtime > maxMtime) maxMtime = fMtime;
+            }
+          } catch {}
+          return { exists: hasAny, size: totalSize, mtimeMs: maxMtime };
         } catch {}
       }
 
@@ -1384,12 +1504,20 @@ const StorageService = (() => {
 
     async _listNativeOccurrenceFileHandles(dir) {
       if (!dir) return [];
+      const now = Date.now();
+      if (this._nativeHandlesCache && this._nativeHandlesCache.dir === dir && now - this._nativeHandlesCache.ts < 1500) {
+        return this._nativeHandlesCache.handles;
+      }
       const found = [];
+      let count = 0;
       try {
         if (typeof dir.entries === 'function') {
           for await (const [name, handle] of dir.entries()) {
             if (handle.kind === 'file' && isIndividualOccurrenceFileName(name)) {
               found.push({ name, handle });
+            }
+            if ((++count & 255) === 0) {
+              await new Promise(r => setTimeout(r, 0));
             }
           }
         } else if (typeof dir.values === 'function') {
@@ -1397,10 +1525,14 @@ const StorageService = (() => {
             if (handle.kind === 'file' && isIndividualOccurrenceFileName(handle.name)) {
               found.push({ name: handle.name, handle });
             }
+            if ((++count & 255) === 0) {
+              await new Promise(r => setTimeout(r, 0));
+            }
           }
         }
       } catch {}
       found.sort((a, b) => a.name.localeCompare(b.name));
+      this._nativeHandlesCache = { dir, ts: Date.now(), handles: found };
       return found;
     },
 
@@ -1419,7 +1551,10 @@ const StorageService = (() => {
       if (this.isEncryptedFile(trimmed)) {
         csvPlain = await window.CryptoService.decrypt(trimmed);
       }
-      const parsed = parseCsv(csvPlain);
+      const parsed = csvPlain.length > 250000 ? await parseCsvAsync(csvPlain) : parseCsv(csvPlain);
+      if (parsed.length > 5000) {
+        await new Promise(r => setTimeout(r, 0));
+      }
       const rows = consolidateVersionedRows(parsed);
       _individualOccFileCache.set(indivName, {
         rawSig,
@@ -1427,13 +1562,15 @@ const StorageService = (() => {
         size: size || trimmed.length,
         rows
       });
-      for (const r of rows) {
-        const idInt = String(r.id_interno || '').trim();
-        const idOcc = String(r.id_ocorrencia || '').trim();
-        const proto = String(r.numero_protocolo || '').trim().toUpperCase();
-        if (idInt) _recordKeyToFileMap.set(`INT:${idInt}`, indivName);
-        if (idOcc) _recordKeyToFileMap.set(`OCC:${idOcc}`, indivName);
-        if (proto) _recordKeyToFileMap.set(`PROTO:${proto}`, indivName);
+      if (indivName !== '__legacy_ocorrencias.csv__') {
+        for (const r of rows) {
+          const idInt = String(r.id_interno || '').trim();
+          const idOcc = String(r.id_ocorrencia || '').trim();
+          const proto = String(r.numero_protocolo || '').trim().toUpperCase();
+          if (idInt) _recordKeyToFileMap.set(`INT:${idInt}`, indivName);
+          if (idOcc) _recordKeyToFileMap.set(`OCC:${idOcc}`, indivName);
+          if (proto) _recordKeyToFileMap.set(`PROTO:${proto}`, indivName);
+        }
       }
       return rows;
     },
@@ -1442,7 +1579,7 @@ const StorageService = (() => {
       const fileName = 'ocorrencias.csv';
       const cached = _rawFileCache.get(fileName);
       if (cached && !options?.force) {
-        return cached.rows.map(r => ({ ...r }));
+        return cached.rows.slice();
       }
 
       const dir = getActiveDirectoryHandle();
@@ -1464,16 +1601,24 @@ const StorageService = (() => {
           if (res.ok) {
             const payload = await res.json();
             if (payload && payload.unchanged && cached && Array.isArray(cached.rows)) {
-              return cached.rows.map(r => ({ ...r }));
+              const effMtime = Number(payload?.maxMtimeMs ?? payload?.mtimeMs ?? cached.mtimeMs);
+              const effSize = Number(payload?.totalSize ?? payload?.size ?? cached.size);
+              cached.mtimeMs = effMtime;
+              cached.size = effSize;
+              if (typeof window !== 'undefined' && typeof window.syncFreshCsvMeta === 'function') {
+                window.syncFreshCsvMeta(fileName, effMtime, effSize);
+              }
+              return cached.rows.slice();
             }
 
             const files = Array.isArray(payload?.files) ? payload.files : [];
             const activeNames = new Set(files.map(f => f.name));
+            if (payload?.legacyRawText) activeNames.add('__legacy_ocorrencias.csv__');
             for (const k of _individualOccFileCache.keys()) {
               if (!activeNames.has(k)) _individualOccFileCache.delete(k);
             }
 
-            const allRows = [];
+            let allRows = [];
             const chunkSize = 128;
             for (let i = 0; i < files.length; i += chunkSize) {
               const slice = files.slice(i, i + chunkSize);
@@ -1493,40 +1638,40 @@ const StorageService = (() => {
               }
             }
 
+            let legacyRows = [];
             if (payload?.legacyRawText && String(payload.legacyRawText).trim()) {
               try {
-                const legRows = await this._decryptIndividualOccurrenceText(
+                legacyRows = await this._decryptIndividualOccurrenceText(
                   '__legacy_ocorrencias.csv__',
                   payload.legacyRawText,
-                  payload.mtimeMs,
-                  payload.size
+                  payload.maxMtimeMs || payload.mtimeMs,
+                  payload.totalSize || payload.size
                 );
-                for (const r of legRows) allRows.push(r);
               } catch {}
             }
 
-            const consolidated = consolidateVersionedRows(allRows);
-            const finalMtime = Number(payload?.mtimeMs || Date.now());
-            const finalSize = Number(payload?.size || 0);
+            let consolidated;
+            if (files.length === 0 && legacyRows.length > 0) {
+              consolidated = legacyRows;
+            } else {
+              for (const r of legacyRows) allRows.push(r);
+              if (allRows.length > 5000) await new Promise(r => setTimeout(r, 0));
+              consolidated = consolidateVersionedRows(allRows);
+            }
+
+            const finalMtime = Number(payload?.maxMtimeMs ?? payload?.mtimeMs ?? Date.now());
+            const finalSize = Number(payload?.totalSize ?? payload?.size ?? 0);
             const batchSig = String(payload?.sig || `${files.length}:${finalMtime}:${finalSize}`);
             _lastKnownBatchSig = batchSig;
 
             _rawFileCache.set(fileName, {
               rawSig: batchSig,
-              rows: consolidated.map(r => ({ ...r })),
+              rows: consolidated,
               mtimeMs: finalMtime,
               size: finalSize
             });
             if (typeof window !== 'undefined' && typeof window.syncFreshCsvMeta === 'function') {
               window.syncFreshCsvMeta(fileName, finalMtime, finalSize);
-            }
-
-            // Se havia arquivo monolítico legado com dados, migra automaticamente cada registro para seu arquivo individual
-            if (payload?.legacyRawText && consolidated.length > 0 && !options?.skipAutoEncrypt) {
-              const resolvedHeaders = CANONICAL_SEEDS[fileName]?.headers || Object.keys(consolidated[0]);
-              this._writeOccurrencesBatchToStorage(consolidated, resolvedHeaders, { alreadyConsolidated: true })
-                .then(() => this.deleteFile('ocorrencias.csv').catch(() => {}))
-                .catch(() => {});
             }
 
             return consolidated;
@@ -1550,6 +1695,7 @@ const StorageService = (() => {
         }
 
         const activeNames = new Set(handles.map(h => h.name));
+        if (legacyFile && legacyFile.size > 0) activeNames.add('__legacy_ocorrencias.csv__');
         for (const k of _individualOccFileCache.keys()) {
           if (!activeNames.has(k)) _individualOccFileCache.delete(k);
         }
@@ -1590,42 +1736,49 @@ const StorageService = (() => {
           }
         }
 
+        let legacyRows = [];
         if (legacyFile && legacyFile.size > 0) {
           try {
-            const legText = await legacyFile.text();
-            totalSize += Number(legacyFile.size || 0);
-            if (Number(legacyFile.lastModified || 0) > maxMtime) {
-              maxMtime = Number(legacyFile.lastModified || 0);
+            const lSize = Number(legacyFile.size || 0);
+            const lMtime = Number(legacyFile.lastModified || 0);
+            totalSize += lSize;
+            if (lMtime > maxMtime) maxMtime = lMtime;
+
+            const cachedLeg = _individualOccFileCache.get('__legacy_ocorrencias.csv__');
+            if (cachedLeg && cachedLeg.mtimeMs > 0 && cachedLeg.mtimeMs === lMtime && cachedLeg.size === lSize && Array.isArray(cachedLeg.rows)) {
+              legacyRows = cachedLeg.rows;
+            } else {
+              const legText = await legacyFile.text();
+              legacyRows = await this._decryptIndividualOccurrenceText(
+                '__legacy_ocorrencias.csv__',
+                legText,
+                lMtime,
+                lSize
+              );
             }
-            const legRows = await this._decryptIndividualOccurrenceText(
-              '__legacy_ocorrencias.csv__',
-              legText,
-              Number(legacyFile.lastModified || 0),
-              Number(legacyFile.size || 0)
-            );
-            for (const r of legRows) allRows.push(r);
           } catch {}
         }
 
-        const consolidated = consolidateVersionedRows(allRows);
+        let consolidated;
+        if (handles.length === 0 && legacyRows.length > 0) {
+          consolidated = legacyRows;
+        } else {
+          for (const r of legacyRows) allRows.push(r);
+          if (allRows.length > 5000) await new Promise(r => setTimeout(r, 0));
+          consolidated = consolidateVersionedRows(allRows);
+        }
+
         const batchSig = `${handles.length}:${maxMtime}:${totalSize}`;
         _lastKnownBatchSig = batchSig;
 
         _rawFileCache.set(fileName, {
           rawSig: batchSig,
-          rows: consolidated.map(r => ({ ...r })),
+          rows: consolidated,
           mtimeMs: maxMtime || Date.now(),
           size: totalSize
         });
         if (typeof window !== 'undefined' && typeof window.syncFreshCsvMeta === 'function') {
           window.syncFreshCsvMeta(fileName, maxMtime || Date.now(), totalSize);
-        }
-
-        if (legacyFile && legacyFile.size > 0 && consolidated.length > 0 && !options?.skipAutoEncrypt) {
-          const resolvedHeaders = CANONICAL_SEEDS[fileName]?.headers || Object.keys(consolidated[0]);
-          this._writeOccurrencesBatchToStorage(consolidated, resolvedHeaders, { alreadyConsolidated: true })
-            .then(() => this.deleteFile('ocorrencias.csv').catch(() => {}))
-            .catch(() => {});
         }
 
         return consolidated;
@@ -1643,7 +1796,7 @@ const StorageService = (() => {
       const nowFn = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
       const tProc0 = nowFn();
       const safeRows = Array.isArray(rows) ? rows : [];
-      const consolidatedRows = options?.alreadyConsolidated ? safeRows : consolidateVersionedRows(safeRows);
+      const consolidatedRows = (options?.alreadyConsolidated || safeRows._consolidated) ? safeRows : consolidateVersionedRows(safeRows);
       const tProc1 = nowFn();
 
       const resolvedHeaders = (headers && headers.length)
@@ -1655,97 +1808,182 @@ const StorageService = (() => {
       }
 
       let existingNames = [];
+      let hasLegacyBase = false;
       if (dir.isServer && !dir.relPath) {
         try {
-          const batchRes = await fetch(`/api/storage/occurrences/batch?_t=${Date.now()}`, { method: 'GET' });
+          const batchRes = await fetch(`/api/storage/occurrences/batch?knownSig=${encodeURIComponent(_lastKnownBatchSig || '')}&_t=${Date.now()}`, { method: 'GET' });
           if (batchRes.ok) {
             const bData = await batchRes.json();
             if (Array.isArray(bData?.files)) {
               existingNames = bData.files.map(f => f.name);
             }
+            if (bData?.sig && String(bData.sig).includes(':L:')) {
+              hasLegacyBase = true;
+            }
           }
         } catch {}
       } else {
+        this._nativeHandlesCache = null;
         const handles = await this._listNativeOccurrenceFileHandles(dir);
         existingNames = handles.map(h => h.name);
+        try {
+          const legFh = await dir.getFileHandle('ocorrencias.csv', { create: false });
+          const legF = await legFh.getFile();
+          if (legF && legF.size > 0) hasLegacyBase = true;
+        } catch {}
       }
 
+      const existingNameSet = new Set(existingNames);
       const targetFileSet = new Set();
       let totalSize = 0;
       let maxMtime = Date.now();
       const tWrite0 = nowFn();
 
-      const chunkSize = 32;
-      for (let i = 0; i < consolidatedRows.length; i += chunkSize) {
-        const slice = consolidatedRows.slice(i, i + chunkSize);
-        await Promise.all(
-          slice.map(async (record, idx) => {
-            const indivFileName = getIndividualOccurrenceFileName(record);
+      // Se existe base legada massiva (> 250 registros), preserva a base em ocorrencias.csv e grava individualmente apenas os arquivos individuais ativos
+      if (hasLegacyBase && consolidatedRows.length > 250) {
+        const indivRowsToWrite = [];
+        const legacyRowsToKeep = [];
+        for (const r of consolidatedRows) {
+          const indivFileName = getIndividualOccurrenceFileName(r);
+          const idInt = String(r.id_interno || '').trim();
+          const idOcc = String(r.id_ocorrencia || '').trim();
+          const proto = String(r.numero_protocolo || '').trim().toUpperCase();
+          const isMappedIndiv = existingNameSet.has(indivFileName) ||
+            (idInt && _recordKeyToFileMap.has(`INT:${idInt}`)) ||
+            (idOcc && _recordKeyToFileMap.has(`OCC:${idOcc}`)) ||
+            (proto && _recordKeyToFileMap.has(`PROTO:${proto}`));
+          if (isMappedIndiv) {
             targetFileSet.add(indivFileName);
+            indivRowsToWrite.push({ record: r, indivFileName });
+          } else {
+            legacyRowsToKeep.push(r);
+          }
+        }
 
-            const idInt = String(record.id_interno || '').trim();
-            const idOcc = String(record.id_ocorrencia || '').trim();
-            const proto = String(record.numero_protocolo || '').trim().toUpperCase();
-            if (idInt) _recordKeyToFileMap.set(`INT:${idInt}`, indivFileName);
-            if (idOcc) _recordKeyToFileMap.set(`OCC:${idOcc}`, indivFileName);
-            if (proto) _recordKeyToFileMap.set(`PROTO:${proto}`, indivFileName);
-
-            // Se o registro já está idêntico no cache individual e no disco, evita regravar desnecessariamente
+        const chunkSize = 32;
+        for (let i = 0; i < indivRowsToWrite.length; i += chunkSize) {
+          const slice = indivRowsToWrite.slice(i, i + chunkSize);
+          await Promise.all(slice.map(async ({ record, indivFileName }) => {
             const cachedIndiv = _individualOccFileCache.get(indivFileName);
-            if (cachedIndiv && existingNames.includes(indivFileName) && Array.isArray(cachedIndiv.rows) && cachedIndiv.rows.length === 1) {
-              const prevRec = cachedIndiv.rows[0];
-              if (JSON.stringify(prevRec) === JSON.stringify(record)) {
+            if (cachedIndiv && existingNameSet.has(indivFileName) && Array.isArray(cachedIndiv.rows) && cachedIndiv.rows.length === 1) {
+              if (JSON.stringify(cachedIndiv.rows[0]) === JSON.stringify(record)) {
                 totalSize += cachedIndiv.size || 0;
                 if (cachedIndiv.mtimeMs > maxMtime) maxMtime = cachedIndiv.mtimeMs;
                 return;
               }
             }
-
             const singleCsv = serializeCsv([record], resolvedHeaders);
-            const encPayload = await window.CryptoService.encrypt(singleCsv, {
-              fileName: indivFileName,
-              rowCount: 1
-            });
-
-            const writeOpts = (i === 0 && idx === 0 && options?.releasedProtocol)
-              ? { releasedProtocol: options.releasedProtocol, id_interno: record.id_interno }
-              : {};
-            const writeMeta = await this.writeRawFile(indivFileName, encPayload, writeOpts);
+            const encPayload = await window.CryptoService.encrypt(singleCsv, { fileName: indivFileName, rowCount: 1 });
+            const writeMeta = await this.writeRawFile(indivFileName, encPayload);
             const fSize = writeMeta?.size || encPayload.length;
             const fMtime = writeMeta?.mtimeMs || Date.now();
             totalSize += fSize;
             if (fMtime > maxMtime) maxMtime = fMtime;
-
             const rawSig = `${encPayload.length}:${encPayload.slice(0, 48)}:${encPayload.slice(-48)}`;
-            _individualOccFileCache.set(indivFileName, {
-              rawSig,
-              mtimeMs: fMtime,
-              size: fSize,
-              rows: [{ ...record }]
-            });
-          })
-        );
-      }
+            _individualOccFileCache.set(indivFileName, { rawSig, mtimeMs: fMtime, size: fSize, rows: [{ ...record }] });
+          }));
+          if (i + chunkSize < indivRowsToWrite.length) {
+            await new Promise(r => setTimeout(r, 0));
+          }
+        }
 
-      // Remove arquivos individuais de ocorrências que foram excluídas da coleção consolidada
-      const toDelete = existingNames.filter(name => !targetFileSet.has(name));
-      if (toDelete.length > 0) {
-        await Promise.all(
-          toDelete.map(async delName => {
+        const toDelete = existingNames.filter(name => !targetFileSet.has(name));
+        if (toDelete.length > 0) {
+          await Promise.all(toDelete.map(async delName => {
             _individualOccFileCache.delete(delName);
             await this.deleteFile(delName).catch(() => {});
-          })
-        );
+          }));
+        }
+
+        const cachedLeg = _individualOccFileCache.get('__legacy_ocorrencias.csv__');
+        if (!cachedLeg || !Array.isArray(cachedLeg.rows) || cachedLeg.rows.length !== legacyRowsToKeep.length) {
+          const legCsv = serializeCsv(legacyRowsToKeep, resolvedHeaders);
+          const legEnc = await window.CryptoService.encrypt(legCsv, { fileName: 'ocorrencias.csv', rowCount: legacyRowsToKeep.length });
+          const legMeta = await this.writeRawFile('ocorrencias.csv', legEnc);
+          const lSize = legMeta?.size || legEnc.length;
+          const lMtime = legMeta?.mtimeMs || Date.now();
+          totalSize += lSize;
+          if (lMtime > maxMtime) maxMtime = lMtime;
+          const legSig = `${legEnc.length}:${legEnc.slice(0, 48)}:${legEnc.slice(-48)}`;
+          _individualOccFileCache.set('__legacy_ocorrencias.csv__', { rawSig: legSig, mtimeMs: lMtime, size: lSize, rows: legacyRowsToKeep });
+        } else {
+          totalSize += cachedLeg.size || 0;
+          if (cachedLeg.mtimeMs > maxMtime) maxMtime = cachedLeg.mtimeMs;
+        }
+      } else {
+        const chunkSize = 32;
+        for (let i = 0; i < consolidatedRows.length; i += chunkSize) {
+          const slice = consolidatedRows.slice(i, i + chunkSize);
+          await Promise.all(
+            slice.map(async (record, idx) => {
+              const indivFileName = getIndividualOccurrenceFileName(record);
+              targetFileSet.add(indivFileName);
+
+              const idInt = String(record.id_interno || '').trim();
+              const idOcc = String(record.id_ocorrencia || '').trim();
+              const proto = String(record.numero_protocolo || '').trim().toUpperCase();
+              if (idInt) _recordKeyToFileMap.set(`INT:${idInt}`, indivFileName);
+              if (idOcc) _recordKeyToFileMap.set(`OCC:${idOcc}`, indivFileName);
+              if (proto) _recordKeyToFileMap.set(`PROTO:${proto}`, indivFileName);
+
+              const cachedIndiv = _individualOccFileCache.get(indivFileName);
+              if (cachedIndiv && existingNameSet.has(indivFileName) && Array.isArray(cachedIndiv.rows) && cachedIndiv.rows.length === 1) {
+                const prevRec = cachedIndiv.rows[0];
+                if (JSON.stringify(prevRec) === JSON.stringify(record)) {
+                  totalSize += cachedIndiv.size || 0;
+                  if (cachedIndiv.mtimeMs > maxMtime) maxMtime = cachedIndiv.mtimeMs;
+                  return;
+                }
+              }
+
+              const singleCsv = serializeCsv([record], resolvedHeaders);
+              const encPayload = await window.CryptoService.encrypt(singleCsv, {
+                fileName: indivFileName,
+                rowCount: 1
+              });
+
+              const writeOpts = (i === 0 && idx === 0 && options?.releasedProtocol)
+                ? { releasedProtocol: options.releasedProtocol, id_interno: record.id_interno }
+                : {};
+              const writeMeta = await this.writeRawFile(indivFileName, encPayload, writeOpts);
+              const fSize = writeMeta?.size || encPayload.length;
+              const fMtime = writeMeta?.mtimeMs || Date.now();
+              totalSize += fSize;
+              if (fMtime > maxMtime) maxMtime = fMtime;
+
+              const rawSig = `${encPayload.length}:${encPayload.slice(0, 48)}:${encPayload.slice(-48)}`;
+              _individualOccFileCache.set(indivFileName, {
+                rawSig,
+                mtimeMs: fMtime,
+                size: fSize,
+                rows: [{ ...record }]
+              });
+            })
+          );
+          if (i + chunkSize < consolidatedRows.length) {
+            await new Promise(r => setTimeout(r, 0));
+          }
+        }
+
+        const toDelete = existingNames.filter(name => !targetFileSet.has(name));
+        if (toDelete.length > 0) {
+          await Promise.all(
+            toDelete.map(async delName => {
+              _individualOccFileCache.delete(delName);
+              await this.deleteFile(delName).catch(() => {});
+            })
+          );
+        }
       }
 
+      this._nativeHandlesCache = null;
       const tWrite1 = nowFn();
-      const cloned = consolidatedRows.map(r => ({ ...r }));
       const batchSig = `${targetFileSet.size}:${maxMtime}:${totalSize}`;
       _lastKnownBatchSig = batchSig;
 
       _rawFileCache.set('ocorrencias.csv', {
         rawSig: batchSig,
-        rows: cloned,
+        rows: consolidatedRows,
         mtimeMs: maxMtime,
         size: totalSize,
         lastWriteTimings: {
@@ -1760,7 +1998,7 @@ const StorageService = (() => {
         window.syncFreshCsvMeta('ocorrencias.csv', maxMtime, totalSize);
       }
 
-      return cloned.map(r => ({ ...r }));
+      return consolidatedRows.slice();
     },
 
     async fetchFreshOccurrencesCsv(options = {}, metaMap = null) {
@@ -1768,16 +2006,29 @@ const StorageService = (() => {
       const prevMeta = metaMap ? metaMap.get(fileName) : null;
       const stat = await this.getFileStat(fileName).catch(() => ({ exists: false, size: 0, mtimeMs: 0 }));
 
-      if (options?.onlyIfChanged && prevMeta && stat.mtimeMs > 0 && stat.mtimeMs === prevMeta.mtimeMs && stat.size === prevMeta.size) {
+      if (options?.onlyIfChanged && prevMeta) {
+        if (stat.sig && _lastKnownBatchSig && stat.sig === _lastKnownBatchSig) {
+          return null;
+        }
+        if (stat.mtimeMs > 0 && Math.abs(stat.mtimeMs - prevMeta.mtimeMs) <= 2 && stat.size === prevMeta.size) {
+          return null;
+        }
+      }
+
+      const prevSig = _lastKnownBatchSig;
+      const rows = await this._readOccurrencesBatchFromStorage({ force: true, optional: true });
+      const cached = _rawFileCache.get(fileName);
+      if (options?.onlyIfChanged && prevSig && cached?.rawSig === prevSig) {
+        if (metaMap && cached) {
+          metaMap.set(fileName, { mtimeMs: cached.mtimeMs, size: cached.size, rawSig: cached.rawSig });
+        }
         return null;
       }
 
-      const rows = await this._readOccurrencesBatchFromStorage({ force: true, optional: true });
       const headers = CANONICAL_SEEDS[fileName]?.headers || (rows.length ? Object.keys(rows[0]) : []);
       const csvText = rows.length > 0 ? serializeCsv(rows, headers) : '';
 
       if (metaMap) {
-        const cached = _rawFileCache.get(fileName);
         metaMap.set(fileName, {
           mtimeMs: cached?.mtimeMs || stat.mtimeMs || Date.now(),
           size: cached?.size || stat.size || csvText.length,
