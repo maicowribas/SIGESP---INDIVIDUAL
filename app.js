@@ -866,7 +866,7 @@ async function fetchServerStorage(relPath,method='GET',body=null,extraParams={})
       }
       if(body){
         opts.body=body;
-        if(body instanceof Blob)opts.headers['Content-Type']='text/csv; charset=utf-8';
+        if(body instanceof Blob)opts.headers['Content-Type']=body.type||'application/octet-stream';
       }
       if(params.releasedProtocol){
         opts.headers['X-Released-Protocol']=String(params.releasedProtocol);
@@ -885,7 +885,7 @@ async function fetchServerStorage(relPath,method='GET',body=null,extraParams={})
   }
   throw lastErr||new Error('Falha ao comunicar com o servidor de dados.');
 }
-class ServerFileHandle{constructor(name,relPath,initialSize=null,initialMtime=null){this.kind='file';this.name=name;this.relPath=relPath;this.initialSize=initialSize;this.initialMtime=initialMtime}async getFile(){const res=await fetchServerStorage(this.relPath,'GET');if(res.status===404){if(this.initialSize===0)return new Blob([],{type:'text/csv; charset=utf-8'});const err=new Error(`Arquivo não encontrado: ${this.relPath}`);err.name='NotFoundError';throw classifyCsvError(err,this.relPath,'read')}if(!res.ok)throw classifyCsvError(new Error(`Falha ao ler arquivo (${res.status}): ${this.relPath}`),this.relPath,'read');return await res.blob()}async createWritable(){const relPath=this.relPath,chunks=[];return{async write(data){chunks.push(data)},async close(){const blob=new Blob(chunks,{type:'text/csv; charset=utf-8'});const res=await fetchServerStorage(relPath,'PUT',blob);if(!res.ok)throw classifyCsvError(new Error(`Falha ao gravar arquivo (${res.status}): ${relPath}`),relPath,'write');const info=await res.json().catch(()=>null);if(info&&typeof info.size==='number'&&info.size!==blob.size)throw classifyCsvError(new Error(`Verificação de escrita falhou para ${relPath}`),relPath,'write')},async abort(){chunks.length=0}}}}
+class ServerFileHandle{constructor(name,relPath,initialSize=null,initialMtime=null){this.kind='file';this.name=name;this.relPath=relPath;this.initialSize=initialSize;this.initialMtime=initialMtime}async getFile(){const res=await fetchServerStorage(this.relPath,'GET');if(res.status===404){if(this.initialSize===0)return new Blob([],{type:'text/csv; charset=utf-8'});const err=new Error(`Arquivo não encontrado: ${this.relPath}`);err.name='NotFoundError';throw classifyCsvError(err,this.relPath,'read')}if(!res.ok)throw classifyCsvError(new Error(`Falha ao ler arquivo (${res.status}): ${this.relPath}`),this.relPath,'read');return await res.blob()}async createWritable(){const relPath=this.relPath,chunks=[];return{async write(data){chunks.push(data)},async close(){const mime=(chunks[0] instanceof Blob && chunks[0].type)?chunks[0].type:(/\.(jpe?g)$/i.test(relPath)?'image/jpeg':/\.(png)$/i.test(relPath)?'image/png':/\.(webp)$/i.test(relPath)?'image/webp':/\.(pdf)$/i.test(relPath)?'application/pdf':'text/csv; charset=utf-8');const blob=new Blob(chunks,{type:mime});const res=await fetchServerStorage(relPath,'PUT',blob);if(!res.ok)throw classifyCsvError(new Error(`Falha ao gravar arquivo (${res.status}): ${relPath}`),relPath,'write');const info=await res.json().catch(()=>null);if(info&&typeof info.size==='number'&&info.size!==blob.size)throw classifyCsvError(new Error(`Verificação de escrita falhou para ${relPath}`),relPath,'write')},async abort(){chunks.length=0}}}}
 class ServerDirectoryHandle{constructor(name=DATA_FOLDER,relPath=''){this.kind='directory';this.name=name;this.relPath=relPath;this.folderName=DATA_FOLDER;this.isServer=true}async queryPermission(){return'granted'}async requestPermission(){return'granted'}async getFileHandle(fileName,options={}){const childPath=this.relPath?`${this.relPath}/${fileName}`:fileName,isCreate=Boolean(options?.create);const res=await fetchServerStorage(childPath,'HEAD',null,isCreate?{create:'1'}:{});if(res.status===404){if(isCreate)return new ServerFileHandle(fileName,childPath,0,Date.now());const err=new Error(`Arquivo não encontrado: ${childPath}`);err.name='NotFoundError';throw err}if(!res.ok)throw classifyCsvError(new Error(`Falha ao acessar arquivo (${res.status}): ${childPath}`),childPath,'head');const sizeHeader=res.headers.get('X-File-Size')??res.headers.get('Content-Length'),mtimeHeader=res.headers.get('X-File-Mtime');return new ServerFileHandle(fileName,childPath,sizeHeader!==null?Number(sizeHeader):null,mtimeHeader!==null?Number(mtimeHeader):null)}async getDirectoryHandle(dirName,options={}){const childPath=this.relPath?`${this.relPath}/${dirName}`:dirName;if(options?.create){const enc=encodeURIComponent(childPath);try{const res=await fetch(`/api/storage/mkdir?path=${enc}`,{method:'POST'});if(!res.ok&&res.status!==404)console.warn('Aviso ao criar diretório:',childPath,res.status)}catch(e){console.warn('Aviso de rede ao criar diretório:',childPath,e)}}return new ServerDirectoryHandle(dirName,childPath)}async removeEntry(entryName){const childPath=this.relPath?`${this.relPath}/${entryName}`:entryName;const res=await fetchServerStorage(childPath,'DELETE');if(!res.ok&&res.status!==404)throw classifyCsvError(new Error(`Falha ao remover arquivo (${res.status}): ${childPath}`),childPath,'delete')}}
 const CSV_ID_FIELDS={'usuarios.csv':'id_usuario','ocorrencias.csv':'id_ocorrencia','chaves.csv':'id_chave','movimentacao_chaves.csv':'id_movimento','historico_sistema.csv':'id_auditoria','inspecao_fumaca_preta.csv':'id','naturezas_ocorrencias.csv':'id_natureza','supervisoes_unidades.csv':'id'};
 const _freshCsvMeta=new Map();
@@ -2005,9 +2005,44 @@ function occurrenceFormElement(){return document.getElementById('validationOccFo
 function occurrenceFieldNames(){return ['id_ocorrencia','gerencia','supervisao','unidade','data_ocorrencia','hora_ocorrencia','natureza_ocorrencia','area','local_especifico','tipo_vinculo','nome_envolvido','empresa_envolvido','matricula_id','telefone','documento','placa_veiculo','gerencia_envolvido','gerencia_geral','diretoria','relato_detalhado','providencias_adotadas','prioridade','status','observacoes']}
 function captureOccurrenceDraft(form=occurrenceFormElement()){if(!form)return null;const raw=Object.fromEntries(new FormData(form));for(const name of occurrenceFieldNames()){const field=form.elements.namedItem(name);if(field&&'value' in field)raw[name]=field.value}const isCsn=raw.tipo_vinculo==='Grupo CSN';if(isCsn){raw.documento='';raw.gerencia_envolvido=raw.gerencia_envolvido||raw.gerencia||'';raw.gerencia=raw.gerencia_envolvido;raw.gerencia_geral=raw.gerencia_geral||'';raw.diretoria=raw.diretoria||''}else{raw.matricula_id='';raw.gerencia_envolvido='';raw.gerencia='';raw.gerencia_geral='';raw.diretoria=''}if(form.id==='validationOccForm'){S.validationModal={...(S.validationModal||{}),...raw}}else{S.editing={...(S.editing||{}),...raw}}return raw}
 function readOccurrenceValue(form,data,name){const field=form?.elements?.namedItem(name);if(field&&'value' in field)return String(field.value??'').trim();return String(data?.[name]??'').trim()}
-function cleanup(){S.newPhotos.forEach(x=>URL.revokeObjectURL(x.url));S.existing.forEach(x=>x.url&&URL.revokeObjectURL(x.url));S.newPhotos=[];S.existing=[];S.removed=[];S.viewUrl=null}
-async function image(path){try{const[p,n]=path.split('/'),root=await S.dir.getDirectoryHandle('anexos'),fd=await root.getDirectoryHandle(p),fh=await fd.getFileHandle(n),file=await fh.getFile();return{path,url:URL.createObjectURL(file),missing:0}}catch{return{path,url:'',missing:1}}}
-async function loadImages(rec){cleanup();const refs=String(rec.anexos_referencias||'').split('|').filter(Boolean).filter(p=>!/\.pdf$/i.test(p.trim()));S.existing=await Promise.all(refs.map(image))}
+function cleanup(){
+  S.newPhotos.forEach(x=>x.url&&URL.revokeObjectURL(x.url));
+  S.existing.forEach(x=>x.url&&URL.revokeObjectURL(x.url));
+  S.newPhotos=[];
+  S.existing=[];
+  S.removed=[];
+  S.viewUrl=null;
+}
+async function image(path){
+  if(!path)return{path:'',url:'',missing:1};
+  try{
+    const clean=String(path).replace(/^[\\/]+|[\\/]+$/g,'').replace(/^anexos[\\/]/i,'').trim();
+    const parts=clean.split(/[\\/]/).filter(Boolean);
+    if(!parts.length)return{path,url:'',missing:1};
+    
+    const root=await S.dir.getDirectoryHandle('anexos',{create:false});
+    let currentDir=root;
+    for(let i=0;i<parts.length-1;i++){
+      currentDir=await currentDir.getDirectoryHandle(parts[i]);
+    }
+    const fileName=parts[parts.length-1];
+    const fh=await currentDir.getFileHandle(fileName);
+    const file=await fh.getFile();
+    const url=URL.createObjectURL(file);
+    return {path,url,missing:0,file};
+  }catch(err){
+    console.warn('[image] Falha ao carregar anexo fotográfico:',path,err);
+    return{path,url:'',missing:1};
+  }
+}
+async function loadImages(rec){
+  S.existing.forEach(x=>x.url&&URL.revokeObjectURL(x.url));
+  S.existing=[];
+  S.removed=[];
+  S.viewUrl=null;
+  const refs=String(rec?.anexos_referencias||'').split('|').filter(Boolean).filter(p=>!/\.pdf$/i.test(p.trim()));
+  S.existing=await Promise.all(refs.map(image));
+}
 async function compress(file){
   const fileName=String(file?.name||'').toLowerCase();
   const fileType=String(file?.type||'').toLowerCase();
@@ -2117,15 +2152,33 @@ async function choose(files){
     fail(x.message||'Falha ao processar fotos selecionadas.');
   }
 }
-async function removeFiles(){
-  if(!S.removed?.length)return;
+function planPhotoPaths(protocol, newPhotos = [], existingPhotos = [], removedPhotos = []){
+  const used=new Set([...(existingPhotos||[]).map(x=>x.path),...((removedPhotos||[]))].map(path=>String(path).split('/').pop()));
+  const planned=[];
+  let n=1;
+  for(let i=0;i<(newPhotos||[]).length;i++){
+    while(used.has(`foto_${String(n).padStart(3,'0')}.jpg`))n++;
+    const name=`foto_${String(n).padStart(3,'0')}.jpg`;
+    used.add(name);
+    planned.push(`${protocol}/${name}`);
+    n++;
+  }
+  return planned;
+}
+
+async function removeFiles(removedList = S.removed){
+  const list = Array.isArray(removedList) ? removedList : S.removed;
+  if(!list?.length)return;
   try{
-    const root=await S.dir.getDirectoryHandle('anexos');
-    await Promise.all(S.removed.map(async p=>{
+    const root=await S.dir.getDirectoryHandle('anexos',{create:false});
+    await Promise.all(list.map(async p=>{
       try{
-        const[d,n]=p.split('/');
-        const fd=await root.getDirectoryHandle(d);
-        await fd.removeEntry(n);
+        const clean=String(p).replace(/^[\\/]+|[\\/]+$/g,'').replace(/^anexos[\\/]/i,'').trim();
+        const parts=clean.split(/[\\/]/).filter(Boolean);
+        if(parts.length>=2){
+          const fd=await root.getDirectoryHandle(parts[0],{create:false});
+          await fd.removeEntry(parts[1]);
+        }
       }catch(error){
         console.warn('Não foi possível remover um anexo marcado para exclusão.',p,error);
       }
@@ -2134,15 +2187,19 @@ async function removeFiles(){
     console.warn('Não foi possível acessar a pasta de anexos para exclusão:',err);
   }
 }
-async function savePhotos(protocol,trackedPaths=[]){
-  const used=new Set([...S.existing.map(x=>x.path),...S.removed].map(path=>path.split('/').pop())),planned=[];
+
+async function savePhotos(protocol, photosToSave = S.newPhotos, existingPhotos = S.existing, removedPhotos = S.removed){
+  const photosList = Array.isArray(photosToSave) ? photosToSave : (S.newPhotos || []);
+  const existingList = Array.isArray(existingPhotos) ? existingPhotos : (S.existing || []);
+  const removedList = Array.isArray(removedPhotos) ? removedPhotos : (S.removed || []);
+
+  const used=new Set([...existingList.map(x=>x.path),...removedList].map(path=>String(path).split('/').pop())),planned=[];
   let n=1;
-  for(const p of S.newPhotos){
+  for(const p of photosList){
     while(used.has(`foto_${String(n).padStart(3,'0')}.jpg`))n++;
     const name=`foto_${String(n).padStart(3,'0')}.jpg`,path=`${protocol}/${name}`;
     used.add(name);
     planned.push({p,name,path});
-    trackedPaths.push(path);
     n++;
   }
   if(!planned.length)return [];
@@ -2471,11 +2528,7 @@ async function persistEditedOccurrence(d,editingBeforeSubmit,photoPaths,initialD
     const current=disk.find(x=>String(x.id_ocorrencia)===String(d.id_ocorrencia)||(x.id_interno&&String(x.id_interno)===String(d.id_interno||d.id_ocorrencia))||(x.numero_protocolo&&x.numero_protocolo===d.numero_protocolo));
     if(!current)throw Error('Registro não encontrado na base de dados.');
     const protocol=current.numero_protocolo;
-    let newPhotos=[];
-    if(S.newPhotos.length){
-      if(!photoPaths.length)newPhotos=await savePhotos(protocol,photoPaths);
-      else newPhotos=[...photoPaths];
-    }
+    const finalPhotoRefs = Array.isArray(photoPaths) ? photoPaths.filter(Boolean) : [];
     const timeNow=now();
     const updated={
       ...current,
@@ -2483,7 +2536,7 @@ async function persistEditedOccurrence(d,editingBeforeSubmit,photoPaths,initialD
       id_ocorrencia:current.id_ocorrencia,
       id_interno:current.id_interno||current.id_ocorrencia,
       numero_protocolo:protocol,
-      anexos_referencias:[...S.existing.map(x=>x.path),...newPhotos].join('|'),
+      anexos_referencias:finalPhotoRefs.join('|'),
       versao_registro:String((+current.versao_registro||0)+1),
       usuario_ultima_alteracao:S.user.login,
       data_atualizacao:timeNow
@@ -2547,7 +2600,8 @@ async function saveOcc(ev){
     const prevRemoved=[...S.removed];
 
     // 3. Objeto Otimista em Memória
-    const photoRefs=[...S.existing.map(x=>x.path),...S.newPhotos.map((p,idx)=>`${protocol}/foto_${String(idx+1).padStart(3,'0')}.jpg`)].filter(Boolean);
+    const plannedNewPaths = planPhotoPaths(protocol, prevNewPhotos, prevExisting, prevRemoved);
+    const photoRefs = [...prevExisting.map(x=>x.path), ...plannedNewPaths].filter(Boolean);
     const optimisticRow=normalizeOccurrenceRow({
       ...(isEdit?(editingBeforeSubmit||{}):{}),
       ...d,
@@ -2595,16 +2649,17 @@ async function saveOcc(ev){
       try{
         await ensureDataWritePermission();
         if(prevNewPhotos.length){
-          savedPhotoPaths=await savePhotos(protocol,[]);
+          savedPhotoPaths=await savePhotos(protocol, prevNewPhotos, prevExisting, prevRemoved);
         }
         if(prevRemoved.length){
-          await removeFiles();
+          await removeFiles(prevRemoved);
         }
+        const finalPhotoPaths=[...prevExisting.map(x=>x.path), ...(savedPhotoPaths||[])].filter(Boolean);
         await withWriteLock('occurrences',async()=>{
           let editDisk=isEdit?await read('ocorrencias.csv',{force:true}):null;
           let saveResult=isEdit
-            ?await persistEditedOccurrence(d,editingBeforeSubmit,savedPhotoPaths,editDisk)
-            :await persistNewOccurrence(d,time,savedPhotoPaths);
+            ?await persistEditedOccurrence(d,editingBeforeSubmit,finalPhotoPaths,editDisk)
+            :await persistNewOccurrence(d,time,finalPhotoPaths);
           const row=saveResult?.row||saveResult;
           if(row){
             const consolidated=window.StorageService?.consolidateVersionedRows
@@ -2618,6 +2673,7 @@ async function saveOcc(ev){
             window.StorageService?.IndexedDBEngine?.saveRecordsBulkLocally('ocorrencias.csv',S.occ).catch(()=>{});
           }
         },0);
+        prevNewPhotos.forEach(x=>x.url&&URL.revokeObjectURL(x.url));
       }catch(bgErr){
         console.error('[Rollback] Falha ao persistir ocorrência no disco:',bgErr);
         S.occ=prevOcc;
@@ -2732,9 +2788,11 @@ async function savePendingDraft(form){
   const prevOcc=[...(S.occ||[])];
   const prevPending=[...(S.pending||[])];
   const prevNewPhotos=[...S.newPhotos];
+  const prevExisting=[...S.existing];
   const prevRemoved=[...S.removed];
 
-  const photoPaths=[...S.existing.map(x=>x.path),...S.newPhotos.map((p,idx)=>`${current.numero_protocolo}/foto_${String(idx+1).padStart(3,'0')}.jpg`)];
+  const plannedNewPaths = planPhotoPaths(current.numero_protocolo, prevNewPhotos, prevExisting, prevRemoved);
+  const photoPaths=[...prevExisting.map(x=>x.path), ...plannedNewPaths].filter(Boolean);
   const updated={
     ...current,
     ...raw,
@@ -2767,15 +2825,16 @@ async function savePendingDraft(form){
       await ensureDataWritePermission();
       let savedNew=[];
       if(prevNewPhotos.length){
-        savedNew=await savePhotos(current.numero_protocolo,[]);
+        savedNew=await savePhotos(current.numero_protocolo, prevNewPhotos, prevExisting, prevRemoved);
       }
       if(prevRemoved.length){
-        await removeFiles();
+        await removeFiles(prevRemoved);
       }
+      const finalPhotoPaths=[...prevExisting.map(x=>x.path), ...savedNew].filter(Boolean);
       await withWriteLock('occurrences',async()=>{
         const updatedWithPhotos={
           ...updated,
-          anexos_referencias:[...S.existing.map(x=>x.path),...savedNew].join('|')
+          anexos_referencias:finalPhotoPaths.join('|')
         };
         let savedResult=null;
         if(window.StorageService?.appendSingleRecord){
@@ -2788,6 +2847,7 @@ async function savePendingDraft(form){
         }
         window.StorageService?.IndexedDBEngine?.saveRecordsBulkLocally('ocorrencias.csv',S.occ).catch(()=>{});
       });
+      prevNewPhotos.forEach(x=>x.url&&URL.revokeObjectURL(x.url));
     }catch(err){
       console.error('[Rollback] Falha ao persistir rascunho de validação no disco:',err);
       S.occ=prevOcc;
@@ -2833,11 +2893,13 @@ async function validatePendingOcc(id,form=null){
   const prevOcc=[...(S.occ||[])];
   const prevPending=[...(S.pending||[])];
   const prevNewPhotos=[...S.newPhotos];
+  const prevExisting=[...S.existing];
   const prevRemoved=[...S.removed];
 
   const idIntVal=String(current.id_interno||formData.id_interno||current.id_ocorrencia||'').trim()||String(current.id_ocorrencia||'').trim();
   const timeNow=now();
-  const photoPaths=[...S.existing.map(x=>x.path),...S.newPhotos.map((p,idx)=>`${current.numero_protocolo}/foto_${String(idx+1).padStart(3,'0')}.jpg`)];
+  const plannedNewPaths = planPhotoPaths(current.numero_protocolo, prevNewPhotos, prevExisting, prevRemoved);
+  const photoPaths=[...prevExisting.map(x=>x.path), ...plannedNewPaths].filter(Boolean);
 
   const updatedRow={
     ...current,
@@ -2876,15 +2938,16 @@ async function validatePendingOcc(id,form=null){
       await ensureDataWritePermission();
       let savedNew=[];
       if(prevNewPhotos.length){
-        savedNew=await savePhotos(current.numero_protocolo,[]);
+        savedNew=await savePhotos(current.numero_protocolo, prevNewPhotos, prevExisting, prevRemoved);
       }
       if(prevRemoved.length){
-        await removeFiles();
+        await removeFiles(prevRemoved);
       }
+      const finalPhotoPaths=[...prevExisting.map(x=>x.path), ...savedNew].filter(Boolean);
       await withWriteLock('occurrences',async()=>{
         const finalRow={
           ...updatedRow,
-          anexos_referencias:[...S.existing.map(x=>x.path),...savedNew].join('|')
+          anexos_referencias:finalPhotoPaths.join('|')
         };
         let savedResult=null;
         if(window.StorageService?.appendSingleRecord){
@@ -2892,6 +2955,7 @@ async function validatePendingOcc(id,form=null){
         }else{
           savedResult=await CSVService.append('ocorrencias.csv',finalRow,H.occ);
         }
+        await window.StorageService?.updateOccurrenceInLegacyBase?.(finalRow);
         if(typeof CSVService!=='undefined'){
           CSVService.buildEntry('ocorrencias.csv',S.occ);
         }
@@ -2901,6 +2965,7 @@ async function validatePendingOcc(id,form=null){
           _freshCsvMeta.set('ocorrencias.csv',{mtimeMs:stat.mtimeMs,size:stat.size,rawSig:''});
         }
       });
+      prevNewPhotos.forEach(x=>x.url&&URL.revokeObjectURL(x.url));
     }catch(bgErr){
       console.error('[Rollback] Falha ao persistir validação no disco:',bgErr);
       S.occ=prevOcc;
@@ -2920,7 +2985,7 @@ async function deletePendingOcc(id){
   
   // Optimistic UI: Fecha o modal imediatamente e remove o registro da interface sem latência (0ms)
   S.deletePendingTarget=null;
-  S.occ=(S.occ||[]).filter(x=>String(x.id_ocorrencia||'').trim()!==normId&&(!x.id_interno||String(x.id_interno).trim()!==normId));
+  S.occ=(S.occ||[]).filter(x=>String(x.id_ocorrencia||'').trim()!==normId&&(!x.id_interno||String(x.id_interno).trim()!==normId)&&String(x.numero_protocolo||'').trim().toUpperCase()!==normId.toUpperCase());
   S.pending=S.occ.filter(isPendingOccurrence);
   render();
   showToast('Ocorrência pendente excluída com sucesso.','success','Fila de Validação');
@@ -2933,11 +2998,30 @@ async function deletePendingOcc(id){
         await refreshAccessContext();
         const rawText=await fetchFreshRawCsv('ocorrencias.csv');
         const freshRows=parseAndConsolidateCsv(rawText);
-        const target=freshRows.find(x=>String(x.id_ocorrencia||'').trim()===normId||String(x.id_interno||'').trim()===normId);
-        if(!target)return;
-        assertUnitAccess(target.unidade);
-        const nextRows=freshRows.filter(x=>String(x.id_ocorrencia||'').trim()!==normId&&(!x.id_interno||String(x.id_interno).trim()!==normId));
-        await write('ocorrencias.csv',nextRows,H.occ);
+        const target=freshRows.find(x=>String(x.id_ocorrencia||'').trim()===normId||String(x.id_interno||'').trim()===normId||String(x.numero_protocolo||'').trim().toUpperCase()===normId.toUpperCase());
+        if(target){
+          assertUnitAccess(target.unidade);
+          const auditItem={
+            id_exclusao:uid(),
+            modulo_origem:'Ocorrências',
+            data_hora_exclusao:now(),
+            administrador:S.user?.login||'admin',
+            id_registro:target.id_ocorrencia||normId,
+            codigo_registro:target.numero_protocolo||normId,
+            dados_originais:JSON.stringify(target),
+            motivo_exclusao:'Exclusão de ocorrência pendente pelo validador'
+          };
+          if(window.StorageService?.appendRecord){
+            await window.StorageService.appendRecord('registros_apagados.csv',auditItem,H.registros_apagados);
+          }else{
+            const currentDeleted=await read('registros_apagados.csv').catch(()=>[]);
+            await write('registros_apagados.csv',[auditItem,...currentDeleted],H.registros_apagados);
+          }
+          const nextRows=freshRows.filter(x=>String(x.id_ocorrencia||'').trim()!==normId&&(!x.id_interno||String(x.id_interno).trim()!==normId)&&String(x.numero_protocolo||'').trim().toUpperCase()!==normId.toUpperCase());
+          await write('ocorrencias.csv',nextRows,H.occ);
+        }
+        await window.StorageService?.deleteOccurrenceRecord?.(target?.numero_protocolo||target?.id_ocorrencia||normId);
+        await window.StorageService?.deleteOccurrenceRecord?.(normId);
       });
     }catch(error){
       console.error('Falha na persistência da exclusão de ocorrência pendente:',error);
@@ -3010,6 +3094,8 @@ async function executeRecordDeletion(){
           }
           const updatedList=occList.filter(x=>x.id_ocorrencia!==original.id_ocorrencia&&x.numero_protocolo!==original.numero_protocolo);
           await write('ocorrencias.csv',updatedList,H.occ);
+          await window.StorageService?.deleteOccurrenceRecord?.(original.numero_protocolo||original.id_ocorrencia||id);
+          await window.StorageService?.deleteOccurrenceRecord?.(id);
         });
       }else if(modulo==='Chaves'){
         await withWriteLock('keys',async()=>{
@@ -4190,7 +4276,12 @@ function filteredAmbientalInspecoes(){const f=S.ambientalFilters||{},rows=scopeA
 function ambientalHistoryTotalPages(){const total=filteredAmbientalInspecoes().length;return Math.max(1,Math.ceil(total/S.pageSize))}
 function pagedAmbientalInspecoes(){const rows=filteredAmbientalInspecoes();const total=ambientalHistoryTotalPages();S.currentPage=Math.min(Math.max(1,S.currentPage),total);const start=(S.currentPage-1)*S.pageSize;return rows.slice(start,start+S.pageSize)}
 function ambientalHistoryPage(){const allFiltered=filteredAmbientalInspecoes(),rows=pagedAmbientalInspecoes(),totalPages=ambientalHistoryTotalPages(),f=S.ambientalFilters||{},allUnits=[...new Set((S.inspecoes||[]).map(item=>item.unidade).filter(Boolean))].sort(),allSupervisoes=[...new Set((S.inspecoes||[]).map(item=>item.supervisao).filter(Boolean))].sort();return `<div class="row between"><div><h2>HISTÓRICO DE INSPEÇÕES</h2><p class="muted">Monitoramento de Fumaça Preta</p></div><button type="button" class="btn primary ambiental-new">Nova inspeção</button></div><div class="card"><div class="history-filter-grid"><label><span class="label">Data inicial</span><input id="ambientalDateFrom" class="field" type="date" value="${esc(f.dateFrom||'')}"></label><label><span class="label">Data final</span><input id="ambientalDateTo" class="field" type="date" value="${esc(f.dateTo||'')}"></label><label><span class="label">Placa</span><input id="ambientalPlaca" class="field" value="${esc(f.placa||'')}" placeholder="Placa"></label><label><span class="label">Transportadora</span><input id="ambientalTransportadora" class="field" value="${esc(f.transportadora||'')}" placeholder="Transportadora"></label><label><span class="label">Monitoramento</span><select id="ambientalRealizado" class="field"><option value="">Todos</option><option value="Sim" ${f.realizado==='Sim'?'selected':''}>Sim</option><option value="Não" ${f.realizado==='Não'?'selected':''}>Não</option></select></label><label><span class="label">Laudo</span><select id="ambientalLaudo" class="field"><option value="">Todos</option><option value="Aprovado" ${f.laudo==='Aprovado'?'selected':''}>Aprovado</option><option value="Reprovado" ${f.laudo==='Reprovado'?'selected':''}>Reprovado</option></select></label><label><span class="label">Responsável</span><input id="ambientalResponsavel" class="field" value="${esc(f.responsavel||'')}" placeholder="Responsável"></label><label><span class="label">Unidade</span><select id="ambientalUnidade" class="field"><option value="">Todas</option>${allUnits.map(item=>`<option value="${esc(item)}" ${f.unidade===item?'selected':''}>${esc(item)}</option>`).join('')}</select></label><label><span class="label">Supervisão</span><select id="ambientalSupervisao" class="field"><option value="">Todas</option>${allSupervisoes.map(item=>`<option value="${esc(item)}" ${f.supervisao===item?'selected':''}>${esc(item)}</option>`).join('')}</select></label><label class="history-general"><span class="label">Pesquisa geral</span><input id="ambientalGeneral" class="field" value="${esc(f.general||'')}" placeholder="Buscar registro..."></label></div><div class="row between" style="margin-top:14px"><button id="clearAmbientalFilters" class="btn">Limpar filtros</button><span class="muted">${allFiltered.length} registros · Página ${S.currentPage} de ${totalPages}</span></div></div><div class="card"><div class="tablewrap"><table class="table"><thead><tr><th>Data</th><th>Placa</th><th>Transportadora</th><th>Monitoramento</th><th>Laudo</th><th>Responsável</th><th>Ações</th></tr></thead><tbody>${rows.length?rows.map(item=>`<tr><td>${esc(item.data||'')}</td><td>${esc(item.placa||'')}</td><td>${esc(item.transportadora||'')}</td><td>${esc(item.realizar_monitoramento||'Não')}</td><td>${String(item.laudo||'') ? ambientalStatusBadge(item.laudo) : ambientalStatusBadge('Não realizado')}</td><td>${esc(formatAmbientalResponsible(item))}</td><td class="actions"><button class="viewAmbiental" data-id="${esc(item.id||'')}" title="Visualizar">👁️</button><button class="editAmbiental" data-id="${esc(item.id||'')}" title="Editar">✏️</button>${isAdministratorUser(S.user)?`<button class="deleteRecordPrompt" data-modulo="Meio Ambiente" data-id="${esc(item.id||'')}" data-code="${esc(item.placa||item.id||'Sem placa')}" data-detail="${esc(item.transportadora||'')} · ${esc(item.laudo||'Não realizado')}" title="Excluir Inspeção">🗑️</button>`:''}</td></tr>`).join(''):`<tr><td colspan="7" class="muted">Nenhum registro disponível para o período selecionado.</td></tr>`}</tbody></table></div><div class="row between" style="margin-top:14px"><button id="ambientalPrev" class="btn" ${S.currentPage<=1?'disabled':''}>◀ Anterior</button><button id="ambientalNext" class="btn" ${S.currentPage>=totalPages?'disabled':''}>Próxima ▶</button></div></div>`}
-function photos(editable){const old=S.existing.map((p,i)=>`<div class="photo">${p.missing?'<div style="height:110px;display:grid;place-items:center">Imagem não encontrada</div>':`<img class="zoom" data-url="${p.url}" src="${p.url}">`}<small>${esc(p.path)}</small>${editable?`<button type="button" class="removeOld btn" data-i="${i}">Remover</button>`:''}</div>`).join(''),fresh=S.newPhotos.map((p,i)=>`<div class="photo"><img class="zoom" data-url="${p.url}" src="${p.url}"><small>${esc(p.name)} · ${Math.round(p.size/1024)} KB</small><button type="button" class="removeNew btn" data-i="${i}">Remover</button></div>`).join(''),count=S.existing.length+S.newPhotos.length;return `<div class="photos">${old}${fresh}${editable&&count<MAX?`<label for="photos" class="add-photo" role="button" tabindex="0" style="cursor:pointer">📷<br>Adicionar foto</label><input id="photos" class="hidden" type="file" accept="image/jpeg,image/png,image/webp,image/*" multiple>`:''}</div>${editable?`<p class="muted">${count} de ${MAX}. Imagens otimizadas automaticamente (até ${WIDTH}px, JPEG ${Math.round(QUALITY*100)}%).</p>`:''}`}
+function photos(editable, inputId = 'photos'){
+  const old=S.existing.map((p,i)=>`<div class="photo">${p.missing?'<div style="height:110px;display:grid;place-items:center">Imagem não encontrada</div>':`<img class="zoom" data-url="${p.url}" src="${p.url}">`}<small>${esc(p.path)}</small>${editable?`<button type="button" class="removeOld btn" data-i="${i}">Remover</button>`:''}</div>`).join(''),
+  fresh=S.newPhotos.map((p,i)=>`<div class="photo"><img class="zoom" data-url="${p.url}" src="${p.url}"><small>${esc(p.name)} · ${Math.round(p.size/1024)} KB</small><button type="button" class="removeNew btn" data-i="${i}">Remover</button></div>`).join(''),
+  count=S.existing.length+S.newPhotos.length;
+  return `<div class="photos">${old}${fresh}${editable&&count<MAX?`<label for="${inputId}" class="add-photo" role="button" tabindex="0" style="cursor:pointer">📷<br>Adicionar foto</label><input id="${inputId}" class="hidden photoFileInput" type="file" accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp" multiple>`:''}</div>${editable?`<p class="muted">${count} de ${MAX}. Imagens otimizadas automaticamente (até ${WIDTH}px, JPEG ${Math.round(QUALITY*100)}%).</p>`:''}`;
+}
 function selectOptions(items,value){return items.map(item=>{const optionValue=typeof item==='string'?item:item.value,label=typeof item==='string'?item:item.label;return `<option value="${esc(optionValue)}" ${optionValue===value?'selected':''}>${esc(label)}</option>`}).join('')}
 function occForm(){
 const x=S.editing||{},availableUnits=units(),historicalUnit=unitForName(x.unidade);
@@ -4363,7 +4454,37 @@ async function qrDataUrl(text){
     return null;
   }
 }
-async function imageForPdf(path){const item=await image(path);if(!item.url)return null;try{const response=await fetch(item.url),blob=await response.blob(),bitmap=await createImageBitmap(blob),canvas=document.createElement('canvas'),max=1500,scale=Math.min(1,max/Math.max(bitmap.width,bitmap.height));canvas.width=Math.max(1,Math.round(bitmap.width*scale));canvas.height=Math.max(1,Math.round(bitmap.height*scale));canvas.getContext('2d').drawImage(bitmap,0,0,canvas.width,canvas.height);bitmap.close();URL.revokeObjectURL(item.url);return{data:canvas.toDataURL('image/jpeg',.84),width:canvas.width,height:canvas.height,path}}catch{URL.revokeObjectURL(item.url);return null}}
+async function imageForPdf(path){
+  const item=await image(path);
+  if(!item||!item.url)return null;
+  try{
+    let bitmap;
+    if(item.file){
+      bitmap=await createImageBitmap(item.file);
+    }else{
+      const response=await fetch(item.url);
+      const blob=await response.blob();
+      bitmap=await createImageBitmap(blob);
+    }
+    const max=1500;
+    const scale=Math.min(1,max/Math.max(bitmap.width,bitmap.height));
+    const targetW=Math.max(1,Math.round(bitmap.width*scale));
+    const targetH=Math.max(1,Math.round(bitmap.height*scale));
+    const canvas=document.createElement('canvas');
+    canvas.width=targetW;
+    canvas.height=targetH;
+    const ctx=canvas.getContext('2d');
+    ctx.drawImage(bitmap,0,0,targetW,targetH);
+    bitmap.close();
+    const data=canvas.toDataURL('image/jpeg',.84);
+    canvas.width=0;
+    canvas.height=0;
+    return{data,width:targetW,height:targetH,path};
+  }catch(err){
+    console.warn('[imageForPdf] Falha ao processar imagem para PDF:',path,err);
+    return null;
+  }
+}
 async function generateOccurrencePdf(id){const occurrence=S.occ.find(x=>x.id_ocorrencia===id);if(!occurrence)return showPdfResult(false,'A ocorrência selecionada não foi encontrada. Verifique o histórico e tente novamente.');if(!occurrence.numero_protocolo||!occurrence.relato_detalhado)return showPdfResult(false,'Os dados essenciais da ocorrência estão ausentes ou corrompidos.');if(!window.jspdf?.jsPDF||!window.QRCode)return showPdfResult(false,'As bibliotecas de geração do PDF não foram carregadas.');showPdfProgress(occurrence.numero_protocolo);await new Promise(r=>setTimeout(r,20));try{updatePdfProgress(14,'Validando dados e rastreabilidade...');const paths=String(occurrence.anexos_referencias||'').split('|').filter(Boolean),photoPaths=paths.filter(x=>/\.(jpe?g|png|webp)$/i.test(x)),documentPaths=paths.filter(x=>!photoPaths.includes(x));const photos=[];for(let i=0;i<photoPaths.length;i++){updatePdfProgress(18+Math.round((i/Math.max(1,photoPaths.length))*30),`Processando evidência fotográfica ${i+1} de ${photoPaths.length}...`);const pic=await imageForPdf(photoPaths[i]);if(pic)photos.push(pic)}updatePdfProgress(52,'Montando o documento executivo...');const {jsPDF}=window.jspdf,doc=new jsPDF({orientation:'portrait',unit:'mm',format:'a4',compress:true}),pageW=210,pageH=297,margin=16,contentW=178,footerY=286,issued=new Date(),issuedText=issued.toLocaleString('pt-BR');let y=18;const blue=[11,55,92],lightBlue=[233,241,249],gray=[79,93,110],lightGray=[244,247,250],green=[22,101,52];const ensure=(need=16)=>{if(y+need>footerY-8){doc.addPage();y=18;return true}return false};const text=(value,x,width,size=9,color=gray,style='normal')=>{doc.setFont('helvetica',style);doc.setFontSize(size);doc.setTextColor(...color);const lines=doc.splitTextToSize(pdfSafe(value,''),width);ensure(lines.length*(size*.38)+4);doc.text(lines,x,y);y+=lines.length*(size*.38)+2};const section=title=>{ensure(14);doc.setFillColor(...blue);doc.roundedRect(margin,y,contentW,9,2,2,'F');doc.setTextColor(255,255,255);doc.setFont('helvetica','bold');doc.setFontSize(10);doc.text(title.toUpperCase(),margin+4,y+6);y+=13};const fieldGrid=(items,cols=2)=>{const gap=4,cellW=(contentW-gap*(cols-1))/cols;for(let i=0;i<items.length;i+=cols){const row=items.slice(i,i+cols),heights=row.map(([label,value])=>{doc.setFontSize(9);return doc.splitTextToSize(pdfSafe(value),cellW-8).length*4+12}),h=Math.max(22,...heights);ensure(h+3);row.forEach(([label,value],idx)=>{const x=margin+idx*(cellW+gap);doc.setFillColor(...lightGray);doc.setDrawColor(219,227,236);doc.roundedRect(x,y,cellW,h,2,2,'FD');doc.setTextColor(...gray);doc.setFont('helvetica','bold');doc.setFontSize(7.5);doc.text(label.toUpperCase(),x+4,y+5);doc.setTextColor(20,36,58);doc.setFont('helvetica','normal');doc.setFontSize(9);doc.text(doc.splitTextToSize(pdfSafe(value),cellW-8),x+4,y+11)});y+=h+3}};const longBlock=(title,value)=>{section(title);ensure(20);doc.setFillColor(250,251,253);doc.setDrawColor(220,227,235);const lines=doc.splitTextToSize(pdfSafe(value),contentW-10);let index=0;while(index<lines.length){const available=Math.max(1,Math.floor((footerY-y-14)/4));if(available<3){doc.addPage();y=18;section(`${title} - Continuação`);continue}const chunk=lines.slice(index,index+available),h=chunk.length*4+10;doc.setFillColor(250,251,253);doc.setDrawColor(220,227,235);doc.roundedRect(margin,y,contentW,h,2,2,'FD');doc.setTextColor(35,48,65);doc.setFont('helvetica','normal');doc.setFontSize(9.2);doc.text(chunk,margin+5,y+7);y+=h+4;index+=chunk.length}};
 // Header
  doc.setFillColor(...blue);doc.rect(0,0,pageW,34,'F');doc.setFillColor(255,255,255);doc.roundedRect(margin,7,18,18,4,4,'F');doc.setTextColor(...blue);doc.setFont('helvetica','bold');doc.setFontSize(15);doc.text('SP',margin+4.4,18.5);doc.setTextColor(255,255,255);doc.setFontSize(15);doc.text('SIGESP',margin+24,13);doc.setFontSize(8.5);doc.setFont('helvetica','normal');doc.text('Sistema Integrado de Gestão da Segurança Patrimonial',margin+24,18);doc.setFont('helvetica','bold');doc.setFontSize(11);doc.text('RELATÓRIO DE OCORRÊNCIA',margin+24,25);y=42;
@@ -6402,7 +6523,7 @@ ${isValCsn?`<label class="c4"><span class="label">Gerência</span><input class="
 </div>
 <div class="validation-section">
 <div class="validation-section-title"><span>4</span> Anexos e Evidências Fotográficas</div>
-<div class="photo-zone">${photos(true)}</div>
+<div class="photo-zone">${photos(true, 'valPhotos')}</div>
 </div>
 </form>
 </div>
@@ -6800,29 +6921,30 @@ function bind(){
   document.getElementById('occForm')?.addEventListener('change',e=>{if(e.target.name==='tipo_vinculo'){handleVinculoChange(e);return}if(e.target.name)captureOccurrenceDraft(e.currentTarget)});
   document.getElementById('occTipoVinculo')?.addEventListener('change',handleVinculoChange);
   document.getElementById('cancelOcc')?.addEventListener('click',async()=>{const wasEditingExisting=Boolean(S.editing?.id_ocorrencia);cleanup();S.occurrenceDraft=null;if(wasEditingExisting){S.editing=null;S.page=hasProfile(S.user,'Operador')?'occ-register':'occ-history';if(S.page==='occ-register'){await openOccurrenceRegistration({forceNew:false,clearDraft:true});}else{render();}}else{await openOccurrenceRegistration({forceNew:false,clearDraft:true});}});
-  const photosEl=document.getElementById('photos');
-  const photosLabel=document.querySelector('label[for="photos"].add-photo, .add-photo');
-  bindFileInputGuard(photosEl);
-  if(photosLabel){
-    photosLabel.addEventListener('click',()=>{
+  document.querySelectorAll('label.add-photo').forEach(lbl=>{
+    lbl.addEventListener('click',()=>{
       markFilePickerOpening();
     });
-    photosLabel.addEventListener('keydown',e=>{
+    lbl.addEventListener('keydown',e=>{
       if(e.key==='Enter'||e.key===' '){
         e.preventDefault();
         markFilePickerOpening();
-        photosEl?.click();
+        const forId=lbl.getAttribute('for');
+        if(forId)document.getElementById(forId)?.click();
       }
     });
-  }
-  photosEl?.addEventListener('change',x=>{
-    markFilePickerClosed(2500);
-    const files=Array.from(x.target.files||[]);
-    x.target.value='';
-    if(files.length)void choose(files);
   });
-  photosEl?.addEventListener('cancel',()=>{
-    markFilePickerClosed(1000);
+  document.querySelectorAll('input.photoFileInput, #photos, #valPhotos').forEach(pInput=>{
+    bindFileInputGuard(pInput);
+    pInput.addEventListener('change',x=>{
+      markFilePickerClosed(2500);
+      const files=Array.from(x.target.files||[]);
+      x.target.value='';
+      if(files.length)void choose(files);
+    });
+    pInput.addEventListener('cancel',()=>{
+      markFilePickerClosed(1000);
+    });
   });
   document.querySelectorAll('.removeNew').forEach(b=>b.onclick=()=>{captureOccurrenceDraft();const i=+b.dataset.i;URL.revokeObjectURL(S.newPhotos[i].url);S.newPhotos.splice(i,1);render()});
   document.querySelectorAll('.removeOld').forEach(b=>b.onclick=()=>{captureOccurrenceDraft();const i=+b.dataset.i,p=S.existing[i];S.removed.push(p.path);if(p.url)URL.revokeObjectURL(p.url);S.existing.splice(i,1);render()});

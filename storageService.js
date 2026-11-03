@@ -829,6 +829,25 @@ const StorageService = (() => {
       }
     },
 
+    async removeRecord(fileName, recordId) {
+      if (typeof indexedDB === 'undefined' || !recordId) return;
+      try {
+        const db = await this.open();
+        if (!db || !db.objectStoreNames.contains('records')) return;
+        await new Promise((res, rej) => {
+          const tx = db.transaction('records', 'readwrite');
+          const store = tx.objectStore('records');
+          store.delete(`${fileName}:${recordId}`);
+          tx.oncomplete = () => res();
+          tx.onerror = () => rej(tx.error);
+          tx.onabort = () => rej(tx.error);
+        });
+        db.close();
+      } catch (err) {
+        console.warn('[IndexedDBEngine:removeRecord] Falha ao remover do IndexedDB:', err);
+      }
+    },
+
     async enqueueOutbox(job) {
       if (typeof indexedDB === 'undefined') return job.id;
       try {
@@ -1846,7 +1865,7 @@ const StorageService = (() => {
       let hasLegacyBase = false;
       if (dir.isServer && !dir.relPath) {
         try {
-          const batchRes = await fetch(`/api/storage/occurrences/batch?knownSig=${encodeURIComponent(_lastKnownBatchSig || '')}&_t=${Date.now()}`, { method: 'GET' });
+          const batchRes = await fetch(`/api/storage/occurrences/batch?_t=${Date.now()}`, { method: 'GET' });
           if (batchRes.ok) {
             const bData = await batchRes.json();
             if (Array.isArray(bData?.files)) {
@@ -3470,6 +3489,95 @@ const StorageService = (() => {
         return await window.BackupService.importCsvData(fileName, rawCsvContent);
       }
       throw new Error('BackupService não disponível.');
+    },
+
+    /**
+     * Remove fisicamente e de todos os caches um registro de ocorrência
+     * Garante que uma ocorrência excluída ou validada nunca reapareça como pendente.
+     */
+    async deleteOccurrenceRecord(idOrProto) {
+      if (!idOrProto) return;
+      const norm = String(idOrProto).trim().toUpperCase();
+      const cleanProto = norm.replace(/[^A-Z0-9_-]/g, '_');
+      const targetFileName = `ocorrencia_${cleanProto}.csv`;
+      
+      const dir = getActiveDirectoryHandle();
+      
+      // 1. Remoção do arquivo individual em disco / servidor
+      if (dir) {
+        if (dir.isServer && !dir.relPath) {
+          try {
+            await fetch(`/api/storage/delete?file=${encodeURIComponent(targetFileName)}&_t=${Date.now()}`, { method: 'DELETE' });
+          } catch (delErr) {
+            console.warn('[StorageService:deleteOccurrenceRecord] Falha ao deletar arquivo individual no servidor:', targetFileName, delErr);
+          }
+        } else if (typeof dir.removeEntry === 'function') {
+          try {
+            await dir.removeEntry(targetFileName);
+          } catch (delErr) {
+            if (delErr?.name !== 'NotFoundError') {
+              console.warn('[StorageService:deleteOccurrenceRecord] Falha ao remover entry individual nativa:', targetFileName, delErr);
+            }
+          }
+        }
+      }
+
+      // 2. Limpeza de caches em memória
+      _individualOccFileCache.delete(targetFileName);
+      for (const [k, v] of _recordKeyToFileMap.entries()) {
+        if (v === targetFileName || k.toUpperCase() === norm) {
+          _recordKeyToFileMap.delete(k);
+        }
+      }
+
+      const cachedOcc = _rawFileCache.get('ocorrencias.csv');
+      if (cachedOcc && Array.isArray(cachedOcc.rows)) {
+        cachedOcc.rows = cachedOcc.rows.filter(x => {
+          const xProto = String(x.numero_protocolo || '').trim().toUpperCase();
+          const xId = String(x.id_ocorrencia || '').trim().toUpperCase();
+          const xInt = String(x.id_interno || '').trim().toUpperCase();
+          return xProto !== norm && xId !== norm && xInt !== norm;
+        });
+      }
+
+      // 3. Remoção do IndexedDB
+      if (this.IndexedDBEngine?.removeRecord) {
+        await this.IndexedDBEngine.removeRecord('ocorrencias.csv', norm);
+        await this.IndexedDBEngine.removeRecord('ocorrencias.csv', targetFileName);
+      }
+    },
+
+    /**
+     * Atualiza um registro existente na base legada ocorrencias.csv
+     * Garante que status 'Validada' / 'Registrada' seja persistido também na base legada,
+     * impedindo que reapareça como 'Pendente' em sincronizações futuras.
+     */
+    async updateOccurrenceInLegacyBase(record) {
+      if (!record) return;
+      const proto = String(record.numero_protocolo || '').trim().toUpperCase();
+      const id = String(record.id_ocorrencia || '').trim();
+      const idInt = String(record.id_interno || '').trim();
+
+      const cachedOcc = _rawFileCache.get('ocorrencias.csv');
+      if (cachedOcc && Array.isArray(cachedOcc.rows)) {
+        let updated = false;
+        cachedOcc.rows = cachedOcc.rows.map(row => {
+          const rProto = String(row.numero_protocolo || '').trim().toUpperCase();
+          const rId = String(row.id_ocorrencia || '').trim();
+          const rInt = String(row.id_interno || '').trim();
+          if ((proto && rProto === proto) || (id && rId === id) || (idInt && rInt === idInt)) {
+            updated = true;
+            return { ...row, ...record, status: 'Registrada', status_validacao: 'Validada' };
+          }
+          return row;
+        });
+        if (updated) {
+          const legEntry = _individualOccFileCache.get('__legacy_ocorrencias.csv__');
+          if (legEntry && Array.isArray(legEntry.rows)) {
+            legEntry.rows = cachedOcc.rows;
+          }
+        }
+      }
     }
   };
 })();
