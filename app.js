@@ -2003,7 +2003,7 @@ function opts(a,v){return a.map(x=>`<option value="${esc(x)}" ${String(x)===Stri
 function alert(){return S.message?`<div class="alert">${esc(S.message)}</div>`:''}
 function occurrenceFormElement(){return document.getElementById('validationOccForm')||document.getElementById('occForm')}
 function occurrenceFieldNames(){return ['id_ocorrencia','gerencia','supervisao','unidade','data_ocorrencia','hora_ocorrencia','natureza_ocorrencia','area','local_especifico','tipo_vinculo','nome_envolvido','empresa_envolvido','matricula_id','telefone','documento','placa_veiculo','gerencia_envolvido','gerencia_geral','diretoria','relato_detalhado','providencias_adotadas','prioridade','status','observacoes']}
-function captureOccurrenceDraft(form=occurrenceFormElement()){if(!form)return null;const raw=Object.fromEntries(new FormData(form));for(const name of occurrenceFieldNames()){const field=form.elements.namedItem(name);if(field&&'value' in field)raw[name]=field.value}const isCsn=raw.tipo_vinculo==='Grupo CSN';if(isCsn){raw.documento='';raw.gerencia_envolvido=raw.gerencia_envolvido||raw.gerencia||'';raw.gerencia=raw.gerencia_envolvido;raw.gerencia_geral=raw.gerencia_geral||'';raw.diretoria=raw.diretoria||''}else{raw.matricula_id='';raw.gerencia_envolvido='';raw.gerencia='';raw.gerencia_geral='';raw.diretoria=''}if(form.id==='validationOccForm'){S.validationModal={...(S.validationModal||{}),...raw}}else{S.editing={...(S.editing||{}),...raw}}return raw}
+function captureOccurrenceDraft(form=occurrenceFormElement()){if(!form)return null;const raw=Object.fromEntries(new FormData(form));for(const name of occurrenceFieldNames()){const field=form.elements.namedItem(name);if(field&&'value' in field)raw[name]=field.value}if(!raw.numero_protocolo){raw.numero_protocolo=S.editing?.numero_protocolo||S.editing?._reservedProtocol||S.activeReservation?.numeroProtocolo||S.activeReservation?.protocolo||''}const isCsn=raw.tipo_vinculo==='Grupo CSN';if(isCsn){raw.documento='';raw.gerencia_envolvido=raw.gerencia_envolvido||raw.gerencia||'';raw.gerencia=raw.gerencia_envolvido;raw.gerencia_geral=raw.gerencia_geral||'';raw.diretoria=raw.diretoria||''}else{raw.matricula_id='';raw.gerencia_envolvido='';raw.gerencia='';raw.gerencia_geral='';raw.diretoria=''}if(form.id==='validationOccForm'){S.validationModal={...(S.validationModal||{}),...raw}}else{S.editing={...(S.editing||{}),...raw}}return raw}
 function readOccurrenceValue(form,data,name){const field=form?.elements?.namedItem(name);if(field&&'value' in field)return String(field.value??'').trim();return String(data?.[name]??'').trim()}
 function cleanup(){
   S.newPhotos.forEach(x=>x.url&&URL.revokeObjectURL(x.url));
@@ -2287,6 +2287,7 @@ function gerarProximoId(ocorrenciasValidadas=[],ocorrenciasPendentes=[]){
     proximoId:proximoNumero,
     maiorIdAtual:maiorIdAtual,
     protocolo:proximoProtocolo,
+    proximoProtocolo:proximoProtocolo,
     numeroSequencial:proximoNumero
   };
 }
@@ -2348,11 +2349,11 @@ async function persistNewOccurrence(d,time,photoPaths,options={}){
   const isOperator=shouldQueueForValidation();
   const statusValue=isOperator?'pendente':'validada';
   const idUnico=d.id_interno||gerarIdUnicoUniversal();
-  const clientId=S.editing?._clientId||S.activeReservation?.sessionId||(window.StorageService?.getClientSessionId?window.StorageService.getClientSessionId():uid());
-  let reservationId=S.editing?._reservationId||S.activeReservation?.reservationId||'';
+  const clientId=d._clientId||S.editing?._clientId||S.activeReservation?.sessionId||(window.StorageService?.getClientSessionId?window.StorageService.getClientSessionId():uid());
+  let reservationId=d._reservationId||S.editing?._reservationId||S.activeReservation?.reservationId||'';
 
   for(let attempt=0;attempt<5;attempt++){
-    let protocol=String(d.numero_protocolo||S.editing?.numero_protocolo||S.activeReservation?.numeroProtocolo||'').trim();
+    let protocol=String(d.numero_protocolo||S.editing?.numero_protocolo||S.activeReservation?.numeroProtocolo||S.activeReservation?.protocolo||'').trim();
     let nextNum=extrairNumeroIdOuProtocolo(protocol);
 
     if(attempt>0||!protocol||nextNum<=0){
@@ -2392,7 +2393,9 @@ async function persistNewOccurrence(d,time,photoPaths,options={}){
       try{
         const confirmed=await window.StorageService.confirmProtocolForSave(protocol,S.user?.login||'Operador',d.unidade||'',{
           clientId,
-          reservationId
+          reservationId,
+          id_interno:idUnico,
+          markUtilized:true
         });
         if(confirmed?.protocolo){
           protocol=confirmed.protocolo;
@@ -2407,7 +2410,7 @@ async function persistNewOccurrence(d,time,photoPaths,options={}){
             sessionId:clientId,
             usuario:S.user?.login||'Operador',
             dataHoraReserva:confirmed.dataHoraReserva||new Date().toISOString(),
-            status:'RESERVADO'
+            status:'UTILIZADO'
           });
           if(S.editing){
             S.editing.numero_protocolo=protocol;
@@ -2582,13 +2585,24 @@ async function saveOcc(ev){
     const pendingFlow=shouldQueueForValidation(),isEdit=!!d.id_ocorrencia;
     const time=now();
 
+    // Se houver uma reserva de protocolo em andamento ao clicar em salvar, aguarda sua conclusão
+    if(!isEdit&&_openOccRegPromise){
+      try{await _openOccRegPromise;}catch{}
+    }
+
     // 1. Determinação determinística de Identificadores no milissegundo 0
     const nextIds=gerarProximoId(S.occ,S.pending);
+    const activeProto=S.activeReservation?.protocolo||S.activeReservation?.numeroProtocolo||S.activeReservation?.protocol||'';
     const protocol=isEdit
-      ?(d.numero_protocolo||editingBeforeSubmit.numero_protocolo||nextIds.proximoProtocolo)
-      :(d.numero_protocolo||S.activeReservation?.protocol||nextIds.proximoProtocolo);
-    const idOcc=isEdit?(d.id_ocorrencia||editingBeforeSubmit.id_ocorrencia||nextIds.proximoId):(d.id_ocorrencia||nextIds.proximoId);
-    const idInt=isEdit?(d.id_interno||editingBeforeSubmit.id_interno||idOcc):(d.id_interno||gerarIdUnicoUniversal());
+      ?(d.numero_protocolo||editingBeforeSubmit.numero_protocolo||nextIds.protocolo)
+      :(d.numero_protocolo||editingBeforeSubmit.numero_protocolo||editingBeforeSubmit._reservedProtocol||activeProto||nextIds.protocolo);
+    const seqFromProto=extrairNumeroIdOuProtocolo(protocol);
+    const idOcc=isEdit?(d.id_ocorrencia||editingBeforeSubmit.id_ocorrencia||nextIds.proximoId):(d.id_ocorrencia||(seqFromProto>0?String(seqFromProto):String(nextIds.proximoId)));
+    const idInt=isEdit?(d.id_interno||editingBeforeSubmit.id_interno||idOcc):(d.id_interno||editingBeforeSubmit.id_interno||gerarIdUnicoUniversal());
+    d.numero_protocolo=protocol;
+    d.id_interno=idInt;
+    d._reservationId=editingBeforeSubmit._reservationId||S.activeReservation?.reservationId||'';
+    d._clientId=editingBeforeSubmit._clientId||S.activeReservation?.sessionId||getTabSessionClientId();
     const supervision=supervisionForUnit(d.unidade);
 
     // 2. Snapshot para Rollback defensivo em caso de falha física no disco
@@ -2662,6 +2676,11 @@ async function saveOcc(ev){
             :await persistNewOccurrence(d,time,finalPhotoPaths);
           const row=saveResult?.row||saveResult;
           if(row){
+            if(S.successPopup&&S.successPopup.idOcorrencia===idOcc&&row.numero_protocolo&&row.numero_protocolo!==S.successPopup.protocolo){
+              S.successPopup.protocolo=row.numero_protocolo;
+              S.successPopup.idOcorrencia=row.id_ocorrencia||idOcc;
+              render();
+            }
             const consolidated=window.StorageService?.consolidateVersionedRows
               ?window.StorageService.consolidateVersionedRows([...(S.occ||[]),row])
               :[...(S.occ||[]),row];

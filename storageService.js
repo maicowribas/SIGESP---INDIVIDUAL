@@ -1574,7 +1574,7 @@ const StorageService = (() => {
       if (parsed.length > 5000) {
         await new Promise(r => setTimeout(r, 0));
       }
-      const rows = consolidateVersionedRows(parsed);
+      const rows = parsed.length <= 1 ? parsed : consolidateVersionedRows(parsed);
       _individualOccFileCache.set(indivName, {
         rawSig,
         mtimeMs: mtimeMs || Date.now(),
@@ -2657,13 +2657,29 @@ const StorageService = (() => {
         }
       }
 
-      const filesToCheck = ['ocorrencias.csv', 'ocorrencias_pendentes.csv', 'registros_apagados.csv'];
       const regex = new RegExp(`OC-${year}-(\\d{1,8})`, 'i');
+      const dir = getActiveDirectoryHandle();
+      if (dir && isNativeSharedDirectory()) {
+        try {
+          const handles = await this._listNativeOccurrenceFileHandles(dir);
+          for (const h of handles) {
+            const m = regex.exec(h.name);
+            if (m) {
+              const n = parseInt(m[1], 10);
+              if (!isNaN(n) && n > 0) {
+                usedNumbers.add(n);
+                if (n > maxFromFiles) maxFromFiles = n;
+              }
+            }
+          }
+        } catch {}
+      }
 
+      const filesToCheck = ['ocorrencias_pendentes.csv', 'registros_apagados.csv'];
       const [csvRowLists, rawResText, rawCounterText] = await Promise.all([
         Promise.all(
           filesToCheck.map(fName =>
-            this.readEncryptedCsv(fName, { force: true, optional: true, skipAutoEncrypt: true }).catch(() => [])
+            this.readEncryptedCsv(fName, { force: false, optional: true, skipAutoEncrypt: true }).catch(() => [])
           )
         ),
         this.readRawFile('reservas_protocolos.json').catch(() => ''),

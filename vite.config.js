@@ -39,7 +39,7 @@ async function listIndividualOccurrenceFiles() {
   const files = [];
   let totalSize = 0;
   let maxMtimeMs = lastOccurrenceMutationMs;
-  const chunkSize = 64;
+  const chunkSize = 512;
   for (let i = 0; i < occEntries.length; i += chunkSize) {
     const slice = occEntries.slice(i, i + chunkSize);
     const stats = await Promise.all(
@@ -382,9 +382,24 @@ async function writeProtocolCounter(year, value, allowReset = false) {
 }
 
 async function extractExistingNumbersFromOcorrencias(year) {
-  const occBatch = await listIndividualOccurrenceFiles();
+  await fs.mkdir(DADOS_DIR, { recursive: true });
+  let dirMtimeMs = lastOccurrenceMutationMs;
+  try {
+    const dirStat = await fs.stat(DADOS_DIR);
+    if (dirStat.mtimeMs > dirMtimeMs) dirMtimeMs = dirStat.mtimeMs;
+  } catch {}
+
+  const entries = await fs.readdir(DADOS_DIR, { withFileTypes: true });
+  const occNames = [];
+  for (const e of entries) {
+    if (e.isFile() && isIndividualOccurrenceFile(e.name)) {
+      occNames.push(e.name);
+    }
+  }
+  occNames.sort();
+
   const filesToScan = ['ocorrencias.csv', 'ocorrencias_pendentes.csv', 'registros_apagados.csv'];
-  let combinedSig = `INDIV:${occBatch.sig}|`;
+  let combinedSig = `INDIV:${occNames.length}:${occNames[0] || ''}:${occNames[occNames.length - 1] || ''}:${Math.round(dirMtimeMs)}|`;
   const stats = [];
 
   for (const name of filesToScan) {
@@ -410,8 +425,8 @@ async function extractExistingNumbersFromOcorrencias(year) {
   const fileNameProtoRegex = new RegExp(`OC-${year}-(\\d{1,8})`, 'i');
   const indivFilesToRead = [];
 
-  for (const occFile of occBatch.files) {
-    const nameMatch = fileNameProtoRegex.exec(occFile.name);
+  for (const fileName of occNames) {
+    const nameMatch = fileNameProtoRegex.exec(fileName);
     if (nameMatch) {
       const num = parseInt(nameMatch[1], 10);
       if (!isNaN(num) && num > 0) {
@@ -419,7 +434,7 @@ async function extractExistingNumbersFromOcorrencias(year) {
         continue;
       }
     }
-    indivFilesToRead.push(occFile);
+    indivFilesToRead.push({ name: fileName, path: path.join(DADOS_DIR, fileName), size: 1 });
   }
 
   const allToRead = [...indivFilesToRead, ...stats];
@@ -446,8 +461,8 @@ async function extractExistingNumbersFromOcorrencias(year) {
 
   if (ocorrenciasProtocolCache.sig !== combinedSig) {
     ocorrenciasProtocolCache = {
-      mtimeMs: occBatch.maxMtimeMs || stats[0]?.mtimeMs || 0,
-      size: occBatch.totalSize || stats[0]?.size || 0,
+      mtimeMs: dirMtimeMs || stats[0]?.mtimeMs || 0,
+      size: occNames.length || stats[0]?.size || 0,
       sig: combinedSig,
       byYear: new Map()
     };
@@ -611,7 +626,7 @@ function createStorageMiddleware() {
         }
 
         const loadedFiles = [];
-        const chunkSize = 64;
+        const chunkSize = 512;
         for (let i = 0; i < batchInfo.files.length; i += chunkSize) {
           const slice = batchInfo.files.slice(i, i + chunkSize);
           const chunkData = await Promise.all(
