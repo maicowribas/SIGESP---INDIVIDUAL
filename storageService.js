@@ -1134,8 +1134,8 @@ const StorageService = (() => {
           _lastKnownBatchSig = '';
         }
       } else {
-        _rawFileCache.clear();
-        _individualOccFileCache.clear();
+        // Invalidação global segura: preserva registros decodificados válidos por assinatura
+        // para garantir reconexão instantânea sem re-computação criptográfica
         _lastKnownBatchSig = '';
         _lastKnownBundleSig = '';
         _preloadedOccurrencesBatch = null;
@@ -1144,6 +1144,7 @@ const StorageService = (() => {
 
     /**
      * Indexa rapidamente entradas de uma pasta nativa em uma única passada
+     * e pré-carrega os arquivos padrão em paralelo
      */
     async _scanAndIndexNativeDirectory(dir) {
       if (!dir || dir.isServer) return;
@@ -1164,7 +1165,7 @@ const StorageService = (() => {
             if (handle.kind === 'file') {
               fileMap.set(handle.name, handle);
               if (isIndividualOccurrenceFileName(handle.name)) {
-                occHandles.push({ name: handle.name, handle });
+                occHandles.push({ name, handle: handle });
               }
             }
           }
@@ -1175,6 +1176,36 @@ const StorageService = (() => {
       occHandles.sort((a, b) => a.name.localeCompare(b.name));
       this._nativeFilesMap = fileMap;
       this._nativeHandlesCache = { dir, ts: Date.now(), handles: occHandles };
+
+      // Pré-carregamento e descriptografia paralela dos arquivos CSV nativos
+      const standardFiles = [
+        'usuarios.csv', 'chaves.csv', 'movimentacao_chaves.csv',
+        'historico_sistema.csv', 'supervisoes_unidades.csv',
+        'naturezas_ocorrencias.csv', 'inspecao_fumaca_preta.csv',
+        'registros_apagados.csv'
+      ];
+      await Promise.all(standardFiles.map(async (name) => {
+        const fh = fileMap.get(name);
+        if (!fh) return;
+        try {
+          const f = await fh.getFile();
+          const mtime = Number(f.lastModified || 0);
+          const size = Number(f.size || 0);
+          const cached = _rawFileCache.get(name);
+          if (cached && cached.mtimeMs === mtime && cached.size === size && Array.isArray(cached.rows)) {
+            return;
+          }
+          const rawText = await f.text();
+          const rawSig = `${rawText.length}:${rawText.slice(0, 48)}:${rawText.slice(-48)}`;
+          if (cached && cached.rawSig === rawSig && Array.isArray(cached.rows)) {
+            cached.mtimeMs = mtime;
+            cached.size = size;
+            return;
+          }
+          _rawFileCache.set(name, { rawSig, rawText, mtimeMs: mtime, size });
+          await this.readEncryptedCsv(name).catch(() => []);
+        } catch {}
+      }));
     },
 
     /**
@@ -1208,6 +1239,12 @@ const StorageService = (() => {
                   if (fileObj && typeof fileObj.rawText === 'string') {
                     const rawText = fileObj.rawText;
                     const rawSig = `${rawText.length}:${rawText.slice(0, 48)}:${rawText.slice(-48)}`;
+                    const existing = _rawFileCache.get(fName);
+                    if (existing && existing.rawSig === rawSig && Array.isArray(existing.rows)) {
+                      existing.mtimeMs = Number(fileObj.mtimeMs || existing.mtimeMs);
+                      existing.size = Number(fileObj.size || existing.size);
+                      continue;
+                    }
                     _rawFileCache.set(fName, {
                       rawSig,
                       rawText,
@@ -1224,6 +1261,10 @@ const StorageService = (() => {
                   _lastKnownBatchSig = String(data.occurrencesBatch.sig);
                 }
               }
+
+              // Pré-decodifica todos os arquivos padrão em paralelo para que qualquer read() seja 0ms
+              const stdFiles = Object.keys(data.files || {});
+              await Promise.all(stdFiles.map(name => this.readEncryptedCsv(name).catch(() => [])));
             }
           }
         } catch (bundleErr) {

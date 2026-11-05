@@ -1393,34 +1393,35 @@ async function handleDirectoryInput(files){
     fail('Nenhum arquivo .csv encontrado na pasta selecionada.');
     return;
   }
-  showLoading('Sincronizando arquivos da pasta selecionada...',{kicker:'Sincronização de dados',title:'Lendo arquivos da pasta em lote...',progress:20,overlayId:'pdfProgressOverlay'});
+  showLoading('Conectando pasta selecionada...',{kicker:'Sincronização de dados',title:'Lendo arquivos da pasta...',progress:30,overlayId:'pdfProgressOverlay'});
   try{
     await new Promise(r=>setTimeout(r,0));
-    if(window.BackupService?.importCsvFilesBatch){
-      await window.BackupService.importCsvFilesBatch(csvFiles,(done,total,currentName)=>{
-        const pct=20+Math.round((done/Math.max(1,total))*65);
-        updateLoadingProgress(pct,`Sincronizando em lote (${done}/${total}) · ${currentName}...`);
-      });
-    }else if(window.BackupService){
-      const batchSize=32;
-      for(let i=0;i<csvFiles.length;i+=batchSize){
-        const slice=csvFiles.slice(i,i+batchSize);
-        updateLoadingProgress(20+Math.round(((i+slice.length)/csvFiles.length)*65),`Lendo lote de arquivos (${i+slice.length}/${csvFiles.length})...`);
-        await Promise.all(slice.map(file=>window.BackupService.importCsvData(file,file.name.trim())));
-        await new Promise(r=>setTimeout(r,0));
+    // Leitura paralela rápida em memória sem re-criptografia destrutiva
+    await Promise.all(csvFiles.map(async file=>{
+      const cleanName=file.name.trim();
+      const text=await file.text();
+      const mtime=Number(file.lastModified||Date.now());
+      const size=Number(file.size||text.length);
+      const rawSig=`${text.length}:${text.slice(0,48)}:${text.slice(-48)}`;
+      if(window.StorageService?._rawFileCache){
+        window.StorageService._rawFileCache.set(cleanName,{
+          rawSig,
+          rawText:text,
+          mtimeMs:mtime,
+          size
+        });
       }
-    }else{
-      await Promise.all(csvFiles.map(async file=>{
-        const cleanName=file.name.trim();
-        const text=await file.text();
+      if(window.CryptoService?.isEncryptedFile(text)){
+        void window.StorageService?.readEncryptedCsv(cleanName).catch(()=>{});
+      }else{
         CSVService.setCachedText(cleanName,text);
-      }));
-    }
-    updateLoadingProgress(90,'Recarregando dados...');
+      }
+    }));
+    updateLoadingProgress(85,'Carregando dados da pasta...');
     await load(false);
     hideLoading();
     S.folderModal=false;
-    S.message=`Pasta com ${csvFiles.length} arquivos CSV sincronizada e protegida com sucesso.`;
+    S.message=`Pasta com ${csvFiles.length} arquivos CSV conectada com sucesso.`;
     render();
   }catch(err){
     hideLoading();
