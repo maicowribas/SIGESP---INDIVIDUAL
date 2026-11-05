@@ -446,7 +446,14 @@ function normalizeOccurrenceRow(raw,index=0,existingList=[]){
   let statusValidacao=getField('status_validacao')||'';
   const valLower=String(statusValidacao).trim().toLowerCase();
   const stLower=String(statusVal).trim().toLowerCase();
-  if(valLower==='validada'||stLower==='validada'||stLower==='em apuração'||stLower==='em apuracao'||stLower==='encerrada'){
+  const perfilReg=String(getField('perfil_registro')||getField('perfil')||'').trim().toLowerCase();
+  const validadoPor=String(getField('validado_por')||'').trim();
+  const isOpPending=(perfilReg==='operador'&&!validadoPor&&valLower!=='validada');
+
+  if(stLower==='pendente'||stLower==='pendente de validação'||valLower.includes('pendente')||isOpPending){
+    statusVal='pendente';
+    statusValidacao='Pendente de validação';
+  }else if(valLower==='validada'||validadoPor||stLower==='validada'||stLower==='em apuração'||stLower==='em apuracao'||stLower==='encerrada'){
     statusValidacao='Validada';
     if(stLower==='em apuração'||stLower==='em apuracao'){
       statusVal='Em Apuração';
@@ -457,9 +464,6 @@ function normalizeOccurrenceRow(raw,index=0,existingList=[]){
     }else{
       statusVal='Registrada';
     }
-  }else if(stLower==='pendente'||stLower==='pendente de validação'||valLower.includes('pendente')){
-    statusVal='pendente';
-    statusValidacao='Pendente de validação';
   }else{
     statusValidacao='Validada';
     statusVal='Registrada';
@@ -660,8 +664,14 @@ function isPendingOccurrence(item){
   if(!item||typeof item!=='object')return false;
   const stVal=String(item.status_validacao||'').trim().toLowerCase();
   const st=String(item.status||'').trim().toLowerCase();
-  if(stVal==='validada'||st==='validada'||st==='em apuração'||st==='em apuracao'||st==='encerrada'||st==='registrada')return false;
-  return st==='pendente'||st==='pendente de validação'||stVal.includes('pendente');
+  const validadoPor=String(item.validado_por||'').trim();
+  const perfil=String(item.perfil_registro||item.perfil||'').trim().toLowerCase();
+
+  if(stVal==='validada'||validadoPor)return false;
+  if(stVal.includes('pendente')||st==='pendente'||st==='pendente de validação')return true;
+  if(perfil==='operador'&&!validadoPor)return true;
+  if(st==='em apuração'||st==='em apuracao'||st==='encerrada')return false;
+  return false;
 }
 function isValidatedOccurrence(item){
   if(!item||typeof item!=='object')return false;
@@ -2537,13 +2547,45 @@ async function persistEditedOccurrence(d,editingBeforeSubmit,photoPaths,initialD
   }
   throw Error('Não foi possível confirmar a alteração da ocorrência.');
 }
+let _lastOccSaveClick=0;
 async function saveOcc(ev){
   ev.preventDefault();
-  if(S.submitting)return;
-  const form=ev.currentTarget,d=captureOccurrenceDraft(form)||{},editingBeforeSubmit={...(S.editing||{})};
-  if(hasProfile(S.user,'Operador')&&d.id_ocorrencia){cleanup();S.editing={};denyOperatorAccess();return}
-  let submitButton=form.querySelector('button[type="submit"],button:not([type])'),savedPhotoPaths=[];
+  const clickTime=Date.now();
+  if(S.submitting||(clickTime-_lastOccSaveClick<1800))return;
+  _lastOccSaveClick=clickTime;
+  S.submitting=true;
+
+  const form=ev.currentTarget;
+  const submitButton=form?.querySelector('button[type="submit"],button.primary,button:not([type])');
+  if(submitButton){
+    submitButton.disabled=true;
+    submitButton.classList.add('opacity-50','cursor-not-allowed');
+    if(!submitButton.dataset.origText)submitButton.dataset.origText=submitButton.textContent||'Salvar ocorrência';
+    submitButton.textContent='Salvando...';
+  }
+
+  let savedPhotoPaths=[];
   try{
+    const isEditCandidate=Boolean(form.elements['id_ocorrencia']?.value||S.editing?.id_ocorrencia);
+    if(!isEditCandidate&&_openOccRegPromise){
+      try{await _openOccRegPromise;}catch{}
+    }
+
+    const d=captureOccurrenceDraft(form)||{},editingBeforeSubmit={...(S.editing||{})};
+    if(hasProfile(S.user,'Operador')&&d.id_ocorrencia){
+      cleanup();
+      S.editing={};
+      S.submitting=false;
+      _lastOccSaveClick=0;
+      if(submitButton){
+        submitButton.disabled=false;
+        submitButton.classList.remove('opacity-50','cursor-not-allowed');
+        submitButton.textContent=submitButton.dataset.origText||'Salvar ocorrência';
+      }
+      denyOperatorAccess();
+      return;
+    }
+
     await refreshAccessContext();
     validateOccurrenceForm(form,d);
     if(!canRegisterOccurrence(S.user))throw Error('Usuário sem permissão para registrar ocorrências.');
@@ -2551,24 +2593,27 @@ async function saveOcc(ev){
     const pendingFlow=shouldQueueForValidation(),isEdit=!!d.id_ocorrencia;
     const time=now();
 
-    // Se houver uma reserva de protocolo em andamento ao clicar em salvar, aguarda sua conclusão
-    if(!isEdit&&_openOccRegPromise){
-      try{await _openOccRegPromise;}catch{}
-    }
-
     // 1. Determinação determinística de Identificadores no milissegundo 0
     const nextIds=gerarProximoId(S.occ,S.pending);
     const activeProto=S.activeReservation?.protocolo||S.activeReservation?.numeroProtocolo||S.activeReservation?.protocol||'';
-    const protocol=isEdit
+    let protocol=isEdit
       ?(d.numero_protocolo||editingBeforeSubmit.numero_protocolo||nextIds.protocolo)
       :(d.numero_protocolo||editingBeforeSubmit.numero_protocolo||editingBeforeSubmit._reservedProtocol||activeProto||nextIds.protocolo);
+    if(!protocol||!protocol.trim()){
+      protocol=nextIds.protocolo;
+    }
     const seqFromProto=extrairNumeroIdOuProtocolo(protocol);
     const idOcc=isEdit?(d.id_ocorrencia||editingBeforeSubmit.id_ocorrencia||nextIds.proximoId):(d.id_ocorrencia||(seqFromProto>0?String(seqFromProto):String(nextIds.proximoId)));
     const idInt=isEdit?(d.id_interno||editingBeforeSubmit.id_interno||idOcc):(d.id_interno||editingBeforeSubmit.id_interno||gerarIdUnicoUniversal());
     d.numero_protocolo=protocol;
-    d.id_interno=idInt;
+    d.id_ocorrencia=String(idOcc);
+    d.id_interno=String(idInt);
     d._reservationId=editingBeforeSubmit._reservationId||S.activeReservation?.reservationId||'';
     d._clientId=editingBeforeSubmit._clientId||S.activeReservation?.sessionId||getTabSessionClientId();
+    if(pendingFlow){
+      d.status='pendente';
+      d.status_validacao='Pendente de validação';
+    }
     const supervision=supervisionForUnit(d.unidade);
 
     // 2. Snapshot para Rollback defensivo em caso de falha física no disco
@@ -2591,19 +2636,28 @@ async function saveOcc(ev){
       supervisao:supervision?.nome||d.supervisao||'GSP/SP',
       status:pendingFlow?'pendente':(d.status||'Registrada'),
       status_validacao:pendingFlow?'Pendente de validação':'Validada',
+      perfil_registro:canonicalPerfil(S.user?.perfil||'Operador'),
+      responsavel_registro:isEdit?(editingBeforeSubmit.responsavel_registro||S.user.login):S.user.login,
       anexos_referencias:photoRefs.join('|'),
       data_registro:isEdit?(editingBeforeSubmit.data_registro||time):time,
       versao_registro:isEdit?String((+editingBeforeSubmit.versao_registro||0)+1):'1',
       data_atualizacao:time,
-      usuario_ultima_alteracao:S.user.login,
-      responsavel_registro:isEdit?(editingBeforeSubmit.responsavel_registro||S.user.login):S.user.login
+      usuario_ultima_alteracao:S.user.login
     },0,S.occ||[]);
 
-    // 4. ATUALIZAÇÃO INSTANTÂNEA DA INTERFACE (0 ms)
+    // 4. ATUALIZAÇÃO INSTANTÂNEA DA INTERFACE (0 ms) COM DESDUPLICAÇÃO
     if(isEdit){
-      S.occ=S.occ.map(x=>(String(x.id_ocorrencia)===String(idOcc)||String(x.id_interno)===String(idInt)||String(x.numero_protocolo)===String(protocol))?optimisticRow:x);
+      S.occ=S.occ.map(x=>(String(x.id_ocorrencia)===String(idOcc)||String(x.id_interno)===String(idInt)||String(x.numero_protocolo).toUpperCase()===String(protocol).toUpperCase())?optimisticRow:x);
     }else{
-      S.occ=[optimisticRow,...S.occ];
+      const existingIdx=S.occ.findIndex(x=>
+        (idInt&&String(x.id_interno||'').trim()===String(idInt).trim())||
+        (protocol&&String(x.numero_protocolo||'').trim().toUpperCase()===String(protocol).trim().toUpperCase())
+      );
+      if(existingIdx>=0){
+        S.occ[existingIdx]=optimisticRow;
+      }else{
+        S.occ=[optimisticRow,...S.occ];
+      }
     }
     S.pending=S.occ.filter(isPendingOccurrence);
     _occFilterMemo={rowsRef:null,query:'',result:[]};
@@ -2611,7 +2665,6 @@ async function saveOcc(ev){
     _dashSeriesMemo={rowsRef:null,result:null};
 
     S.editing=null;
-    S.submitting=false;
     cleanup();
     S.message='';
     S.successPopup={
@@ -2670,11 +2723,18 @@ async function saveOcc(ev){
         S.successPopup=null;
         render();
         showToast(bgErr.message||'Falha ao gravar no disco. Ocorrência restaurada.','error','Erro de Gravação');
+      }finally{
+        S.submitting=false;
       }
     })();
   }catch(error){
     S.submitting=false;
-    if(submitButton){submitButton.disabled=false;submitButton.textContent='Salvar ocorrência'}
+    _lastOccSaveClick=0;
+    if(submitButton){
+      submitButton.disabled=false;
+      submitButton.classList.remove('opacity-50','cursor-not-allowed');
+      submitButton.textContent=submitButton.dataset.origText||'Salvar ocorrência';
+    }
     if(error instanceof OccurrenceValidationError){
       showOccurrenceValidationError(error.message,'Validação do formulário');
     }else{
@@ -3274,9 +3334,10 @@ async function ensureActiveProtocolReservation(options={}){
 
   if(!existingRes||forceNew){
     S.reservingProtocol=true;
-    if(S.editing&&!S.editing.id_ocorrencia){
-      S.editing.numero_protocolo='';
-      S.editing._reservedProtocol='';
+    if(S.editing&&!S.editing.id_ocorrencia&&!S.editing.numero_protocolo){
+      const quickProto=gerarProximoId(S.occ,S.pending).protocolo;
+      S.editing.numero_protocolo=quickProto;
+      S.editing._reservedProtocol=quickProto;
       S.editing._reservationConfirmed=false;
     }
     if(S.page==='occ-register')render();
@@ -3355,10 +3416,11 @@ async function openOccurrenceRegistration(options={}){
   S.successPopup=null;
   S.modal=null;
   S.errorPopup=null;
+  const instantProto=storedRes?.numeroProtocolo||gerarProximoId(S.occ,S.pending).protocolo;
   S.editing={
     ...draftToRestore,
-    numero_protocolo:storedRes?.numeroProtocolo||'',
-    _reservedProtocol:storedRes?.numeroProtocolo||'',
+    numero_protocolo:storedRes?.numeroProtocolo||instantProto,
+    _reservedProtocol:storedRes?.numeroProtocolo||instantProto,
     _reservationId:storedRes?.reservationId||'',
     _reservationConfirmed:Boolean(storedRes?.numeroProtocolo),
     _clientId:clientId
@@ -4297,7 +4359,7 @@ return `<div class="card">
   </div>
   <form id="occForm" novalidate>
   <input type="hidden" name="id_ocorrencia" value="${esc(x.id_ocorrencia||'')}">
-  <input type="hidden" name="numero_protocolo" value="${esc((x.id_ocorrencia||x._reservationConfirmed!==false)?(x.numero_protocolo||''):'')}">
+  <input type="hidden" name="numero_protocolo" value="${esc(x.numero_protocolo||'')}">
   <div class="section">Estrutura organizacional</div><div class="formgrid"><label class="c4"><span class="label">Gerência</span><input class="field" name="gerencia" value="${esc(x.gerencia||'GSP/SP')}"></label><label class="c4"><span class="label">Supervisão</span><input class="field" name="supervisao" value="${esc(x.supervisao||supervision?.nome||'')}" readonly></label><label class="c4"><span class="label">Unidade</span><select class="field" name="unidade" ${availableUnits.length?'':'disabled'}>${availableUnits.length?selectOptions(availableUnits,selectedUnit):'<option value="">Nenhuma unidade autorizada</option>'}</select></label><label class="c6 col-datetime"><span class="label">Data</span><input class="field" type="date" name="data_ocorrencia" value="${esc(x.data_ocorrencia||today)}"></label><label class="c6 col-datetime"><span class="label">Hora</span><input class="field" type="time" name="hora_ocorrencia" value="${esc(x.hora_ocorrencia||tm)}"></label><label class="c12"><span class="label">Natureza</span><select class="field" name="natureza_ocorrencia"><option value="">Selecione uma natureza</option>${selectOptions(natureOptions,selectedNature)}${natureOptions.length?'':'<option value="" disabled>Nenhuma natureza ativa cadastrada</option>'}</select></label><label class="c6"><span class="label">Área</span><input class="field" name="area" value="${esc(x.area||'')}"></label><label class="c6"><span class="label">Local específico</span><input class="field" name="local_especifico" value="${esc(x.local_especifico||'')}" required></label></div><div class="section">Identificação do envolvido e relato</div><div class="formgrid"><label class="c4"><span class="label">Tipo de Vínculo</span><select class="field" name="tipo_vinculo" id="occTipoVinculo"><option value="Terceiro" ${vinculo==='Terceiro'?'selected':''}>Terceiro</option><option value="Visitante" ${vinculo==='Visitante'?'selected':''}>Visitante</option><option value="Motorista" ${vinculo==='Motorista'?'selected':''}>Motorista</option><option value="Grupo CSN" ${isCsn?'selected':''}>Grupo CSN</option></select></label><label class="c8"><span class="label whitespace-nowrap min-w-fit">Nome Completo do Envolvido</span><input class="field" name="nome_envolvido" id="occNomeEnvolvido" value="${esc(x.nome_envolvido||'')}" placeholder="Nome do envolvido"></label><label class="c6"><span class="label">Empresa</span><input class="field" name="empresa_envolvido" id="occEmpresaEnvolvido" value="${esc(x.empresa_envolvido||(isCsn?'Grupo CSN':''))}" placeholder="Empresa"></label>${isCsn?`<label class="c6"><span class="label">Matrícula</span><input class="field" name="matricula_id" id="occMatriculaId" value="${esc(x.matricula_id||'')}" placeholder="Informe a matrícula CSN"></label>`:`<label class="c6"><span class="label">Documento</span><input class="field" name="documento" id="occDocumento" value="${esc(x.documento||'')}" placeholder="RG, CPF ou CNH"></label>`}<label class="c6"><span class="label">Telefone</span><input class="field" name="telefone" id="occTelefone" value="${esc(x.telefone||'')}" placeholder="(00) 00000-0000"></label><label class="c6"><span class="label">Placa</span><input class="field" name="placa_veiculo" id="occPlacaVeiculo" value="${esc(x.placa_veiculo||'')}" placeholder="ABC-1234"></label>${isCsn?`<label class="c4"><span class="label">Gerência</span><input class="field" name="gerencia_envolvido" id="occGerenciaEnvolvido" value="${esc(x.gerencia_envolvido||x.gerencia||'')}" placeholder="Informe a gerência"></label><label class="c4"><span class="label">Gerência Geral</span><input class="field" name="gerencia_geral" id="occGerenciaGeral" value="${esc(x.gerencia_geral||'')}" placeholder="Informe a gerência geral"></label><label class="c4"><span class="label">Diretoria</span><input class="field" name="diretoria" id="occDiretoria" value="${esc(x.diretoria||'')}" placeholder="Informe a diretoria"></label>`:''}<label class="c12"><span class="label">Relato detalhado</span><textarea class="field" rows="7" maxlength="5000" name="relato_detalhado" id="occRelatoDetalhado" required>${esc(x.relato_detalhado||'')}</textarea></label><label class="c6"><span class="label">Prioridade</span><select class="field" name="prioridade">${opts(PRI,x.prioridade||'Média')}</select></label><label class="c6"><span class="label">Status</span><select class="field" name="status">${opts(OST,x.status||'Registrada')}</select></label><label class="c12"><span class="label">Providências</span><textarea class="field" rows="4" name="providencias_adotadas">${esc(x.providencias_adotadas||'')}</textarea></label></div><div class="section">Evidências fotográficas</div><div class="photo-zone">${photos(true)}</div><div class="row" style="justify-content:flex-end;margin-top:18px"><button type="button" id="cancelOcc" class="btn">Cancelar</button><button class="btn primary" ${S.submitting?'disabled':''}>${S.submitting?'Salvando...':'Salvar ocorrência'}</button></div></form></div>`
 }
 const _occRowIndex=new WeakMap();

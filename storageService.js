@@ -400,7 +400,7 @@ const StorageService = (() => {
             relato_detalhado: rawObj.relato_detalhado || rawObj.descricao_ocorrencia || rawObj.arma_envolvida || '',
             providencias_adotadas: rawObj.providencias_adotadas || rawObj.acao_imediata || rawObj.Camera_relacionada || '',
             prioridade: rawObj.prioridade || rawObj.classificacao || rawObj.nivel_risco || 'Média',
-            status: rawObj.status || 'validada',
+            status: rawObj.status || (String(rawObj.perfil_registro || '').trim().toLowerCase() === 'operador' && !rawObj.validado_por ? 'pendente' : 'validada'),
             anexos_referencias: rawObj.anexos_referencias || rawObj.anexos || rawObj.equipe_plantao || '',
             responsavel_registro: rawObj.responsavel_registro || rawObj.operador_responsavel || '',
             matricula_responsavel: rawObj.matricula_responsavel || rawObj.id_operador || '',
@@ -408,7 +408,7 @@ const StorageService = (() => {
             data_registro: rawObj.data_registro || rawObj.data_hora_registro || rawObj.data_ultima_alteracao || '',
             versao_registro: rawObj.versao_registro || '1',
             usuario_ultima_alteracao: rawObj.usuario_ultima_alteracao || rawObj.operador_responsavel || '',
-            status_validacao: rawObj.status_validacao || 'Validada',
+            status_validacao: rawObj.status_validacao || (String(rawObj.perfil_registro || '').trim().toLowerCase() === 'operador' && !rawObj.validado_por ? 'Pendente de validação' : 'Validada'),
             data_envio_validacao: rawObj.data_envio_validacao || '',
             validado_por: rawObj.validado_por || '',
             data_validacao: rawObj.data_validacao || '',
@@ -517,20 +517,29 @@ const StorageService = (() => {
     return result;
   }
 
-  function isRowValidated(r) {
+  function isRowPending(r) {
     if (!r || typeof r !== 'object') return false;
-    const st = String(r.status || '').trim().toLowerCase();
     const stVal = String(r.status_validacao || '').trim().toLowerCase();
-    if (stVal === 'validada' || st === 'validada' || st === 'em apuração' || st === 'em apuracao' || st === 'encerrada' || st === 'registrada') return true;
+    const st = String(r.status || '').trim().toLowerCase();
+    const validadoPor = String(r.validado_por || '').trim();
+    const perfil = String(r.perfil_registro || r.perfil || '').trim().toLowerCase();
+
+    if (stVal === 'validada' || validadoPor) return false;
+    if (stVal.includes('pendente') || st === 'pendente' || st === 'pendente de validação') return true;
+    if (perfil === 'operador' && !validadoPor) return true;
     return false;
   }
 
-  function isRowPending(r) {
+  function isRowValidated(r) {
     if (!r || typeof r !== 'object') return false;
-    if (isRowValidated(r)) return false;
-    const st = String(r.status || '').trim().toLowerCase();
+    if (isRowPending(r)) return false;
     const stVal = String(r.status_validacao || '').trim().toLowerCase();
-    return st === 'pendente' || st === 'pendente de validação' || stVal.includes('pendente');
+    const st = String(r.status || '').trim().toLowerCase();
+    const validadoPor = String(r.validado_por || '').trim();
+    if (stVal === 'validada' || validadoPor || st === 'validada' || st === 'em apuração' || st === 'em apuracao' || st === 'encerrada') return true;
+    const perfil = String(r.perfil_registro || r.perfil || '').trim().toLowerCase();
+    if (st === 'registrada' && perfil !== 'operador') return true;
+    return false;
   }
 
   /**
@@ -633,7 +642,10 @@ const StorageService = (() => {
         }
 
         const merged = { ...existing, ...r };
-        if (existValid || newValid) {
+        if (newPend) {
+          merged.status_validacao = 'Pendente de validação';
+          merged.status = 'pendente';
+        } else if (newValid || existValid) {
           merged.status_validacao = 'Validada';
           const sLower = String(r.status || existing.status || '').trim().toLowerCase();
           if (sLower === 'em apuração' || sLower === 'em apuracao') {
@@ -2840,7 +2852,21 @@ const StorageService = (() => {
         } catch {}
       }
 
-      const filesToCheck = ['ocorrencias_pendentes.csv', 'registros_apagados.csv'];
+      if (typeof S !== 'undefined' && Array.isArray(S.occ)) {
+        for (const occItem of S.occ) {
+          const protoStr = String(occItem.numero_protocolo || occItem.codigo_registro || occItem.id_ocorrencia || '');
+          const m = regex.exec(protoStr);
+          if (m) {
+            const n = parseInt(m[1], 10);
+            if (!isNaN(n) && n > 0) {
+              usedNumbers.add(n);
+              if (n > maxFromFiles) maxFromFiles = n;
+            }
+          }
+        }
+      }
+
+      const filesToCheck = ['registros_apagados.csv'];
       const [csvRowLists, rawResText, rawCounterText] = await Promise.all([
         Promise.all(
           filesToCheck.map(fName =>

@@ -170,7 +170,6 @@ async function acquireSharedProtocolFileLock(owner = 'Sistema', clientId = '', t
       const handle = await fs.open(PROTOCOL_LOCK_FILE, 'wx');
       try {
         await handle.writeFile(lockPayload, 'utf8');
-        await handle.sync();
       } finally {
         await handle.close();
       }
@@ -383,11 +382,6 @@ async function writeProtocolCounter(year, value, allowReset = false) {
 
 async function extractExistingNumbersFromOcorrencias(year) {
   await fs.mkdir(DADOS_DIR, { recursive: true });
-  let dirMtimeMs = lastOccurrenceMutationMs;
-  try {
-    const dirStat = await fs.stat(DADOS_DIR);
-    if (dirStat.mtimeMs > dirMtimeMs) dirMtimeMs = dirStat.mtimeMs;
-  } catch {}
 
   const entries = await fs.readdir(DADOS_DIR, { withFileTypes: true });
   const occNames = [];
@@ -398,8 +392,8 @@ async function extractExistingNumbersFromOcorrencias(year) {
   }
   occNames.sort();
 
-  const filesToScan = ['ocorrencias.csv', 'ocorrencias_pendentes.csv', 'registros_apagados.csv'];
-  let combinedSig = `INDIV:${occNames.length}:${occNames[0] || ''}:${occNames[occNames.length - 1] || ''}:${Math.round(dirMtimeMs)}|`;
+  const filesToScan = ['ocorrencias.csv', 'registros_apagados.csv'];
+  let combinedSig = `INDIV:${occNames.length}:${occNames[0] || ''}:${occNames[occNames.length - 1] || ''}:`;
   const stats = [];
 
   for (const name of filesToScan) {
@@ -415,6 +409,7 @@ async function extractExistingNumbersFromOcorrencias(year) {
 
   if (
     ocorrenciasProtocolCache.sig === combinedSig &&
+    ocorrenciasProtocolCache.byYear &&
     ocorrenciasProtocolCache.byYear.has(year)
   ) {
     return new Set(ocorrenciasProtocolCache.byYear.get(year));
@@ -461,7 +456,7 @@ async function extractExistingNumbersFromOcorrencias(year) {
 
   if (ocorrenciasProtocolCache.sig !== combinedSig) {
     ocorrenciasProtocolCache = {
-      mtimeMs: dirMtimeMs || stats[0]?.mtimeMs || 0,
+      mtimeMs: stats[0]?.mtimeMs || 0,
       size: occNames.length || stats[0]?.size || 0,
       sig: combinedSig,
       byYear: new Map()
