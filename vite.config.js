@@ -537,6 +537,8 @@ function createStorageMiddleware() {
         pathname !== '/file' &&
         pathname !== '/list' &&
         pathname !== '/mkdir' &&
+        pathname !== '/bundle' &&
+        pathname !== '/api/storage/bundle' &&
         pathname !== '/occurrences/batch' &&
         pathname !== '/api/storage/occurrences/batch' &&
         !pathname.startsWith('/protocol/') &&
@@ -585,6 +587,137 @@ function createStorageMiddleware() {
         res.statusCode = 200;
         res.setHeader('Content-Type', 'application/json; charset=utf-8');
         res.end(JSON.stringify({ files }));
+        return;
+      }
+
+      if (req.method === 'GET' && (pathname === '/bundle' || pathname === '/api/storage/bundle')) {
+        await fs.mkdir(DADOS_DIR, { recursive: true });
+        await fs.mkdir(path.resolve(DADOS_DIR, 'anexos'), { recursive: true }).catch(() => {});
+
+        const knownSig = url.searchParams.get('knownSig') || '';
+        const batchInfo = await listIndividualOccurrenceFiles();
+        let legacyRawText = '';
+        let legacyMtime = 0;
+        let legacySize = 0;
+        const legacyPath = path.resolve(DADOS_DIR, 'ocorrencias.csv');
+        try {
+          const lStat = await fs.stat(legacyPath);
+          if (lStat.isFile() && lStat.size > 0) {
+            legacySize = lStat.size;
+            legacyMtime = lStat.mtimeMs;
+          }
+        } catch {}
+
+        const effectiveOccSig = legacySize > 0
+          ? `${batchInfo.sig}:L:${legacySize}:${Math.round(legacyMtime)}`
+          : batchInfo.sig;
+        const effectiveOccTotalSize = batchInfo.totalSize + legacySize;
+        const effectiveOccMaxMtime = Math.max(batchInfo.maxMtimeMs, legacyMtime);
+
+        const standardFiles = [
+          'usuarios.csv',
+          'chaves.csv',
+          'movimentacao_chaves.csv',
+          'historico_sistema.csv',
+          'supervisoes_unidades.csv',
+          'naturezas_ocorrencias.csv',
+          'inspecao_fumaca_preta.csv',
+          'registros_apagados.csv'
+        ];
+
+        const filesData = {};
+        const sigParts = [effectiveOccSig];
+
+        await Promise.all(standardFiles.map(async (fileName) => {
+          const fullPath = path.resolve(DADOS_DIR, fileName);
+          try {
+            const st = await fs.stat(fullPath);
+            if (st.isFile()) {
+              sigParts.push(`${fileName}:${st.size}:${Math.round(st.mtimeMs)}`);
+            }
+          } catch {}
+        }));
+
+        const bundleSig = sigParts.join('|');
+
+        if (knownSig && knownSig === bundleSig) {
+          const respBuf = Buffer.from(JSON.stringify({
+            ok: true,
+            unchanged: true,
+            sig: bundleSig
+          }), 'utf8');
+          res.statusCode = 200;
+          res.setHeader('Content-Type', 'application/json; charset=utf-8');
+          res.setHeader('Content-Length', String(respBuf.length));
+          res.end(respBuf);
+          return;
+        }
+
+        await Promise.all(standardFiles.map(async (fileName) => {
+          const fullPath = path.resolve(DADOS_DIR, fileName);
+          try {
+            const st = await fs.stat(fullPath);
+            if (st.isFile()) {
+              const rawText = await fs.readFile(fullPath, 'utf8');
+              filesData[fileName] = {
+                name: fileName,
+                rawText,
+                size: st.size,
+                mtimeMs: st.mtimeMs
+              };
+            }
+          } catch {}
+        }));
+
+        const loadedOccFiles = [];
+        const chunkSize = 512;
+        for (let i = 0; i < batchInfo.files.length; i += chunkSize) {
+          const slice = batchInfo.files.slice(i, i + chunkSize);
+          const chunkData = await Promise.all(
+            slice.map(async f => {
+              try {
+                const rawText = await fs.readFile(f.path, 'utf8');
+                return {
+                  name: f.name,
+                  size: f.size,
+                  mtimeMs: f.mtimeMs,
+                  rawText
+                };
+              } catch {
+                return null;
+              }
+            })
+          );
+          for (const item of chunkData) {
+            if (item && item.rawText) loadedOccFiles.push(item);
+          }
+        }
+
+        if (legacySize > 0) {
+          try {
+            legacyRawText = await fs.readFile(legacyPath, 'utf8');
+          } catch {}
+        }
+
+        const respPayload = Buffer.from(JSON.stringify({
+          ok: true,
+          unchanged: false,
+          sig: bundleSig,
+          files: filesData,
+          occurrencesBatch: {
+            sig: effectiveOccSig,
+            count: loadedOccFiles.length,
+            totalSize: effectiveOccTotalSize,
+            maxMtimeMs: effectiveOccMaxMtime,
+            files: loadedOccFiles,
+            legacyRawText
+          }
+        }), 'utf8');
+
+        res.statusCode = 200;
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.setHeader('Content-Length', String(respPayload.length));
+        res.end(respPayload);
         return;
       }
 

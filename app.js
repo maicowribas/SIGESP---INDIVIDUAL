@@ -846,44 +846,30 @@ async function fetchServerStorage(relPath,method='GET',body=null,extraParams={})
   const params={...extraParams};
   if(cleanPath.includes('?')){const[p,q]=cleanPath.split('?');cleanPath=p;new URLSearchParams(q).forEach((v,k)=>{if(!(k in params))params[k]=v})}
   if(cleanPath.includes('&create=1')){cleanPath=cleanPath.replace('&create=1','');params.create='1'}
-  const enc=encodeURIComponent(cleanPath),now=Date.now();
+  const now=Date.now();
   const search=new URLSearchParams();
   search.set('path',cleanPath);
   for(const[k,v]of Object.entries(params)){if(v!==undefined&&v!==null&&k!=='expectedMtime'&&k!=='releasedProtocol'&&k!=='signal')search.set(k,String(v))}
   search.set('_t',String(now));
   const queryStr=search.toString();
-  const urls=method==='GET'||method==='HEAD'
-    ?[`/api/storage/file?${queryStr}`,`/dados/${enc}?${queryStr}`,`/api/storage/file?${queryStr}`]
-    :[`/api/storage/file?${queryStr}`,`/api/storage/file?${queryStr}`];
-  let lastErr=null;
-  const delays=[120, 300, 700];
-  for(let attempt=0;attempt<urls.length;attempt++){
-    const url=urls[attempt];
-    try{
-      const opts={method,headers:{}};
-      if(params.signal){
-        opts.signal=params.signal;
-      }
-      if(body){
-        opts.body=body;
-        if(body instanceof Blob)opts.headers['Content-Type']=body.type||'application/octet-stream';
-      }
-      if(params.releasedProtocol){
-        opts.headers['X-Released-Protocol']=String(params.releasedProtocol);
-      }
-      if(params.expectedMtime!==undefined&&params.expectedMtime!==null&&Number(params.expectedMtime)>0){
-        opts.headers['X-Expected-Mtime']=String(params.expectedMtime);
-      }
-      const res=await fetch(url,opts);
-      if(res.ok||res.status===404||res.status===409)return res;
-      lastErr=new Error(`HTTP ${res.status}`);
-    }catch(err){
-      lastErr=err;
-      const delay=delays[attempt]||400;
-      if(attempt<urls.length-1)await new Promise(r=>setTimeout(r,delay));
-    }
+  const targetUrl=`/api/storage/file?${queryStr}`;
+  const opts={method,headers:{}};
+  if(params.signal)opts.signal=params.signal;
+  if(body){
+    opts.body=body;
+    if(body instanceof Blob)opts.headers['Content-Type']=body.type||'application/octet-stream';
   }
-  throw lastErr||new Error('Falha ao comunicar com o servidor de dados.');
+  if(params.releasedProtocol)opts.headers['X-Released-Protocol']=String(params.releasedProtocol);
+  if(params.expectedMtime!==undefined&&params.expectedMtime!==null&&Number(params.expectedMtime)>0){
+    opts.headers['X-Expected-Mtime']=String(params.expectedMtime);
+  }
+  try{
+    const res=await fetch(targetUrl,opts);
+    if(res.ok||res.status===404||res.status===409)return res;
+    return await fetch(targetUrl,opts);
+  }catch(err){
+    return await fetch(targetUrl,opts);
+  }
 }
 class ServerFileHandle{constructor(name,relPath,initialSize=null,initialMtime=null){this.kind='file';this.name=name;this.relPath=relPath;this.initialSize=initialSize;this.initialMtime=initialMtime}async getFile(){const res=await fetchServerStorage(this.relPath,'GET');if(res.status===404){if(this.initialSize===0)return new Blob([],{type:'text/csv; charset=utf-8'});const err=new Error(`Arquivo não encontrado: ${this.relPath}`);err.name='NotFoundError';throw classifyCsvError(err,this.relPath,'read')}if(!res.ok)throw classifyCsvError(new Error(`Falha ao ler arquivo (${res.status}): ${this.relPath}`),this.relPath,'read');return await res.blob()}async createWritable(){const relPath=this.relPath,chunks=[];return{async write(data){chunks.push(data)},async close(){const mime=(chunks[0] instanceof Blob && chunks[0].type)?chunks[0].type:(/\.(jpe?g)$/i.test(relPath)?'image/jpeg':/\.(png)$/i.test(relPath)?'image/png':/\.(webp)$/i.test(relPath)?'image/webp':/\.(pdf)$/i.test(relPath)?'application/pdf':'text/csv; charset=utf-8');const blob=new Blob(chunks,{type:mime});const res=await fetchServerStorage(relPath,'PUT',blob);if(!res.ok)throw classifyCsvError(new Error(`Falha ao gravar arquivo (${res.status}): ${relPath}`),relPath,'write');const info=await res.json().catch(()=>null);if(info&&typeof info.size==='number'&&info.size!==blob.size)throw classifyCsvError(new Error(`Verificação de escrita falhou para ${relPath}`),relPath,'write')},async abort(){chunks.length=0}}}}
 class ServerDirectoryHandle{constructor(name=DATA_FOLDER,relPath=''){this.kind='directory';this.name=name;this.relPath=relPath;this.folderName=DATA_FOLDER;this.isServer=true}async queryPermission(){return'granted'}async requestPermission(){return'granted'}async getFileHandle(fileName,options={}){const childPath=this.relPath?`${this.relPath}/${fileName}`:fileName,isCreate=Boolean(options?.create);const res=await fetchServerStorage(childPath,'HEAD',null,isCreate?{create:'1'}:{});if(res.status===404){if(isCreate)return new ServerFileHandle(fileName,childPath,0,Date.now());const err=new Error(`Arquivo não encontrado: ${childPath}`);err.name='NotFoundError';throw err}if(!res.ok)throw classifyCsvError(new Error(`Falha ao acessar arquivo (${res.status}): ${childPath}`),childPath,'head');const sizeHeader=res.headers.get('X-File-Size')??res.headers.get('Content-Length'),mtimeHeader=res.headers.get('X-File-Mtime');return new ServerFileHandle(fileName,childPath,sizeHeader!==null?Number(sizeHeader):null,mtimeHeader!==null?Number(mtimeHeader):null)}async getDirectoryHandle(dirName,options={}){const childPath=this.relPath?`${this.relPath}/${dirName}`:dirName;if(options?.create){const enc=encodeURIComponent(childPath);try{const res=await fetch(`/api/storage/mkdir?path=${enc}`,{method:'POST'});if(!res.ok&&res.status!==404)console.warn('Aviso ao criar diretório:',childPath,res.status)}catch(e){console.warn('Aviso de rede ao criar diretório:',childPath,e)}}return new ServerDirectoryHandle(dirName,childPath)}async removeEntry(entryName){const childPath=this.relPath?`${this.relPath}/${entryName}`:entryName;const res=await fetchServerStorage(childPath,'DELETE');if(!res.ok&&res.status!==404)throw classifyCsvError(new Error(`Falha ao remover arquivo (${res.status}): ${childPath}`),childPath,'delete')}}
@@ -1224,7 +1210,6 @@ return occurrence;
 }
 async function load(forceReload=false,skipRender=false){
   if(forceReload===true||forceReload?.type==='click')CSVService.invalidateCache();
-  await ensureAmbientalCsv();
   const[u,o,k,m,a,organization,natures,inspecoes,delRecs]=await Promise.all([
     read('usuarios.csv'),
     read('ocorrencias.csv'),
@@ -1236,36 +1221,16 @@ async function load(forceReload=false,skipRender=false){
     read(ENVIRONMENTAL_FILE),
     read('registros_apagados.csv').catch(()=>[])
   ]);
-  try{
-    const legacyPending=await read('ocorrencias_pendentes.csv',{optional:true}).catch(()=>[]);
-    if(legacyPending&&legacyPending.length){
-      const occIds=new Set((o||[]).map(x=>String(x.id_ocorrencia||'').trim()).filter(Boolean));
-      const occInternalIds=new Set((o||[]).map(x=>String(x.id_interno||'').trim()).filter(Boolean));
-      const occProtos=new Set((o||[]).map(x=>String(x.numero_protocolo||'').trim().toUpperCase()).filter(Boolean));
-      const toMigrate=legacyPending.filter(x=>{
-        const xOcc=String(x.id_ocorrencia||'').trim();
-        const xInt=String(x.id_interno||'').trim();
-        const xProto=String(x.numero_protocolo||'').trim().toUpperCase();
-        if(xOcc&&(occIds.has(xOcc)||occInternalIds.has(xOcc)))return false;
-        if(xInt&&(occInternalIds.has(xInt)||occIds.has(xInt)))return false;
-        if(xProto&&occProtos.has(xProto))return false;
-        return true;
-      }).map(x=>({...x,status:'pendente',status_validacao:'Pendente de validação'}));
-      if(toMigrate.length){
-        const merged=window.StorageService?.consolidateVersionedRows
-          ? window.StorageService.consolidateVersionedRows([...(o||[]),...toMigrate])
-          : [...(o||[]),...toMigrate];
-        await write('ocorrencias.csv',merged,H.occ);
-        o.splice(0,o.length,...merged);
-      }
-      await write('ocorrencias_pendentes.csv',[],H.occ).catch(()=>{});
-    }
-  }catch(err){
-    console.warn('[SIGESP] Migração legada de pendentes ignorada:',err);
+  let effOrg=organization;
+  let effNatures=natures;
+  if((!effOrg||!effOrg.length)||(!effNatures||!effNatures.length)){
+    await initializeOrganizationCatalog();
+    effOrg=await read('supervisoes_unidades.csv');
+    effNatures=await read('naturezas_ocorrencias.csv');
   }
-  setOrganizationContext(organization);
+  setOrganizationContext(effOrg);
   S.users=normalizedUsers(u);
-  S.natureCatalog=natures;
+  S.natureCatalog=effNatures;
   const rawOccList=o||[];
   const consolidatedOcc=(rawOccList._consolidated||!window.StorageService?.consolidateVersionedRows)
     ? rawOccList
@@ -1305,19 +1270,20 @@ async function load(forceReload=false,skipRender=false){
 let _isConnectingFolder=false;
 async function prepare(handle,options={}){
   if(window.SIGESP_PERF_TRACE&&console.time)console.time('[SIGESP:Perf] autorizacao e listagem da pasta');
+  const isSameDir=S.dir&&(
+    (S.dir===handle)||
+    (S.dir.isServer&&handle?.isServer&&S.dir.name===handle?.name)
+  );
   S.dir=handle;
-  CSVService.invalidateCache();
-  if(window.StorageService){await window.StorageService.initializeStorage(handle)}
-  await Promise.all([
-    ['ocorrencias.csv',H.occ],
-    ['chaves.csv',H.keys],
-    ['movimentacao_chaves.csv',H.moves],
-    ['historico_sistema.csv',H.audit],
-    [ENVIRONMENTAL_FILE,H.inspecoes],
-    ['registros_apagados.csv',H.registros_apagados]
-  ].map(([n,h])=>ensure(n,h)));
-  await initializeOrganizationCatalog();
-  await handle.getDirectoryHandle('anexos',{create:true});
+  if(!isSameDir){
+    CSVService.invalidateCache();
+  }
+  if(window.StorageService){
+    await window.StorageService.initializeStorage(handle);
+  }
+  if(handle&&typeof handle.getDirectoryHandle==='function'){
+    void handle.getDirectoryHandle('anexos',{create:true}).catch(()=>{});
+  }
   if(window.SIGESP_PERF_TRACE&&console.timeEnd)console.timeEnd('[SIGESP:Perf] autorizacao e listagem da pasta');
   await load(false,Boolean(options?.skipRender));
   startBackgroundPolling();
@@ -1390,8 +1356,7 @@ async function pickFolderWithPicker(ev){
       _isConnectingFolder=true;
       showLoading('Conectando e sincronizando pasta selecionada...',{kicker:'File System Access API',title:`Carregando dados da pasta "${handle.name}"...`,progress:25,overlayId:'pdfProgressOverlay'});
       try{
-        await new Promise(r=>setTimeout(r,0));
-        await DirectoryPersistence.saveDirectoryHandle(handle);
+        void DirectoryPersistence.saveDirectoryHandle(handle).catch(()=>{});
         S.savedHandle=handle;
         S.permissionNeeded=false;
         S.folderModal=false;

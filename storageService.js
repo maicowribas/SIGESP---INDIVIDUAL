@@ -111,6 +111,8 @@ const StorageService = (() => {
   // Mapa de chave canônica de ocorrência -> nome do arquivo individual atual no disco
   const _recordKeyToFileMap = new Map();
   let _lastKnownBatchSig = '';
+  let _lastKnownBundleSig = '';
+  let _preloadedOccurrencesBatch = null;
   let _clientSessionId = null;
 
   function isIndividualOccurrenceFileName(fileName) {
@@ -1135,11 +1137,48 @@ const StorageService = (() => {
         _rawFileCache.clear();
         _individualOccFileCache.clear();
         _lastKnownBatchSig = '';
+        _lastKnownBundleSig = '';
+        _preloadedOccurrencesBatch = null;
       }
     },
 
     /**
-     * Inicializa a camada de armazenamento sem leituras duplicadas da pasta
+     * Indexa rapidamente entradas de uma pasta nativa em uma única passada
+     */
+    async _scanAndIndexNativeDirectory(dir) {
+      if (!dir || dir.isServer) return;
+      const fileMap = new Map();
+      const occHandles = [];
+      try {
+        if (typeof dir.entries === 'function') {
+          for await (const [name, handle] of dir.entries()) {
+            if (handle.kind === 'file') {
+              fileMap.set(name, handle);
+              if (isIndividualOccurrenceFileName(name)) {
+                occHandles.push({ name, handle });
+              }
+            }
+          }
+        } else if (typeof dir.values === 'function') {
+          for await (const handle of dir.values()) {
+            if (handle.kind === 'file') {
+              fileMap.set(handle.name, handle);
+              if (isIndividualOccurrenceFileName(handle.name)) {
+                occHandles.push({ name: handle.name, handle });
+              }
+            }
+          }
+        }
+      } catch (err) {
+        console.warn('[StorageService] Falha ao indexar diretório nativo:', err);
+      }
+      occHandles.sort((a, b) => a.name.localeCompare(b.name));
+      this._nativeFilesMap = fileMap;
+      this._nativeHandlesCache = { dir, ts: Date.now(), handles: occHandles };
+    },
+
+    /**
+     * Inicializa a camada de armazenamento com sincronização instantânea em lote (Bundle API / Native Index)
      */
     async initializeStorage(handle = null) {
       if (handle && typeof S !== 'undefined') {
@@ -1149,9 +1188,58 @@ const StorageService = (() => {
       if (!dir) {
         return false;
       }
-      if (window.CryptoService) {
-        await window.CryptoService.getStatus();
+
+      // Fast-path 1: Servidor de desenvolvimento / API bundle unificada de 3ms
+      if (dir.isServer && !dir.relPath) {
+        try {
+          const bundleUrl = `/api/storage/bundle?knownSig=${encodeURIComponent(_lastKnownBundleSig || '')}&_t=${Date.now()}`;
+          const res = await fetch(bundleUrl, { method: 'GET', headers: { 'Cache-Control': 'no-cache' } });
+          if (res.ok) {
+            const data = await res.json();
+            if (data && data.ok) {
+              if (data.unchanged && _lastKnownBundleSig === data.sig) {
+                scheduleBackgroundSync(100);
+                return true;
+              }
+              _lastKnownBundleSig = data.sig || '';
+
+              if (data.files && typeof data.files === 'object') {
+                for (const [fName, fileObj] of Object.entries(data.files)) {
+                  if (fileObj && typeof fileObj.rawText === 'string') {
+                    const rawText = fileObj.rawText;
+                    const rawSig = `${rawText.length}:${rawText.slice(0, 48)}:${rawText.slice(-48)}`;
+                    _rawFileCache.set(fName, {
+                      rawSig,
+                      rawText,
+                      mtimeMs: Number(fileObj.mtimeMs || Date.now()),
+                      size: Number(fileObj.size || rawText.length)
+                    });
+                  }
+                }
+              }
+
+              if (data.occurrencesBatch) {
+                _preloadedOccurrencesBatch = data.occurrencesBatch;
+                if (data.occurrencesBatch.sig) {
+                  _lastKnownBatchSig = String(data.occurrencesBatch.sig);
+                }
+              }
+            }
+          }
+        } catch (bundleErr) {
+          console.warn('[StorageService] Falha no bundle unificado do servidor:', bundleErr);
+        }
+        scheduleBackgroundSync(100);
+        return true;
       }
+
+      // Fast-path 2: Pasta nativa do sistema operacional (scan instantâneo de diretório)
+      try {
+        await this._scanAndIndexNativeDirectory(dir);
+      } catch (scanErr) {
+        console.warn('[StorageService] Falha no scan nativo:', scanErr);
+      }
+
       scheduleBackgroundSync(100);
       return true;
     },
@@ -1166,6 +1254,11 @@ const StorageService = (() => {
       }
 
       if (dir.isServer && !dir.relPath) {
+        // Se já está no cache em memória, retorna instantaneamente (0ms)
+        if (_rawFileCache.has(fileName)) {
+          const cached = _rawFileCache.get(fileName);
+          return { exists: true, size: cached.size || 0, mtimeMs: cached.mtimeMs || 0, sig: cached.rawSig || '' };
+        }
         if (fileName === 'ocorrencias.csv') {
           try {
             const batchUrl = `/api/storage/occurrences/batch?knownSig=${encodeURIComponent(_lastKnownBatchSig || '')}&_t=${Date.now()}`;
@@ -1197,6 +1290,11 @@ const StorageService = (() => {
         };
       }
 
+      // Handle nativo com indexação em memória
+      if (this._nativeFilesMap && !this._nativeFilesMap.has(fileName) && fileName !== 'ocorrencias.csv') {
+        return { exists: false, size: 0, mtimeMs: 0 };
+      }
+
       if (fileName === 'ocorrencias.csv') {
         try {
           const handles = await this._listNativeOccurrenceFileHandles(dir);
@@ -1222,7 +1320,7 @@ const StorageService = (() => {
             }
           }
           try {
-            const fh = await dir.getFileHandle(fileName, { create: false });
+            const fh = this._nativeFilesMap?.get(fileName) || await dir.getFileHandle(fileName, { create: false });
             const f = await fh.getFile();
             const fSize = Number(f.size || 0);
             const fMtime = Number(f.lastModified || 0);
@@ -1237,7 +1335,7 @@ const StorageService = (() => {
       }
 
       try {
-        const fh = await dir.getFileHandle(fileName, { create: false });
+        const fh = this._nativeFilesMap?.get(fileName) || await dir.getFileHandle(fileName, { create: false });
         const f = await fh.getFile();
         return {
           exists: true,
@@ -1262,6 +1360,14 @@ const StorageService = (() => {
       }
 
       if (dir.isServer && !dir.relPath) {
+        const cachedRaw = _rawFileCache.get(fileName);
+        if (cachedRaw && typeof cachedRaw.rawText === 'string') {
+          return {
+            rawText: cachedRaw.rawText,
+            size: cachedRaw.size,
+            mtimeMs: cachedRaw.mtimeMs
+          };
+        }
         if (typeof fetchServerStorage !== 'function') {
           throw new Error('fetchServerStorage indisponível no cliente.');
         }
@@ -1284,7 +1390,7 @@ const StorageService = (() => {
         };
       }
 
-      const h = await dir.getFileHandle(fileName);
+      const h = this._nativeFilesMap?.get(fileName) || await dir.getFileHandle(fileName);
       const f = await h.getFile();
       const rawText = await f.text();
       return {
@@ -1524,8 +1630,19 @@ const StorageService = (() => {
     async _listNativeOccurrenceFileHandles(dir) {
       if (!dir) return [];
       const now = Date.now();
-      if (this._nativeHandlesCache && this._nativeHandlesCache.dir === dir && now - this._nativeHandlesCache.ts < 1500) {
+      if (this._nativeHandlesCache && this._nativeHandlesCache.dir === dir && now - this._nativeHandlesCache.ts < 5000) {
         return this._nativeHandlesCache.handles;
+      }
+      if (this._nativeFilesMap) {
+        const found = [];
+        for (const [name, handle] of this._nativeFilesMap.entries()) {
+          if (isIndividualOccurrenceFileName(name)) {
+            found.push({ name, handle });
+          }
+        }
+        found.sort((a, b) => a.name.localeCompare(b.name));
+        this._nativeHandlesCache = { dir, ts: Date.now(), handles: found };
+        return found;
       }
       const found = [];
       let count = 0;
@@ -1597,7 +1714,7 @@ const StorageService = (() => {
     async _readOccurrencesBatchFromStorage(options = {}) {
       const fileName = 'ocorrencias.csv';
       const cached = _rawFileCache.get(fileName);
-      if (cached && !options?.force) {
+      if (cached && !options?.force && Array.isArray(cached.rows)) {
         return cached.rows.slice();
       }
 
@@ -1612,11 +1729,18 @@ const StorageService = (() => {
         // MODO 1: Servidor de desenvolvimento / API local (/api/storage/occurrences/batch)
         if (dir.isServer && !dir.relPath) {
           try {
-            const batchUrl = `/api/storage/occurrences/batch?knownSig=${encodeURIComponent(_lastKnownBatchSig || '')}&_t=${Date.now()}`;
-            const res = await fetch(batchUrl, { method: 'GET' });
+            let payload = _preloadedOccurrencesBatch;
+            _preloadedOccurrencesBatch = null;
 
-            if (res.ok) {
-              const payload = await res.json();
+            if (!payload) {
+              const batchUrl = `/api/storage/occurrences/batch?knownSig=${encodeURIComponent(_lastKnownBatchSig || '')}&_t=${Date.now()}`;
+              const res = await fetch(batchUrl, { method: 'GET' });
+              if (res.ok) {
+                payload = await res.json();
+              }
+            }
+
+            if (payload) {
               if (payload && payload.unchanged && cached && Array.isArray(cached.rows)) {
                 const effMtime = Number(payload?.maxMtimeMs ?? payload?.mtimeMs ?? cached.mtimeMs);
                 const effSize = Number(payload?.totalSize ?? payload?.size ?? cached.size);
@@ -2103,7 +2227,7 @@ const StorageService = (() => {
       let meta = null;
       try {
         const cached = _rawFileCache.get(fileName);
-        if (cached && !options?.force) {
+        if (cached && Array.isArray(cached.rows) && !options?.force) {
           return cached.rows.map(r => ({ ...r }));
         }
         if (options?.force) {
@@ -2138,7 +2262,7 @@ const StorageService = (() => {
 
       const rawSig = `${rawText.length}:${rawText.slice(0, 48)}:${rawText.slice(-48)}`;
       const cachedByContent = _rawFileCache.get(fileName);
-      if (cachedByContent && cachedByContent.rawSig === rawSig) {
+      if (cachedByContent && cachedByContent.rawSig === rawSig && Array.isArray(cachedByContent.rows)) {
         cachedByContent.mtimeMs = meta?.mtimeMs || cachedByContent.mtimeMs;
         cachedByContent.size = meta?.size || cachedByContent.size;
         if (typeof window !== 'undefined' && typeof window.syncFreshCsvMeta === 'function') {
@@ -3452,6 +3576,14 @@ const StorageService = (() => {
       }
       const dir = getActiveDirectoryHandle();
       if (!dir) return;
+
+      // Fast-path: se o arquivo já foi carregado no bundle ou indexado nativamente, retorna instantaneamente (0ms)
+      if (dir.isServer && !dir.relPath && _rawFileCache.has(fileName)) {
+        return;
+      }
+      if (this._nativeFilesMap && this._nativeFilesMap.has(fileName)) {
+        return;
+      }
 
       try {
         const stat = await this.getFileStat(fileName);
