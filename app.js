@@ -940,8 +940,12 @@ async function fetchFreshRawCsv(fileName,options={}){
   // Apenas consulta o endpoint do servidor se não houver pasta nativa conectada ou se for modo servidor
   try{
     const baseUrl=`/api/storage/file?path=${encodeURIComponent(fileName)}&nocache=${nocache}&_t=${nocache}`;
+    const timeoutSignal = (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function')
+      ? AbortSignal.timeout(7000)
+      : undefined;
+
     if(options?.onlyIfChanged&&prevMeta){
-      const headRes=await fetch(baseUrl,{method:'HEAD',headers:{'Cache-Control':'no-cache'}});
+      const headRes=await fetch(baseUrl,{method:'HEAD',headers:{'Cache-Control':'no-cache'},signal:timeoutSignal});
       if(headRes.ok){
         const mtime=Number(headRes.headers.get('X-File-Mtime')||0);
         const size=Number(headRes.headers.get('X-File-Size')||headRes.headers.get('Content-Length')||0);
@@ -958,7 +962,8 @@ async function fetchFreshRawCsv(fileName,options={}){
         'Cache-Control':'no-cache, no-store, must-revalidate',
         'Pragma':'no-cache',
         'Expires':'0'
-      }
+      },
+      signal:timeoutSignal
     });
     if(res.ok){
       const mtime=Number(res.headers.get('X-File-Mtime')||Date.now());
@@ -1320,12 +1325,12 @@ let _filePickerOpenedAt=0;
 function markFilePickerOpening(){
   _isFilePickerActive=true;
   _filePickerOpenedAt=Date.now();
-  _filePickerCooldownUntil=Date.now()+60000;
+  _filePickerCooldownUntil=Date.now()+2500;
   if(_filePickerSafetyTimer)clearTimeout(_filePickerSafetyTimer);
   _filePickerSafetyTimer=setTimeout(()=>{
     _isFilePickerActive=false;
     _filePickerCooldownUntil=0;
-  },60000);
+  },2500);
 }
 function markFilePickerClosed(cooldownMs=1500){
   _isFilePickerActive=false;
@@ -1726,14 +1731,24 @@ function hideManualRefreshingModal(){
 }
 let _pollIntervalId=null;
 let _isPollingActive=false;
+let _lastPollStart=0;
 async function smartPollSync(){
   if(typeof document!=='undefined'&&document.visibilityState==='hidden')return;
   if(isFilePickerBlockingSync()||S.folderModal)return;
-  if(S.page==='occ-register'||S.validationModal||S.apuracaoModal)return;
   if(!S.dir||S.restoring||S.permissionNeeded)return;
   if(S.submitting)return;
-  if(_isPollingActive)return;
+
+  const now=Date.now();
+  if(_isPollingActive){
+    if(now - _lastPollStart > 12000){
+      console.warn('[SmartPoll] Watchdog: resetando lock de polling travado.');
+      _isPollingActive=false;
+    }else{
+      return;
+    }
+  }
   _isPollingActive=true;
+  _lastPollStart=now;
   try{
     let dataChanged=false;
 
@@ -1937,6 +1952,9 @@ async function handleManualRefresh(){
   showManualRefreshingModal();
   try{
     CSVService.invalidateCache();
+    if(typeof window!=='undefined'&&window.StorageService?.invalidateCache){
+      window.StorageService.invalidateCache();
+    }
     await load(true);
     S.lastSyncTime=new Date();
     updateSyncIndicatorElement();
@@ -1959,20 +1977,47 @@ if(typeof window!=='undefined'){
       return;
     }
     if(isFilePickerBlockingSync()||S.folderModal)return;
-    if(S.page==='occ-register'||S.validationModal)return;
     if(S.dir&&!S.submitting&&!S.restoring&&!S.permissionNeeded){
       smartPollSync().catch(()=>{});
     }
   });
   document.addEventListener('visibilitychange',()=>{
     if(isFilePickerBlockingSync()||S.folderModal)return;
-    if(S.page==='occ-register'||S.validationModal)return;
     if(document.visibilityState==='visible'&&S.dir&&!S.submitting&&!S.restoring&&!S.permissionNeeded){
       smartPollSync().catch(()=>{});
     }
   });
 }
-async function login(ev){ev.preventDefault();try{const d=Object.fromEntries(new FormData(ev.currentTarget)),ph=await hash(d.senha),u=S.users.find(x=>x.login===d.login.trim()&&x.senha_hash===ph&&x.status==='Ativo');if(!u)throw Error('Login, senha ou status inválido.');S.user={...u,perfil:canonicalPerfil(u.perfil)};const isOp=hasProfile(S.user,'Operador');S.page=isOp?'occ-register':'dashboard';S.editing=isOp?{}:null;S.userPasswordTarget=null;S.modal=null;S.errorPopup=null;S.successPopup=null;S.accessDenied=false;S.activeMenu=isOp?'ocorrencias':null;S.message='';startBackgroundPolling();if(isOp){await openOccurrenceRegistration({forceNew:false});}else{render();}}catch(x){fail(x.message)}}
+
+async function login(ev){
+  ev.preventDefault();
+  try{
+    const d=Object.fromEntries(new FormData(ev.currentTarget));
+    const inputLogin=String(d.login||'').trim().toLowerCase();
+    const ph=await hash(d.senha);
+    const u=S.users.find(x=>String(x.login||'').trim().toLowerCase()===inputLogin&&x.senha_hash===ph&&x.status==='Ativo');
+    if(!u)throw Error('Login, senha ou status inválido.');
+    S.user={...u,perfil:canonicalPerfil(u.perfil)};
+    const isOp=hasProfile(S.user,'Operador');
+    S.page=isOp?'occ-register':'dashboard';
+    S.editing=isOp?{}:null;
+    S.userPasswordTarget=null;
+    S.modal=null;
+    S.errorPopup=null;
+    S.successPopup=null;
+    S.accessDenied=false;
+    S.activeMenu=isOp?'ocorrencias':null;
+    S.message='';
+    startBackgroundPolling();
+    if(isOp){
+      await openOccurrenceRegistration({forceNew:false});
+    }else{
+      render();
+    }
+  }catch(x){
+    fail(x.message);
+  }
+}
 function logout(){void releaseCurrentReservation();S.occurrenceDraft=null;cleanup();S.user=null;S.page='dashboard';S.editing=null;S.userPasswordTarget=null;S.modal=null;S.errorPopup=null;S.successPopup=null;S.accessDenied=false;S.activeMenu=null;S.message='';startBackgroundPolling();render()}
 function fail(m){S.restoring=false;if(S.user&&S.page==='ocorrencias'){S.errorPopup={titulo:'Não foi possível salvar a ocorrência',mensagem:m};S.message=''}else S.message=m;render()}
 function opts(a,v){return a.map(x=>`<option value="${esc(x)}" ${String(x)===String(v)?'selected':''}>${esc(x)}</option>`).join('')}
@@ -3682,7 +3727,7 @@ return{category:'Falha ao salvar',message:'Ocorreu um erro ao salvar a nova senh
 }
 async function editUser(id){
 if(denyOperatorAccess()||denyUserManagement())return;
-try{const users=await read('usuarios.csv'),target=users.find(user=>user.id_usuario===id);if(!target)throw Error('Usuário não encontrado.');assertUserTargetPermission(target);S.users=users.map(user=>({...user,perfil:canonicalPerfil(user.perfil)}));S.userPasswordTarget=null;S.editing={kind:'user',data:{...target,perfil:canonicalPerfil(target.perfil)}};render()}
+try{const users=await read('usuarios.csv'),target=users.find(user=>user.id_usuario===id);if(!target)throw Error('Usuário não encontrado.');assertUserTargetPermission(target);S.users=users.map(user=>({...user,perfil:canonicalPerfil(user.perfil)}));S.userPasswordTarget=null;S.userModalTab='geral';S.editing={kind:'user',data:{...target,perfil:canonicalPerfil(target.perfil)}};render()}
 catch(error){if(handleUserTargetDenied(error))return;if(error?.name!=='UserPermissionError')console.error('Falha ao carregar o usuário para edição.',error);fail(error?.name==='UserPermissionError'?'Seu perfil não possui autorização para administrar usuários.':'Não foi possível carregar o usuário selecionado.')}
 }
 function denyUserRemovalTargetAccess(){S.userRemovalTarget=null;S.accessDenied='remove-user-target';render()}
@@ -6453,22 +6498,395 @@ function userSupervisionOptions(selectedId,includeExisting=false){const options=
 function userScopeFields(profile,supervisionId,assignedValue,locked=false){if(locked){return `<input type="hidden" name="supervisao_id" value="${esc(supervisionId)}"><input type="hidden" name="unidades_permitidas" value="${esc(assignedValue||'')}"><p class="muted">Escopo: ${esc(userScopeSummary({perfil:profile,supervisao_id:supervisionId,unidades_permitidas:assignedValue}))}. Somente Administradores podem alterar esse escopo.</p>`}if(hasProfile({perfil:profile},'Administrador'))return `<input type="hidden" name="supervisao_id" value=""><input type="hidden" name="unidades_permitidas" value="*"><p class="muted">Acesso a todas as unidades.</p>`;const supervisionField=`<label><span class="label">Supervisão</span><select class="field" name="supervisao_id" required>${userSupervisionOptions(supervisionId,true)}</select></label>`;if(hasProfile({perfil:profile},'Supervisor'))return `${supervisionField}<input type="hidden" name="unidades_permitidas" value=""><p class="muted">O Supervisor herda as unidades ativas vinculadas à Supervisão selecionada.</p>`;const assigned=new Set(assignedUnitIds({unidades_permitidas:assignedValue})),available=S.unitCatalog.filter(unit=>unit.id_supervisao===supervisionId&&activeMaster(unit)),assignedInactive=S.unitCatalog.filter(unit=>unit.id_supervisao===supervisionId&&!activeMaster(unit)&&assigned.has(unit.id_unidade));return `${supervisionField}<label><span class="label">Unidades autorizadas</span><select class="field" name="unidades_permitidas" multiple size="${Math.max(2,Math.min(5,available.length+assignedInactive.length))}">${[...available,...assignedInactive].map(unit=>`<option value="${esc(unit.id_unidade)}" ${assigned.has(unit.id_unidade)?'selected':''}>${esc(unit.nome)}${activeMaster(unit)?'':' (Inativa)'}</option>`).join('')}</select></label>`}
 function userScopeSummary(user){if(hasProfile(user,'Administrador'))return'Todas as unidades';if(hasProfile(user,'Supervisor')){const supervision=_supervisionLookupMap.get(effectiveSupervisionId(user))||S.supervisions.find(item=>item.id_supervisao===effectiveSupervisionId(user));return supervision?`Supervisão: ${supervision.nome}`:'Sem Supervisão'}const names=assignedUnitIds(user).map(id=>S.unitCatalog.find(unit=>unit.id_unidade===id)?.nome).filter(Boolean);return names.join(', ')||userUnitNames(user.unidades_permitidas).join(', ')||'Sem unidades'}
 async function exportScopedData(buttonId){try{await refreshAccessContext();if(!canAccessPage('relatorios'))throw new DataScopeError('Seu perfil não pode exportar relatórios.');const occurrences=buttonId==='exportOcc',rows=await read(occurrences?'ocorrencias.csv':'chaves.csv');download(occurrences?'ocorrencias.csv':'chaves.csv',scope(rows),occurrences?H.occ:H.keys)}catch(error){console.error('Falha ao exportar dados no SIGESP.',error);fail(error instanceof DataScopeError?'Seu perfil não possui autorização para exportar estes dados.':'Não foi possível atualizar os dados antes da exportação.')}}
-function userForm(){
-  const selected=S.editing?.kind==='user'?S.editing.data:null,
-        baseUser=selected?.id_usuario?(manageableUsers().find(user=>user.id_usuario===selected.id_usuario)||S.users.find(user=>user.id_usuario===selected.id_usuario)||{}):{},
-        x=selected?{...baseUser,...selected}:baseUser,
-        profiles=allowedProfiles(),
-        matchedProfile=profiles.find(p=>canonicalPerfil(p)===canonicalPerfil(x.perfil))||profiles[0],
-        profile=matchedProfile;
-  x.perfil=profile;
-  const lockedForeignScope=Boolean(x.id_usuario&&hasProfile(S.user,'Supervisor')&&effectiveSupervisionId(x)!==effectiveSupervisionId(S.user)),
-        supervisionId=lockedForeignScope?effectiveSupervisionId(x):(effectiveSupervisionId(x)||(hasProfile(S.user,'Supervisor')?effectiveSupervisionId(S.user):'')),
-        profileOptions=profiles.map(p=>`<option value="${esc(p)}" ${canonicalPerfil(p)===canonicalPerfil(profile)?'selected':''}>${esc(p)}</option>`).join(''),
-        profileField=lockedForeignScope?`<input type="hidden" name="perfil" value="${esc(profile)}"><p class="muted">Perfil: ${esc(profile)}. Somente Administradores podem alterar perfil e escopo de usuários de outra Supervisão.</p>`:`<label><span class="label">Perfil</span><select class="field" name="perfil" id="userPerfilSelect">${profileOptions}</select></label>`,
-        scopeFields=userScopeFields(profile,supervisionId,x.unidades_permitidas,lockedForeignScope);
-  return `<div class="card"><h3>${x.id_usuario?'Editar':'Novo'} usuário</h3><form id="userForm" class="stack" novalidate><input type="hidden" name="id_usuario" value="${esc(x.id_usuario||'')}"><input class="field" name="nome" required value="${esc(x.nome||'')}" placeholder="Nome completo"><input class="field" name="login" required value="${esc(x.login||'')}" placeholder="Login">${x.id_usuario?'':`<input class="field" name="senha" type="password" value="${esc(x.senha||'')}" required placeholder="Senha mínima de 8 caracteres">`}${profileField}${scopeFields}<select class="field" name="status">${opts(['Ativo','Inativo'],x.status||'Ativo')}</select><button type="submit" class="btn primary">Salvar usuário</button>${x.id_usuario?'<button id="cancelUser" type="button" class="btn">Cancelar</button>':''}</form></div>`;
+function userAvatarInitials(name){
+  const parts=String(name||'').trim().split(/\s+/).filter(Boolean);
+  if(!parts.length)return 'US';
+  if(parts.length===1)return parts[0].slice(0,2).toUpperCase();
+  return (parts[0][0]+parts[parts.length-1][0]).toUpperCase();
 }
-function usersPage(){const users=manageableUsers();return `<div class="row between"><h2>Usuários e permissões</h2><button id="newUser" class="btn primary">Novo usuário</button></div><div class="grid two">${userForm()}<div class="card tablewrap"><table class="table"><tr><th>Nome</th><th>Login</th><th>Perfil</th><th>Supervisão / Unidades</th><th>Status</th><th>Ações</th></tr>${users.map(x=>`<tr><td>${esc(x.nome)}</td><td>${esc(x.login)}</td><td>${esc(x.perfil)}</td><td>${esc(userScopeSummary(x))}</td><td>${esc(x.status)}</td><td class="actions"><button class="editUser" data-id="${esc(x.id_usuario)}" title="Editar">✏️</button><button class="changeUserPassword" data-id="${esc(x.id_usuario)}">Alterar Senha</button>${x.login!=='admin'?`<button class="toggleUser" data-id="${esc(x.id_usuario)}" title="${x.status==='Ativo'?'Bloquear':'Reativar'}">${x.status==='Ativo'?'🔒':'🔓'}</button>`:''}<button class="removeUser" data-id="${esc(x.id_usuario)}" title="Remover usuário" aria-label="Remover ${esc(x.nome)}">🗑️</button></td></tr>`).join('')}</table></div></div>`}
+
+function userProfileBadge(perfil){
+  const p=canonicalPerfil(perfil);
+  let badgeClass='user-badge-operator';
+  let icon='🛡️';
+  if(p==='Administrador'){
+    badgeClass='user-badge-admin';
+    icon='⚡';
+  }else if(p==='Supervisor'){
+    badgeClass='user-badge-supervisor';
+    icon='👔';
+  }
+  return `<span class="user-badge-role ${badgeClass}"><span style="font-size:11px">${icon}</span>${esc(p)}</span>`;
+}
+
+function userStatusBadge(status){
+  const ativo=String(status||'').trim()==='Ativo';
+  return ativo
+    ? `<span class="user-status-active"><span class="user-dot-active"></span>Ativo</span>`
+    : `<span class="user-status-inactive"><span class="user-dot-inactive"></span>Inativo</span>`;
+}
+
+function filteredManageableUsers(){
+  const all=manageableUsers();
+  const q=(S.userSearchQuery||'').toLowerCase().trim();
+  const profFilter=S.userProfileFilter||'todos';
+  const statusFilter=S.userStatusFilter||'todos';
+
+  return all.filter(u=>{
+    if(profFilter!=='todos'&&canonicalPerfil(u.perfil)!==canonicalPerfil(profFilter))return false;
+    if(statusFilter!=='todos'&&String(u.status||'').toLowerCase()!==statusFilter.toLowerCase())return false;
+    if(q){
+      const mNome=String(u.nome||'').toLowerCase().includes(q);
+      const mLogin=String(u.login||'').toLowerCase().includes(q);
+      const mPerfil=String(u.perfil||'').toLowerCase().includes(q);
+      const mScope=String(userScopeSummary(u)||'').toLowerCase().includes(q);
+      if(!mNome&&!mLogin&&!mPerfil&&!mScope)return false;
+    }
+    return true;
+  });
+}
+
+function userFormModal(){
+  if(!S.editing||S.editing.kind!=='user')return '';
+  const selected=S.editing.data||{};
+  const baseUser=selected?.id_usuario?(manageableUsers().find(user=>user.id_usuario===selected.id_usuario)||S.users.find(user=>user.id_usuario===selected.id_usuario)||{}):{};
+  const x={...baseUser,...selected};
+  const isEdit=Boolean(x.id_usuario);
+  const profiles=allowedProfiles();
+  const matchedProfile=profiles.find(p=>canonicalPerfil(p)===canonicalPerfil(x.perfil))||profiles[0];
+  const profile=matchedProfile;
+  x.perfil=profile;
+
+  const currentTab=S.userModalTab||'geral';
+  const lockedForeignScope=Boolean(x.id_usuario&&hasProfile(S.user,'Supervisor')&&effectiveSupervisionId(x)!==effectiveSupervisionId(S.user));
+  const supervisionId=lockedForeignScope?effectiveSupervisionId(x):(effectiveSupervisionId(x)||(hasProfile(S.user,'Supervisor')?effectiveSupervisionId(S.user):''));
+  const profileOptions=profiles.map(p=>`<option value="${esc(p)}" ${canonicalPerfil(p)===canonicalPerfil(profile)?'selected':''}>${esc(p)}</option>`).join('');
+  const profileField=lockedForeignScope
+    ? `<input type="hidden" name="perfil" value="${esc(profile)}"><div class="user-scope-banner">Perfil restrito: <b>${esc(profile)}</b>. Somente Administradores podem alterar perfil e escopo de usuários de outra Supervisão.</div>`
+    : `<div class="user-form-group"><label class="user-field-label">Perfil de Acesso Corporativo<span class="key-input-req">*</span></label><select class="field" name="perfil" id="userPerfilSelect">${profileOptions}</select></div>`;
+  const scopeFields=userScopeFields(profile,supervisionId,x.unidades_permitidas,lockedForeignScope);
+
+  return `<div class="modalbg popup-backdrop" id="modalUserFormOverlay">
+    <div class="user-modal-card" role="dialog" aria-modal="true" aria-labelledby="userModalTitle">
+      <div class="user-modal-header">
+        <div style="display:flex;align-items:center;gap:12px">
+          <div class="user-modal-avatar-preview">${userAvatarInitials(x.nome||'Novo Usuário')}</div>
+          <div>
+            <h3 id="userModalTitle" style="margin:0;font-size:18px;font-weight:800">${isEdit?'Editar Usuário':'Cadastrar Novo Usuário'}</h3>
+            <p style="margin:2px 0 0;font-size:12.5px;color:#64748b">${isEdit?`Atualização de cadastro · ${esc(x.login||'')}`:'Preencha os dados e permissões do usuário'}</p>
+          </div>
+        </div>
+        <button type="button" class="key-modal-close closeUserModal" aria-label="Fechar">×</button>
+      </div>
+
+      <!-- Abas Internas do Modal -->
+      <div class="user-modal-tabs" role="tablist">
+        <button type="button" class="user-tab-btn ${currentTab==='geral'?'active':''}" data-usertab="geral">
+          <span>👤 Identificação & Acesso</span>
+        </button>
+        <button type="button" class="user-tab-btn ${currentTab==='escopo'?'active':''}" data-usertab="escopo">
+          <span>🏢 Lotação & Unidades</span>
+        </button>
+        <button type="button" class="user-tab-btn ${currentTab==='permissoes'?'active':''}" data-usertab="permissoes">
+          <span>🛡️ Perfil & Status</span>
+        </button>
+      </div>
+
+      <form id="userForm" novalidate>
+        <input type="hidden" name="id_usuario" value="${esc(x.id_usuario||'')}">
+
+        <div class="user-modal-body">
+          <!-- Aba 1: Identificação -->
+          <div class="user-tab-pane ${currentTab==='geral'?'active':''}" id="paneUserGeral">
+            <div class="user-form-stack">
+              <div class="user-form-group">
+                <label class="user-field-label">Nome Completo do Usuário<span class="key-input-req">*</span></label>
+                <input class="field" name="nome" required value="${esc(x.nome||'')}" placeholder="Ex: Carlos Eduardo da Silva" autofocus>
+              </div>
+
+              <div class="user-form-grid-2">
+                <div class="user-form-group">
+                  <label class="user-field-label">Identificação / Login Único<span class="key-input-req">*</span></label>
+                  <input class="field" name="login" required value="${esc(x.login||'')}" placeholder="Ex: carlos.silva ou matrícula" autocomplete="username">
+                  <small style="font-size:11px;color:#64748b;margin-top:4px;display:block">O login aceitará maiúsculas ou minúsculas no momento do acesso.</small>
+                </div>
+                ${!isEdit?`
+                  <div class="user-form-group">
+                    <label class="user-field-label">Senha de Acesso Inicial<span class="key-input-req">*</span></label>
+                    <input class="field" name="senha" type="password" value="${esc(x.senha||'')}" required placeholder="Mínimo 8 caracteres" autocomplete="new-password">
+                    <small style="font-size:11px;color:#64748b;margin-top:4px;display:block">A senha é criptografada e segura com hash PBKDF2.</small>
+                  </div>
+                `:`
+                  <div class="user-form-group">
+                    <label class="user-field-label">Senha Cadastrada</label>
+                    <div style="padding:10px 12px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;font-size:12.5px;color:#64748b;display:flex;align-items:center;justify-content:space-between">
+                      <span>••••••••••••</span>
+                      <button type="button" class="btn changeUserPassword" data-id="${esc(x.id_usuario)}" style="padding:4px 8px;font-size:11px">Alterar Senha</button>
+                    </div>
+                  </div>
+                `}
+              </div>
+            </div>
+          </div>
+
+          <!-- Aba 2: Escopo e Lotação -->
+          <div class="user-tab-pane ${currentTab==='escopo'?'active':''}" id="paneUserEscopo">
+            <div class="user-form-stack">
+              ${scopeFields}
+            </div>
+          </div>
+
+          <!-- Aba 3: Perfil e Status -->
+          <div class="user-tab-pane ${currentTab==='permissoes'?'active':''}" id="paneUserPermissoes">
+            <div class="user-form-stack">
+              ${profileField}
+              <div class="user-form-group">
+                <label class="user-field-label">Status da Conta<span class="key-input-req">*</span></label>
+                <select class="field" name="status">
+                  ${opts(['Ativo','Inativo'],x.status||'Ativo')}
+                </select>
+                <small style="font-size:11.5px;color:#64748b;margin-top:4px;display:block">Usuários inativos têm o acesso bloqueado imediatamente em tempo real.</small>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="user-modal-footer">
+          <button type="button" class="btn closeUserModal">Cancelar</button>
+          <button type="submit" class="btn primary" style="padding:10px 24px;font-weight:700">
+            ${isEdit?'Salvar Alterações':'Cadastrar Usuário'}
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>`;
+}
+
+function userForm(){
+  return '';
+}
+
+function usersPage(){
+  const allUsers=manageableUsers();
+  const filtered=filteredManageableUsers();
+  const total=allUsers.length;
+  const activeCount=allUsers.filter(u=>u.status==='Ativo').length;
+  const inactiveCount=allUsers.filter(u=>u.status!=='Ativo').length;
+  const adminCount=allUsers.filter(u=>canonicalPerfil(u.perfil)==='Administrador').length;
+  const supervisorCount=allUsers.filter(u=>canonicalPerfil(u.perfil)==='Supervisor').length;
+  const operatorCount=allUsers.filter(u=>canonicalPerfil(u.perfil)==='Operador').length;
+
+  const viewMode=S.userViewMode||'grid';
+  const profFilter=S.userProfileFilter||'todos';
+  const statFilter=S.userStatusFilter||'todos';
+
+  return `<div class="users-section-container">
+    <!-- Cabeçalho Principal -->
+    <div class="users-header">
+      <div class="row between" style="align-items:flex-start">
+        <div style="display:flex;align-items:center;gap:12px">
+          <div class="users-header-icon" aria-hidden="true">👥</div>
+          <div>
+            <h2 style="margin:0;font-size:23px;font-weight:900;letter-spacing:-0.02em">Gestão de Usuários & Permissões</h2>
+            <p class="muted" style="margin:4px 0 0;font-size:13px">Administração centralizada de acessos, lotações e permissões de segurança (RBAC)</p>
+          </div>
+        </div>
+        <button type="button" id="newUser" class="btn primary" style="display:inline-flex;align-items:center;gap:6px;padding:10px 18px;font-weight:700">
+          <span style="font-weight:900;font-size:16px">＋</span>
+          <span>Novo Usuário</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- KPIs Corporativos de Acesso -->
+    <div class="users-kpi-grid">
+      <div class="user-kpi-card kpi-total">
+        <div class="user-kpi-title">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+          Total de Usuários
+        </div>
+        <div class="user-kpi-value">${total}</div>
+        <div class="user-kpi-sub">Cadastros no escopo ativo</div>
+      </div>
+      <div class="user-kpi-card kpi-active">
+        <div class="user-kpi-title" style="color:#047857">
+          <span class="user-dot-active"></span>Usuários Ativos
+        </div>
+        <div class="user-kpi-value" style="color:#047857">${activeCount}</div>
+        <div class="user-kpi-sub">Com permissão de login habilitada</div>
+      </div>
+      <div class="user-kpi-card kpi-inactive">
+        <div class="user-kpi-title" style="color:#be123c">
+          <span class="user-dot-inactive"></span>Bloqueados / Inativos
+        </div>
+        <div class="user-kpi-value" style="color:#be123c">${inactiveCount}</div>
+        <div class="user-kpi-sub">Acesso revogado ao sistema</div>
+      </div>
+      <div class="user-kpi-card kpi-roles">
+        <div class="user-kpi-title">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+          Distribuição por Perfil
+        </div>
+        <div class="user-roles-breakdown">
+          <span>⚡ <b>${adminCount}</b> Adm</span>
+          <span>·</span>
+          <span>👔 <b>${supervisorCount}</b> Sup</span>
+          <span>·</span>
+          <span>🛡️ <b>${operatorCount}</b> Op</span>
+        </div>
+        <div class="user-kpi-sub">Papeis de acesso atribuídos</div>
+      </div>
+    </div>
+
+    <!-- Barra de Ferramentas / Filtros -->
+    <div class="users-toolbar">
+      <div class="users-toolbar-row">
+        <div class="users-search-wrap">
+          <span class="users-search-icon">🔍</span>
+          <input type="text" id="userSearchInput" class="field users-search-input" placeholder="Buscar por nome, login ou unidade autorizada..." value="${esc(S.userSearchQuery||'')}">
+        </div>
+
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+          <select id="userProfileFilter" class="field" style="width:auto;min-width:160px">
+            <option value="todos">Todos os Perfis</option>
+            <option value="Administrador" ${profFilter==='Administrador'?'selected':''}>Administradores (${adminCount})</option>
+            <option value="Supervisor" ${profFilter==='Supervisor'?'selected':''}>Supervisores (${supervisorCount})</option>
+            <option value="Operador" ${profFilter==='Operador'?'selected':''}>Operadores (${operatorCount})</option>
+          </select>
+
+          <div class="users-status-filters" role="group" aria-label="Filtro de status de usuário">
+            <button type="button" class="users-status-btn ${statFilter==='todos'?'active':''}" data-userstatus="todos">Todos (${total})</button>
+            <button type="button" class="users-status-btn ${statFilter==='ativo'?'active':''}" data-userstatus="ativo">Ativos (${activeCount})</button>
+            <button type="button" class="users-status-btn ${statFilter==='inativo'?'active':''}" data-userstatus="inativo">Inativos (${inactiveCount})</button>
+          </div>
+
+          <div class="users-view-toggle" role="group" aria-label="Alternar exibição de usuários">
+            <button type="button" class="users-view-btn ${viewMode==='grid'?'active':''}" data-userview="grid" title="Visualização em Cards">🗂️ Cards</button>
+            <button type="button" class="users-view-btn ${viewMode==='table'?'active':''}" data-userview="table" title="Visualização em Tabela">📑 Tabela</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Conteúdo: Grid de Cards ou Tabela -->
+    ${viewMode==='grid'?`
+      <div class="users-cards-grid">
+        ${filtered.length?filtered.map(u=>{
+          const ativo=u.status==='Ativo';
+          const initials=userAvatarInitials(u.nome);
+          const scopeText=userScopeSummary(u);
+          const isCurrent=S.user?.id_usuario===u.id_usuario;
+
+          return `<div class="user-card ${ativo?'status-active':'status-inactive'}">
+            <div>
+              <div class="user-card-header">
+                <div style="display:flex;align-items:center;gap:12px;min-width:0">
+                  <div class="user-avatar" title="${esc(u.nome)}">${initials}</div>
+                  <div style="min-width:0">
+                    <h4 class="user-card-name" title="${esc(u.nome)}">${esc(u.nome)}</h4>
+                    <div class="user-card-login">@${esc(u.login)}${isCurrent?' <span class="user-self-pill">Você</span>':''}</div>
+                  </div>
+                </div>
+                ${userStatusBadge(u.status)}
+              </div>
+
+              <div class="user-card-body">
+                <div style="margin-bottom:10px">
+                  ${userProfileBadge(u.perfil)}
+                </div>
+
+                <div class="user-scope-box">
+                  <div class="user-scope-title">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+                    Lotação & Escopo Autorizado
+                  </div>
+                  <div class="user-scope-desc" title="${esc(scopeText)}">${esc(scopeText)}</div>
+                </div>
+              </div>
+            </div>
+
+            <div class="user-card-footer">
+              <div class="user-actions-row">
+                <button type="button" class="btn editUser user-btn-action" data-id="${esc(u.id_usuario)}" title="Editar dados e permissões do usuário">
+                  <span>✏️</span>
+                  <span>Editar</span>
+                </button>
+                <button type="button" class="btn changeUserPassword user-btn-action" data-id="${esc(u.id_usuario)}" title="Alterar senha de acesso">
+                  <span>🔑</span>
+                  <span>Senha</span>
+                </button>
+                ${u.login!=='admin'?`
+                  <button type="button" class="btn toggleUser user-btn-action" data-id="${esc(u.id_usuario)}" title="${ativo?'Bloquear acesso':'Reativar acesso'}">
+                    <span>${ativo?'🔒':'🔓'}</span>
+                    <span>${ativo?'Bloquear':'Reativar'}</span>
+                  </button>
+                `:''}
+                ${!isCurrent&&u.login!=='admin'?`
+                  <button type="button" class="btn danger removeUser user-btn-action" data-id="${esc(u.id_usuario)}" title="Remover usuário">
+                    <span>🗑️</span>
+                  </button>
+                `:''}
+              </div>
+            </div>
+          </div>`;
+        }).join(''):`
+          <div class="user-card-empty">
+            <span style="font-size:36px">👤</span>
+            <h4 style="margin:8px 0 4px;font-size:16px;font-weight:700">Nenhum usuário encontrado</h4>
+            <p class="muted" style="margin:0;font-size:13px">Nenhum registro corresponde aos filtros ou busca informada.</p>
+          </div>
+        `}
+      </div>
+    `:`
+      <div class="card tablewrap" style="border-radius:14px;border:1.5px solid #e2e8f0;box-shadow:0 4px 14px rgba(15,23,42,0.04)">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Usuário</th>
+              <th>Login</th>
+              <th>Perfil</th>
+              <th>Supervisão / Unidades</th>
+              <th>Status</th>
+              <th style="min-width:240px">Ações</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${filtered.length?filtered.map(x=>{
+              const isCurrent=S.user?.id_usuario===x.id_usuario;
+              return `<tr>
+                <td>
+                  <div style="display:flex;align-items:center;gap:10px">
+                    <div class="user-avatar" style="width:32px;height:32px;font-size:12px">${userAvatarInitials(x.nome)}</div>
+                    <div>
+                      <b>${esc(x.nome)}</b>
+                      ${isCurrent?' <span class="user-self-pill">Você</span>':''}
+                    </div>
+                  </div>
+                </td>
+                <td style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-weight:700;color:#0f172a">@${esc(x.login)}</td>
+                <td>${userProfileBadge(x.perfil)}</td>
+                <td style="max-width:260px;font-size:12.5px">${esc(userScopeSummary(x))}</td>
+                <td>${userStatusBadge(x.status)}</td>
+                <td class="actions" style="white-space:nowrap">
+                  <button type="button" class="btn editUser" data-id="${esc(x.id_usuario)}" title="Editar" style="padding:4px 8px;font-size:12px">✏️ Editar</button>
+                  <button type="button" class="btn changeUserPassword" data-id="${esc(x.id_usuario)}" style="padding:4px 8px;font-size:12px">🔑 Senha</button>
+                  ${x.login!=='admin'?`
+                    <button type="button" class="btn toggleUser" data-id="${esc(x.id_usuario)}" title="${x.status==='Ativo'?'Bloquear':'Reativar'}" style="padding:4px 8px;font-size:12px">
+                      ${x.status==='Ativo'?'🔒 Bloquear':'🔓 Reativar'}
+                    </button>
+                  `:''}
+                  ${!isCurrent&&x.login!=='admin'?`
+                    <button type="button" class="btn danger removeUser" data-id="${esc(x.id_usuario)}" title="Remover usuário" style="padding:4px 8px;font-size:12px">🗑️</button>
+                  `:''}
+                </td>
+              </tr>`;
+            }).join(''):`<tr><td colspan="6" style="text-align:center;padding:32px;color:#64748b">Nenhum usuário encontrado.</td></tr>`}
+          </tbody>
+        </table>
+      </div>
+    `}
+  </div>`;
+}
 function userRemovalModal(){const target=S.userRemovalTarget;if(!target||S.page!=='usuarios'||!canManageUsers())return'';return `<div class="modalbg popup-backdrop"><div class="result-dialog result-error" role="dialog" aria-modal="true" aria-labelledby="removeUserTitle"><div class="error-strip"></div><div class="error-body"><div class="error-icon">!</div><div><div class="result-kicker error-kicker">Confirmação necessária</div><h2 id="removeUserTitle">REMOVER USUÁRIO</h2><p>Tem certeza de que deseja remover este usuário?</p><div class="detail"><b>Nome</b><p>${esc(target.nome)}</p><b>Login</b><p>${esc(target.login)}</p><b>Perfil</b><p>${esc(target.perfil)}</p></div><p>Esta ação removerá o acesso deste usuário ao SIGESP.</p></div></div><div class="result-actions error-actions"><button id="cancelUserRemoval" type="button" class="btn">Cancelar</button><button id="confirmUserRemoval" type="button" class="btn danger">Remover Usuário</button></div></div></div>`}
 function auditPage(){return `<h2>Auditoria</h2><div class="card tablewrap"><table class="table"><tr><th>Data</th><th>Usuário</th><th>Módulo</th><th>Ação</th><th>Detalhes</th></tr>${S.audits.map(item=>`<tr><td>${esc(item.data_hora)}</td><td>${esc(item.usuario)}</td><td>${esc(item.modulo)}</td><td>${esc(item.acao)}</td><td>${esc(item.detalhes)}</td></tr>`).join('')}</table></div>`}
 function reportsPage(){return `<h2>Relatórios</h2><div class="grid metrics"><div class="card"><h3>Ocorrências</h3><button id="exportOcc" class="btn">Exportar CSV</button></div><div class="card"><h3>Chaves</h3><button id="exportKeys" class="btn">Exportar CSV</button></div></div>`}
@@ -6730,7 +7148,7 @@ function shell(){
     S.page==='relatorios'?reportsPage():
     settingsPage();
 
-  return `<div class="shell"><aside class="sidebar" aria-label="Navegação lateral do sistema"><div class="brand">🛡️ SIGESP</div><nav class="menu" aria-label="Menu principal">${renderSidebarMenu()}</nav></aside><main class="main"><header class="topbar"><div style="display:flex;align-items:center;gap:10px"><button type="button" id="topbarFolderBadge" class="btn" style="padding:5px 10px;font-size:12px;display:inline-flex;align-items:center;gap:6px;background:#ecfdf5;color:#047857;border-color:#a7f3d0" title="Pasta de dados ativa. Clique para gerenciar ou selecionar outra."><span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:#16a34a"></span><b>Pasta: ${esc(S.dir?.name||'dados')}</b></button><b>${esc(S.user.nome)} · ${esc(S.user.perfil)}</b></div><div style="display:flex;align-items:center;gap:10px"><div class="sync-status-badge" id="syncStatusBadge" title="Sincronização em segundo plano ativa"><span class="sync-pulse-dot" aria-hidden="true"></span><span id="syncStatusText">Sincronizado às ${formatSyncTime()}</span></div>${operator?'':'<button id="refresh" class="btn">Atualizar</button>'}</div></header><section class="content">${alert()}${body}</section></main>${modal()}${validationModal()}${apuracaoModal()}${deletePendingAlertDialog()}${deleteRecordAlertDialog()}${keyWithdrawModal()}${keyReturnModal()}${keyHistoryModal()}${toastContainer()}${userPasswordModal()}${userRemovalModal()}${successModal()}${errorModal()}${settingsMasterEditor()}${masterConfirmationModal()}${S.viewUrl?`<div class="viewer"><button id="closeViewer">×</button><img src="${S.viewUrl}"></div>`:''}</div>${accessDeniedModal()}${folderSelectionModal()}`
+  return `<div class="shell"><aside class="sidebar" aria-label="Navegação lateral do sistema"><div class="brand">🛡️ SIGESP</div><nav class="menu" aria-label="Menu principal">${renderSidebarMenu()}</nav></aside><main class="main"><header class="topbar"><div style="display:flex;align-items:center;gap:10px"><button type="button" id="topbarFolderBadge" class="btn" style="padding:5px 10px;font-size:12px;display:inline-flex;align-items:center;gap:6px;background:#ecfdf5;color:#047857;border-color:#a7f3d0" title="Pasta de dados ativa. Clique para gerenciar ou selecionar outra."><span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:#16a34a"></span><b>Pasta: ${esc(S.dir?.name||'dados')}</b></button><b>${esc(S.user.nome)} · ${esc(S.user.perfil)}</b></div><div style="display:flex;align-items:center;gap:10px"><div class="sync-status-badge" id="syncStatusBadge" title="Sincronização em segundo plano ativa"><span class="sync-pulse-dot" aria-hidden="true"></span><span id="syncStatusText">Sincronizado às ${formatSyncTime()}</span></div>${operator?'':'<button id="refresh" class="btn">Atualizar</button>'}</div></header><section class="content">${alert()}${body}</section></main>${modal()}${validationModal()}${apuracaoModal()}${deletePendingAlertDialog()}${deleteRecordAlertDialog()}${keyWithdrawModal()}${keyReturnModal()}${keyHistoryModal()}${toastContainer()}${userPasswordModal()}${userRemovalModal()}${userFormModal()}${successModal()}${errorModal()}${settingsMasterEditor()}${masterConfirmationModal()}${S.viewUrl?`<div class="viewer"><button id="closeViewer">×</button><img src="${S.viewUrl}"></div>`:''}</div>${accessDeniedModal()}${folderSelectionModal()}`
 }
 let _searchDebounceTimer=null;
 function scheduleSearchRender(delay=300){if(_searchDebounceTimer)clearTimeout(_searchDebounceTimer);_searchDebounceTimer=setTimeout(()=>{_searchDebounceTimer=null;render()},delay)}
@@ -7187,9 +7605,36 @@ function bind(){
   document.getElementById('ambientalSupervisao')?.addEventListener('change',e=>{S.ambientalFilters={...S.ambientalFilters,supervisao:e.target.value};S.currentPage=1;render()});
   document.getElementById('ambientalGeneral')?.addEventListener('input',e=>{S.ambientalFilters={...S.ambientalFilters,general:e.target.value};S.currentPage=1;scheduleSearchRender(300)});
   document.getElementById('userForm')?.addEventListener('submit',saveUser);
-  document.getElementById('newUser')?.addEventListener('click',()=>{S.editing={kind:'user',data:{}};render()});
+  document.getElementById('newUser')?.addEventListener('click',()=>{S.editing={kind:'user',data:{}};S.userModalTab='geral';render()});
   document.getElementById('cancelUser')?.addEventListener('click',()=>{S.editing=null;render()});
-  document.querySelectorAll('.editUser').forEach(b=>b.onclick=()=>{S.editing={kind:'user',data:S.users.find(x=>x.id_usuario===b.dataset.id)};render()});
+  document.querySelectorAll('.closeUserModal').forEach(b=>b.onclick=()=>{S.editing=null;render()});
+  document.querySelectorAll('.user-tab-btn[data-usertab]').forEach(b=>b.onclick=()=>{
+    S.userModalTab=b.dataset.usertab;
+    render();
+  });
+
+  document.getElementById('userSearchInput')?.addEventListener('input',e=>{
+    S.userSearchQuery=e.target.value;
+    scheduleSearchRender(250);
+  });
+  document.getElementById('userProfileFilter')?.addEventListener('change',e=>{
+    S.userProfileFilter=e.target.value;
+    render();
+  });
+  document.querySelectorAll('.users-status-btn[data-userstatus]').forEach(b=>b.onclick=()=>{
+    S.userStatusFilter=b.dataset.userstatus;
+    render();
+  });
+  document.querySelectorAll('.users-view-btn[data-userview]').forEach(b=>b.onclick=()=>{
+    S.userViewMode=b.dataset.userview;
+    render();
+  });
+
+  document.querySelectorAll('.editUser').forEach(b=>b.onclick=()=>{
+    S.editing={kind:'user',data:S.users.find(x=>x.id_usuario===b.dataset.id)};
+    S.userModalTab='geral';
+    render();
+  });
   document.querySelectorAll('.toggleUser').forEach(b=>b.onclick=()=>toggleUser(b.dataset.id));
   document.getElementById('closeSuccess')?.addEventListener('click',async()=>{const kind=S.successPopup?.kind;S.successPopup=null;S.editing=null;const isOp=hasProfile(S.user,'Operador');S.page=isOp?'occ-register':(kind==='pending'?'occ-validation':'occ-history');S.activeMenu=isOp?'ocorrencias':null;if(isOp){await openOccurrenceRegistration({forceNew:true,clearDraft:true});}else{render();}});
   document.getElementById('newSuccessOccurrence')?.addEventListener('click',()=>openOccurrenceRegistration({forceNew:true,clearDraft:true}));

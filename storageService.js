@@ -1307,11 +1307,6 @@ const StorageService = (() => {
       }
 
       if (dir.isServer && !dir.relPath) {
-        // Se já está no cache em memória, retorna instantaneamente (0ms)
-        if (_rawFileCache.has(fileName)) {
-          const cached = _rawFileCache.get(fileName);
-          return { exists: true, size: cached.size || 0, mtimeMs: cached.mtimeMs || 0, sig: cached.rawSig || '' };
-        }
         if (fileName === 'ocorrencias.csv') {
           try {
             const batchUrl = `/api/storage/occurrences/batch?knownSig=${encodeURIComponent(_lastKnownBatchSig || '')}&_t=${Date.now()}`;
