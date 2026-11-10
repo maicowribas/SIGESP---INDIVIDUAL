@@ -3105,9 +3105,13 @@ const StorageService = (() => {
         // Se estivermos conectados ao diretório do servidor (ou sem handle nativo), usamos o endpoint atômico do backend
         if (!isNativeSharedDirectory()) {
           try {
+            const timeoutSignal = (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function')
+              ? AbortSignal.timeout(3000)
+              : undefined;
             const res = await fetch('/api/storage/protocol/reserve', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
+              signal: timeoutSignal,
               body: JSON.stringify({
                 user,
                 unit,
@@ -3125,8 +3129,9 @@ const StorageService = (() => {
             });
             if (res.ok) {
               const data = await res.json();
-              if (data?.reservation?.protocolo || data?.reservation?.numeroProtocolo) {
-                return this.normalizeReservationObject(data.reservation);
+              const item = data?.reservation || (data?.protocolo ? data : null);
+              if (item?.protocolo || item?.numeroProtocolo) {
+                return this.normalizeReservationObject(item);
               }
             }
           } catch (e) {
@@ -3330,9 +3335,13 @@ const StorageService = (() => {
 
       if (!isNativeSharedDirectory()) {
         try {
+          const timeoutSignal = (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function')
+            ? AbortSignal.timeout(3000)
+            : undefined;
           const res = await fetch('/api/storage/protocol/confirm', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
+            signal: timeoutSignal,
             body: JSON.stringify({
               protocolo: normProto,
               user,

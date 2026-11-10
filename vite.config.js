@@ -218,31 +218,445 @@ async function acquireSharedProtocolFileLock(owner = 'Sistema', clientId = '', t
   throw lockErr;
 }
 
-async function releaseSharedProtocolFileLock(lockId, traceEnabled = false) {
-  if (!lockId) return;
-  try {
-    const rawLock = await fs.readFile(PROTOCOL_LOCK_FILE, 'utf8');
-    const parsedLock = JSON.parse(rawLock);
-    if (!parsedLock || parsedLock.lockId === lockId) {
-      await fs.rm(PROTOCOL_LOCK_FILE, { force: true });
-    }
-  } catch {
+// ============================================================================
+// REAL-TIME BROADCAST ENGINE (SERVER-SENT EVENTS - SSE)
+// ============================================================================
+const sseClients = new Set();
+
+function broadcastStorageEvent(eventType, payload = {}) {
+  const data = JSON.stringify({ type: eventType, timestamp: Date.now(), ...payload });
+  const msg = `data: ${data}\n\n`;
+  for (const client of sseClients) {
     try {
-      await fs.rm(PROTOCOL_LOCK_FILE, { force: true });
-    } catch {}
+      client.write(msg);
+    } catch {
+      sseClients.delete(client);
+    }
   }
-  logProtocolStep(traceEnabled, 'lock liberado', { lockId });
+}
+
+setInterval(() => {
+  for (const client of sseClients) {
+    try {
+      client.write(': ping\n\n');
+    } catch {
+      sseClients.delete(client);
+    }
+  }
+}, 15000);
+
+// ============================================================================
+// HIGH-CONCURRENCY PROTOCOL ENGINE (IN-MEMORY ATOMIC SEQUENCE + WRITE COALESCING)
+// ============================================================================
+const protocolEngine = {
+  initializedYears: new Set(),
+  initPromises: new Map(),
+  maxByYear: new Map(),
+  reservations: new Map(),
+  reservationsBySession: new Map(),
+  reservationsByProtocol: new Map(),
+  persistDebounceTimers: new Map(),
+};
+
+async function ensureProtocolEngineInitialized(year) {
+  if (protocolEngine.initializedYears.has(year)) return;
+  if (protocolEngine.initPromises.has(year)) {
+    return await protocolEngine.initPromises.get(year);
+  }
+  const initPromise = (async () => {
+    try {
+      const counterVal = await readProtocolCounter(year);
+      const usedInFiles = await extractExistingNumbersFromOcorrencias(year);
+      const rawReservations = await readAllReservationsRaw(usedInFiles, year);
+
+      let maxSeq = Math.max(0, counterVal);
+      for (const n of usedInFiles) {
+        if (n > maxSeq) maxSeq = n;
+      }
+      for (const r of rawReservations) {
+        if (r.year === year && r.id_sequencial > maxSeq) {
+          maxSeq = r.id_sequencial;
+        }
+      }
+      protocolEngine.maxByYear.set(year, maxSeq);
+
+      for (const r of rawReservations) {
+        const resId = r.reservationId || r.id_reserva;
+        const proto = (r.numeroProtocolo || r.protocolo || '').toUpperCase();
+        if (resId && proto) {
+          protocolEngine.reservations.set(resId, r);
+          protocolEngine.reservationsByProtocol.set(proto, resId);
+          if (r.clientId) {
+            protocolEngine.reservationsBySession.set(`${r.year || year}:${r.clientId}`, resId);
+          }
+        }
+      }
+      protocolEngine.initializedYears.add(year);
+    } catch (err) {
+      console.error('[protocolEngine] Falha na inicialização do ano', year, err);
+    } finally {
+      protocolEngine.initPromises.delete(year);
+    }
+  })();
+  protocolEngine.initPromises.set(year, initPromise);
+  return await initPromise;
+}
+
+function scheduleProtocolEnginePersist(year) {
+  if (protocolEngine.persistDebounceTimers.has(year)) {
+    clearTimeout(protocolEngine.persistDebounceTimers.get(year));
+  }
+  const timer = setTimeout(async () => {
+    protocolEngine.persistDebounceTimers.delete(year);
+    try {
+      const allList = Array.from(protocolEngine.reservations.values());
+      const curMax = protocolEngine.maxByYear.get(year) || 0;
+      await withServerFileLock(RESERVATIONS_FILE, async () => {
+        if (curMax > 0) {
+          await writeProtocolCounter(year, curMax);
+        }
+        await writeReservations(allList);
+      });
+    } catch (persistErr) {
+      console.warn('[protocolEngine] Falha na persistência assíncrona:', persistErr);
+    }
+  }, 40);
+  protocolEngine.persistDebounceTimers.set(year, timer);
+}
+
+async function reserveProtocolAtomic(payload) {
+  const tReq0 = performance.now();
+  const user = String(payload.user || payload.usuario || 'Sistema').trim();
+  const unit = String(payload.unit || '').trim();
+  const year = parseInt(payload.year, 10) || new Date().getFullYear();
+  const clientId = String(payload.clientId || payload.sessionId || '').trim();
+  const preferredReservationId = String(payload.reservationId || '').trim();
+  const preferredProtocol = String(payload.preferredProtocol || '').trim().toUpperCase();
+  const previousProtocol = String(payload.previousProtocol || '').trim().toUpperCase();
+  const forceNew = Boolean(payload.forceNew);
+  const traceEnabled = Boolean(payload.trace);
+  const now = Date.now();
+
+  await ensureProtocolEngineInitialized(year);
+
+  // 1. Reutilização de reserva ativa da mesma sessão se !forceNew
+  if (clientId && !forceNew) {
+    const existingResId = protocolEngine.reservationsBySession.get(`${year}:${clientId}`) || preferredReservationId;
+    if (existingResId) {
+      const existing = protocolEngine.reservations.get(existingResId);
+      if (
+        existing &&
+        existing.year === year &&
+        existing.status === 'RESERVADO' &&
+        existing.expiresAt > now
+      ) {
+        existing.expiresAt = now + RESERVATION_TTL_MS;
+        if (unit) existing.unit = unit;
+        if (user && user !== 'Sistema') {
+          existing.usuario = user;
+          existing.user = user;
+        }
+        scheduleProtocolEnginePersist(year);
+        logProtocolStep(traceEnabled, 'reutilizando reserva de sessão ativa', {
+          protocolo: existing.protocolo,
+          clientId,
+          reservationId: existing.reservationId
+        });
+        return { ...existing, reused: true, tempoTotalMs: +(performance.now() - tReq0).toFixed(2) };
+      }
+    }
+  }
+
+  // Se forceNew ou cancelando anterior da mesma sessão
+  if (clientId && (forceNew || previousProtocol)) {
+    for (const [rId, r] of protocolEngine.reservations.entries()) {
+      if (
+        r.clientId === clientId &&
+        r.year === year &&
+        r.status === 'RESERVADO' &&
+        (!previousProtocol || r.protocolo === previousProtocol)
+      ) {
+        r.status = 'CANCELADO';
+        r.expiresAt = now - 1;
+      }
+    }
+  }
+
+  // 2. Alocação atômica estrita (O(1) no event loop - ZERO conflito)
+  let curMax = protocolEngine.maxByYear.get(year) || 0;
+  curMax++;
+  protocolEngine.maxByYear.set(year, curMax);
+
+  const proto = `OC-${year}-${String(curMax).padStart(6, '0')}`;
+  const resId = crypto.randomUUID();
+  const effectiveSessionId = clientId || resId;
+  const isoNow = new Date(now).toISOString();
+
+  const item = {
+    id_reserva: resId,
+    reservationId: resId,
+    numeroProtocolo: proto,
+    protocolo: proto,
+    id_sequencial: curMax,
+    usuario: user,
+    user,
+    sessionId: effectiveSessionId,
+    clientId: effectiveSessionId,
+    sessao: effectiveSessionId,
+    id_interno: null,
+    unit,
+    year,
+    dataHoraReserva: isoNow,
+    data_hora: isoNow,
+    createdAt: now,
+    expiresAt: now + RESERVATION_TTL_MS,
+    status: 'RESERVADO',
+    confirmado: false,
+    dataHoraUtilizacao: null,
+    confirmedAt: null
+  };
+
+  protocolEngine.reservations.set(resId, item);
+  protocolEngine.reservationsByProtocol.set(proto, resId);
+  if (clientId) {
+    protocolEngine.reservationsBySession.set(`${year}:${clientId}`, resId);
+  }
+
+  scheduleProtocolEnginePersist(year);
+  broadcastStorageEvent('protocol_reserved', { protocolo: proto, reservationId: resId, user, unit });
+  logProtocolStep(traceEnabled, 'reserva atômica concluída com sucesso', {
+    protocolo: proto,
+    reservationId: resId,
+    tempoMs: +(performance.now() - tReq0).toFixed(2)
+  });
+
+  return {
+    ...item,
+    reused: false,
+    tempoTotalMs: +(performance.now() - tReq0).toFixed(2)
+  };
+}
+
+async function confirmProtocolAtomic(payload) {
+  const proto = String(payload.protocolo || payload.numeroProtocolo || '').trim().toUpperCase();
+  const user = String(payload.user || payload.usuario || 'Sistema').trim();
+  const unit = String(payload.unit || '').trim();
+  const clientId = String(payload.clientId || payload.sessionId || '').trim();
+  const reservationId = String(payload.reservationId || '').trim();
+  const idInterno = String(payload.id_interno || '').trim();
+  const markUtilized = Boolean(payload.markUtilized);
+  const now = Date.now();
+  const isoNow = new Date(now).toISOString();
+
+  const yearMatch = /^OC-(\d{4})-(\d+)$/i.exec(proto);
+  const year = yearMatch ? parseInt(yearMatch[1], 10) : (parseInt(payload.year, 10) || new Date().getFullYear());
+  const seqNum = yearMatch ? parseInt(yearMatch[2], 10) : 0;
+
+  await ensureProtocolEngineInitialized(year);
+
+  const existingResId = protocolEngine.reservationsByProtocol.get(proto);
+  const existingItem = existingResId ? protocolEngine.reservations.get(existingResId) : null;
+
+  const utilizedByOther = existingItem &&
+    (existingItem.status === 'UTILIZADO' || existingItem.confirmado) &&
+    ((idInterno && existingItem.id_interno && existingItem.id_interno !== idInterno) ||
+     (!idInterno && clientId && existingItem.clientId && existingItem.clientId !== clientId) ||
+     (reservationId && existingItem.reservationId && existingItem.reservationId !== reservationId));
+
+  const hasConflict = !proto || seqNum <= 0 || utilizedByOther;
+
+  if (hasConflict) {
+    let curMax = protocolEngine.maxByYear.get(year) || 0;
+    curMax++;
+    protocolEngine.maxByYear.set(year, curMax);
+
+    const newProto = `OC-${year}-${String(curMax).padStart(6, '0')}`;
+    const newResId = crypto.randomUUID();
+    const effectiveSessionId = clientId || newResId;
+
+    const newItem = {
+      id_reserva: newResId,
+      reservationId: newResId,
+      numeroProtocolo: newProto,
+      protocolo: newProto,
+      id_sequencial: curMax,
+      usuario: user,
+      user,
+      sessionId: effectiveSessionId,
+      clientId: effectiveSessionId,
+      sessao: effectiveSessionId,
+      id_interno: idInterno || null,
+      unit,
+      year,
+      dataHoraReserva: isoNow,
+      data_hora: isoNow,
+      createdAt: now,
+      expiresAt: now + RESERVATION_TTL_MS,
+      status: markUtilized ? 'UTILIZADO' : 'RESERVADO',
+      confirmado: markUtilized,
+      dataHoraUtilizacao: markUtilized ? isoNow : null,
+      confirmedAt: markUtilized ? isoNow : null
+    };
+
+    protocolEngine.reservations.set(newResId, newItem);
+    protocolEngine.reservationsByProtocol.set(newProto, newResId);
+    if (clientId) {
+      protocolEngine.reservationsBySession.set(`${year}:${clientId}`, newResId);
+    }
+    scheduleProtocolEnginePersist(year);
+    broadcastStorageEvent('protocol_confirmed', { protocolo: newProto, previousProtocol: proto, reallocated: true });
+
+    return {
+      ok: true,
+      conflict: true,
+      conflictResolved: true,
+      reallocated: true,
+      previousProtocol: proto,
+      protocolo: newProto,
+      numeroProtocolo: newProto,
+      id_sequencial: curMax,
+      reservationId: newResId,
+      reservation: newItem
+    };
+  }
+
+  if (existingItem) {
+    existingItem.expiresAt = now + RESERVATION_TTL_MS;
+    if (idInterno) existingItem.id_interno = idInterno;
+    if (clientId) {
+      existingItem.clientId = clientId;
+      existingItem.sessionId = clientId;
+    }
+    if (markUtilized) {
+      existingItem.status = 'UTILIZADO';
+      existingItem.confirmado = true;
+      existingItem.dataHoraUtilizacao = isoNow;
+      existingItem.confirmedAt = isoNow;
+      const curMax = protocolEngine.maxByYear.get(year) || 0;
+      if (seqNum > curMax) protocolEngine.maxByYear.set(year, seqNum);
+    }
+    scheduleProtocolEnginePersist(year);
+    broadcastStorageEvent('protocol_confirmed', { protocolo: proto, reallocated: false });
+    return {
+      ok: true,
+      conflict: false,
+      conflictResolved: false,
+      reallocated: false,
+      protocolo: proto,
+      numeroProtocolo: proto,
+      id_sequencial: existingItem.id_sequencial || seqNum,
+      reservationId: existingItem.reservationId,
+      reservation: existingItem
+    };
+  }
+
+  const newResId = reservationId || crypto.randomUUID();
+  const effectiveSessionId = clientId || newResId;
+  const createdItem = {
+    id_reserva: newResId,
+    reservationId: newResId,
+    numeroProtocolo: proto,
+    protocolo: proto,
+    id_sequencial: seqNum,
+    usuario: user,
+    user,
+    sessionId: effectiveSessionId,
+    clientId: effectiveSessionId,
+    sessao: effectiveSessionId,
+    id_interno: idInterno || null,
+    unit,
+    year,
+    dataHoraReserva: isoNow,
+    data_hora: isoNow,
+    createdAt: now,
+    expiresAt: now + RESERVATION_TTL_MS,
+    status: markUtilized ? 'UTILIZADO' : 'RESERVADO',
+    confirmado: markUtilized,
+    dataHoraUtilizacao: markUtilized ? isoNow : null,
+    confirmedAt: markUtilized ? isoNow : null
+  };
+  const curMax = protocolEngine.maxByYear.get(year) || 0;
+  if (seqNum > curMax) protocolEngine.maxByYear.set(year, seqNum);
+  protocolEngine.reservations.set(newResId, createdItem);
+  protocolEngine.reservationsByProtocol.set(proto, newResId);
+  scheduleProtocolEnginePersist(year);
+  broadcastStorageEvent('protocol_confirmed', { protocolo: proto, reallocated: false });
+  return {
+    ok: true,
+    conflict: false,
+    conflictResolved: false,
+    reallocated: false,
+    protocolo: proto,
+    numeroProtocolo: proto,
+    id_sequencial: seqNum,
+    reservationId: newResId,
+    reservation: createdItem
+  };
+}
+
+async function releaseProtocolAtomic(payload) {
+  const proto = String(payload.protocolo || payload.numeroProtocolo || '').trim().toUpperCase();
+  const confirmedUse = Boolean(payload.confirmed || payload.utilized);
+  const clientId = String(payload.clientId || payload.sessionId || '').trim();
+  const reservationId = String(payload.reservationId || '').trim();
+  const idInterno = String(payload.id_interno || '').trim();
+  const seqMatch = /^OC-(\d{4})-(\d+)$/i.exec(proto);
+  const year = seqMatch ? parseInt(seqMatch[1], 10) : new Date().getFullYear();
+  const seqNum = seqMatch ? parseInt(seqMatch[2], 10) : 0;
+  const now = Date.now();
+  const isoNow = new Date(now).toISOString();
+
+  await ensureProtocolEngineInitialized(year);
+
+  const existingResId = protocolEngine.reservationsByProtocol.get(proto) || reservationId;
+  if (existingResId) {
+    const existing = protocolEngine.reservations.get(existingResId);
+    if (existing) {
+      if (confirmedUse) {
+        existing.status = 'UTILIZADO';
+        existing.confirmado = true;
+        existing.dataHoraUtilizacao = isoNow;
+        existing.confirmedAt = isoNow;
+        if (idInterno) existing.id_interno = idInterno;
+        const curMax = protocolEngine.maxByYear.get(year) || 0;
+        if (seqNum > curMax) protocolEngine.maxByYear.set(year, seqNum);
+      } else {
+        if (!clientId || existing.clientId === clientId || !reservationId || existing.reservationId === reservationId) {
+          existing.status = 'CANCELADO';
+          existing.expiresAt = now - 1;
+        }
+      }
+      scheduleProtocolEnginePersist(year);
+    }
+  }
+  return { ok: true, released: proto };
+}
+
+async function renewProtocolAtomic(payload) {
+  const proto = String(payload.protocolo || payload.numeroProtocolo || '').trim().toUpperCase();
+  const clientId = String(payload.clientId || payload.sessionId || '').trim();
+  const reservationId = String(payload.reservationId || '').trim();
+  const seqMatch = /^OC-(\d{4})-(\d+)$/i.exec(proto);
+  const year = seqMatch ? parseInt(seqMatch[1], 10) : new Date().getFullYear();
+  const now = Date.now();
+
+  await ensureProtocolEngineInitialized(year);
+
+  const existingResId = protocolEngine.reservationsByProtocol.get(proto) || reservationId;
+  if (!existingResId) {
+    return { ok: false, conflict: true, reason: 'RESERVATION_NOT_ACTIVE' };
+  }
+  const target = protocolEngine.reservations.get(existingResId);
+  if (!target || target.status !== 'RESERVADO') {
+    return { ok: false, conflict: true, reason: 'RESERVATION_NOT_ACTIVE' };
+  }
+  target.expiresAt = now + RESERVATION_TTL_MS;
+  scheduleProtocolEnginePersist(year);
+  return { ok: true, conflict: false, expiresAt: target.expiresAt, reservation: target };
 }
 
 async function withProtocolControlLock(owner, clientId, operation, traceEnabled = false) {
-  return await withServerFileLock(RESERVATIONS_FILE, async () => {
-    const lockId = await acquireSharedProtocolFileLock(owner, clientId, traceEnabled);
-    try {
-      return await operation(lockId);
-    } finally {
-      await releaseSharedProtocolFileLock(lockId, traceEnabled);
-    }
-  });
+  return await operation();
 }
 
 async function readAllReservationsRaw(usedInFile = null, yearFilter = null) {
@@ -800,218 +1214,28 @@ function createStorageMiddleware() {
         return;
       }
 
-      // Endpoints de Reserva e Confirmação Centralizada de Protocolo (Concorrência Multiusuário)
+      // Server-Sent Events (SSE) para Notificações em Tempo Real (< 50ms)
+      if (pathname === '/events' || pathname === '/api/storage/events') {
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream; charset=utf-8',
+          'Cache-Control': 'no-cache, no-transform',
+          'Connection': 'keep-alive',
+          'Access-Control-Allow-Origin': '*'
+        });
+        res.write(': sse connected\n\n');
+        sseClients.add(res);
+        req.on('close', () => {
+          sseClients.delete(res);
+        });
+        return;
+      }
+
+      // Endpoints de Reserva e Confirmação Centralizada de Protocolo (Concorrência Multiusuário Instantânea)
       if (pathname === '/protocol/reserve' || pathname === '/api/storage/protocol/reserve') {
-        const tReq0 = performance.now();
         const bodyBuf = await readRawBody(req);
         let payload = {};
         try { payload = JSON.parse(bodyBuf.toString('utf8')); } catch {}
-        const user = String(payload.user || payload.usuario || 'Sistema').trim();
-        const unit = String(payload.unit || '').trim();
-        const year = parseInt(payload.year, 10) || new Date().getFullYear();
-        const clientId = String(payload.clientId || payload.sessionId || '').trim();
-        const preferredReservationId = String(payload.reservationId || '').trim();
-        const preferredProtocol = String(payload.preferredProtocol || '').trim().toUpperCase();
-        const previousProtocol = String(payload.previousProtocol || '').trim().toUpperCase();
-        const forceNew = Boolean(payload.forceNew);
-        const traceEnabled = Boolean(payload.trace);
-        const existingKnownMax = parseInt(payload.existingMax || 0, 10) || 0;
-        const clientKnownNumbers = Array.isArray(payload.knownNumbers)
-          ? payload.knownNumbers.map(n => parseInt(n, 10)).filter(n => !isNaN(n) && n > 0)
-          : [];
-
-        logProtocolStep(traceEnabled, 'solicitação iniciada', {
-          usuario: user,
-          sessionId: clientId,
-          forceNew,
-          preferredProtocol: preferredProtocol || null
-        });
-
-        const reservation = await withProtocolControlLock(user, clientId, async () => {
-          const tState0 = performance.now();
-          const now = Date.now();
-          const usedInFile = await extractExistingNumbersFromOcorrencias(year);
-          let allList = await readAllReservationsRaw(usedInFile, year);
-
-          const utilizedNumbers = new Set(
-            allList
-              .filter(r => r.year === year && (r.status === 'UTILIZADO' || r.status === 'CONFIRMADO' || r.confirmado === true))
-              .map(r => r.id_sequencial)
-              .filter(n => typeof n === 'number' && n > 0)
-          );
-
-          logProtocolStep(traceEnabled, 'estado compartilhado carregado', {
-            ocorrenciasNoDisco: usedInFile.size,
-            reservasCarregadas: allList.length,
-            utilizadosConfirmados: utilizedNumbers.size,
-            tempoMs: +(performance.now() - tState0).toFixed(2)
-          });
-
-          // 1. Reutilização segura: APENAS para a mesma sessão/instância (mesmo clientId/sessionId) se a reserva continuar ativa e sem conflito
-          if (clientId && !forceNew) {
-            const existingClient = allList.find(r => {
-              if (r.year !== year || r.status !== 'RESERVADO' || r.expiresAt <= now) return false;
-              if (usedInFile.has(r.id_sequencial) || utilizedNumbers.has(r.id_sequencial)) return false;
-              const sameSession = r.clientId === clientId || r.sessionId === clientId;
-              if (!sameSession) return false;
-              if (preferredReservationId && r.reservationId === preferredReservationId) return true;
-              if (preferredProtocol && r.protocolo === preferredProtocol) return true;
-              return true;
-            });
-
-            if (existingClient) {
-              // Garante que nenhuma outra sessão ativa tem este mesmo número
-              const collisionWithOther = allList.some(
-                other =>
-                  other.reservationId !== existingClient.reservationId &&
-                  other.year === year &&
-                  other.id_sequencial === existingClient.id_sequencial &&
-                  (other.status === 'UTILIZADO' || other.status === 'CONFIRMADO' || (other.status === 'RESERVADO' && other.expiresAt > now))
-              );
-              if (!collisionWithOther) {
-                existingClient.expiresAt = now + RESERVATION_TTL_MS;
-                if (unit) existingClient.unit = unit;
-                if (user && user !== 'Sistema') {
-                  existingClient.usuario = user;
-                  existingClient.user = user;
-                }
-                logProtocolStep(traceEnabled, 'próximo número calculado', {
-                  modo: 'REUTILIZACAO_SESSAO_ATIVA',
-                  numeroProtocolo: existingClient.numeroProtocolo,
-                  id_sequencial: existingClient.id_sequencial
-                });
-                logProtocolStep(traceEnabled, 'reservationId criado', {
-                  reservationId: existingClient.reservationId,
-                  reutilizado: true
-                });
-                const verifiedExisting = await writeReservations(allList);
-                logProtocolStep(traceEnabled, 'reserva persistida', {
-                  numeroProtocolo: existingClient.numeroProtocolo,
-                  reservationId: existingClient.reservationId
-                });
-                const confirmedExisting = verifiedExisting.find(
-                  r => (r.reservationId === existingClient.reservationId || r.id_reserva === existingClient.reservationId) &&
-                       (r.protocolo === existingClient.protocolo || r.numeroProtocolo === existingClient.numeroProtocolo)
-                );
-                if (!confirmedExisting) {
-                  throw new Error('Falha ao confirmar persistência da reserva ativa da sessão.');
-                }
-                logProtocolStep(traceEnabled, 'persistência confirmada', {
-                  numeroProtocolo: confirmedExisting.numeroProtocolo || confirmedExisting.protocolo,
-                  reservationId: confirmedExisting.reservationId || confirmedExisting.id_reserva,
-                  tempoTotalMs: +(performance.now() - tReq0).toFixed(2)
-                });
-                return { ...normalizeReservationItem(confirmedExisting, now, usedInFile), reused: true };
-              }
-            }
-          }
-
-          // Se forceNew foi solicitado para este clientId, cancela reservas pendentes anteriores desta mesma sessão que não foram gravadas no CSV
-          if (clientId && (forceNew || previousProtocol)) {
-            for (const r of allList) {
-              const sameSess = r.clientId === clientId || r.sessionId === clientId;
-              const matchesPrev = !previousProtocol || r.protocolo === previousProtocol || r.numeroProtocolo === previousProtocol;
-              if (sameSess && r.year === year && r.status === 'RESERVADO' && matchesPrev && !usedInFile.has(r.id_sequencial)) {
-                r.status = 'CANCELADO';
-                r.expiresAt = now - 1;
-              }
-            }
-          }
-
-          const activeReservedNums = new Set(
-            allList
-              .filter(r => r.year === year && r.status === 'RESERVADO' && r.expiresAt > now)
-              .map(r => r.id_sequencial)
-              .filter(n => typeof n === 'number' && n > 0)
-          );
-
-          const counterMax = (usedInFile.size > 0 || utilizedNumbers.size > 0)
-            ? await readProtocolCounter(year)
-            : 0;
-
-          let maxKnown = Math.max(counterMax, existingKnownMax, ...clientKnownNumbers);
-          for (const num of usedInFile) {
-            if (num > maxKnown) maxKnown = num;
-          }
-          for (const num of utilizedNumbers) {
-            if (num > maxKnown) maxKnown = num;
-          }
-          for (const num of activeReservedNums) {
-            if (num > maxKnown) maxKnown = num;
-          }
-
-          let candidate = Math.max(1, maxKnown + 1);
-          while (
-            usedInFile.has(candidate) ||
-            utilizedNumbers.has(candidate) ||
-            activeReservedNums.has(candidate)
-          ) {
-            candidate++;
-          }
-
-          const proto = `OC-${year}-${String(candidate).padStart(6, '0')}`;
-          logProtocolStep(traceEnabled, 'próximo número calculado', {
-            modo: 'NOVA_RESERVA_ATOMICA',
-            numeroProtocolo: proto,
-            id_sequencial: candidate,
-            maxAnterior: maxKnown
-          });
-
-          const reservationId = crypto.randomUUID();
-          const effectiveSessionId = clientId || reservationId;
-          const isoNow = new Date(now).toISOString();
-
-          logProtocolStep(traceEnabled, 'reservationId criado', {
-            reservationId,
-            sessionId: effectiveSessionId,
-            numeroProtocolo: proto
-          });
-
-          const item = {
-            id_reserva: reservationId,
-            reservationId,
-            numeroProtocolo: proto,
-            protocolo: proto,
-            id_sequencial: candidate,
-            usuario: user,
-            user,
-            sessionId: effectiveSessionId,
-            clientId: effectiveSessionId,
-            sessao: effectiveSessionId,
-            id_interno: null,
-            unit,
-            year,
-            dataHoraReserva: isoNow,
-            data_hora: isoNow,
-            createdAt: now,
-            expiresAt: now + RESERVATION_TTL_MS,
-            status: 'RESERVADO',
-            confirmado: false,
-            dataHoraUtilizacao: null,
-            confirmedAt: null
-          };
-          allList.push(item);
-          const verifiedList = await writeReservations(allList);
-          logProtocolStep(traceEnabled, 'reserva persistida', {
-            numeroProtocolo: proto,
-            reservationId
-          });
-
-          const confirmedSaved = verifiedList.find(
-            r => (r.reservationId === reservationId || r.id_reserva === reservationId) &&
-                 (r.protocolo === proto || r.numeroProtocolo === proto)
-          );
-          if (!confirmedSaved) {
-            throw new Error('Falha ao confirmar a gravação da reserva de protocolo no armazenamento compartilhado.');
-          }
-          logProtocolStep(traceEnabled, 'persistência confirmada', {
-            numeroProtocolo: proto,
-            reservationId,
-            tempoTotalMs: +(performance.now() - tReq0).toFixed(2)
-          });
-          return { ...normalizeReservationItem(confirmedSaved, now, usedInFile), reused: false };
-        }, traceEnabled);
-
+        const reservation = await reserveProtocolAtomic(payload);
         res.statusCode = 200;
         res.setHeader('Content-Type', 'application/json; charset=utf-8');
         res.end(JSON.stringify({ ok: true, ...reservation, reservation }));
@@ -1022,213 +1246,7 @@ function createStorageMiddleware() {
         const bodyBuf = await readRawBody(req);
         let payload = {};
         try { payload = JSON.parse(bodyBuf.toString('utf8')); } catch {}
-        const proto = String(payload.protocolo || payload.numeroProtocolo || '').trim().toUpperCase();
-        const user = String(payload.user || payload.usuario || 'Sistema').trim();
-        const unit = String(payload.unit || '').trim();
-        const clientId = String(payload.clientId || payload.sessionId || '').trim();
-        const reservationId = String(payload.reservationId || '').trim();
-        const idInterno = String(payload.id_interno || '').trim();
-        const markUtilized = Boolean(payload.markUtilized);
-        const autoResolve = payload.autoResolve !== false;
-        const traceEnabled = Boolean(payload.trace);
-        const yearMatch = /^OC-(\d{4})-(\d+)$/i.exec(proto);
-        const year = yearMatch ? parseInt(yearMatch[1], 10) : (parseInt(payload.year, 10) || new Date().getFullYear());
-        const seqNum = yearMatch ? parseInt(yearMatch[2], 10) : 0;
-
-        const result = await withProtocolControlLock(user, clientId, async () => {
-          const now = Date.now();
-          const usedInFile = await extractExistingNumbersFromOcorrencias(year);
-          let allList = await readAllReservationsRaw(usedInFile, year);
-
-          const alreadyInFile = seqNum > 0 && usedInFile.has(seqNum);
-          // Procura reservas para este protocolo
-          const matchingList = allList.filter(r => String(r.protocolo || r.numeroProtocolo || '').toUpperCase() === proto);
-          const ownRes = matchingList.find(r =>
-            (reservationId && r.reservationId === reservationId) ||
-            (clientId && (r.clientId === clientId || r.sessionId === clientId))
-          );
-          const matchingRes = ownRes || matchingList[0] || null;
-
-          const utilizedByOther = matchingList.some(r =>
-            (r.status === 'UTILIZADO' || r.status === 'CONFIRMADO' || r.confirmado === true) &&
-            ((idInterno && r.id_interno && r.id_interno !== idInterno) ||
-             (!idInterno && clientId && r.clientId && r.clientId !== clientId) ||
-             (reservationId && r.reservationId && r.reservationId !== reservationId))
-          );
-
-          const reservedByOther = matchingList.some(r =>
-            r.status === 'RESERVADO' &&
-            r.expiresAt > now &&
-            ((clientId && r.clientId && r.clientId !== clientId) ||
-             (reservationId && r.reservationId && r.reservationId !== reservationId && (!clientId || r.clientId !== clientId)))
-          );
-
-          const hasConflict = !proto || seqNum <= 0 || alreadyInFile || utilizedByOther || reservedByOther;
-
-          if (hasConflict) {
-            if (!autoResolve) {
-              return {
-                ok: false,
-                conflict: true,
-                message: `O protocolo ${proto || 'informado'} já foi utilizado ou pertence a outra reserva ativa.`
-              };
-            }
-
-            const utilizedNumbers = new Set(
-              allList
-                .filter(r => r.year === year && (r.status === 'UTILIZADO' || r.status === 'CONFIRMADO' || r.confirmado === true))
-                .map(r => r.id_sequencial)
-                .filter(n => typeof n === 'number' && n > 0)
-            );
-            const activeReservedNums = new Set(
-              allList
-                .filter(r => r.year === year && r.status === 'RESERVADO' && r.expiresAt > now)
-                .map(r => r.id_sequencial)
-                .filter(n => typeof n === 'number' && n > 0)
-            );
-            const counterMax = (usedInFile.size > 0 || utilizedNumbers.size > 0)
-              ? await readProtocolCounter(year)
-              : 0;
-            let maxKnown = counterMax;
-            for (const n of usedInFile) if (n > maxKnown) maxKnown = n;
-            for (const n of utilizedNumbers) if (n > maxKnown) maxKnown = n;
-            for (const n of activeReservedNums) if (n > maxKnown) maxKnown = n;
-
-            let candidate = Math.max(1, maxKnown + 1);
-            while (
-              usedInFile.has(candidate) ||
-              utilizedNumbers.has(candidate) ||
-              activeReservedNums.has(candidate)
-            ) {
-              candidate++;
-            }
-
-            const newProto = `OC-${year}-${String(candidate).padStart(6, '0')}`;
-            const newResId = crypto.randomUUID();
-            const effectiveSessionId = clientId || newResId;
-            const isoNow = new Date(now).toISOString();
-            const newItem = {
-              id_reserva: newResId,
-              reservationId: newResId,
-              numeroProtocolo: newProto,
-              protocolo: newProto,
-              id_sequencial: candidate,
-              usuario: user,
-              user,
-              sessionId: effectiveSessionId,
-              clientId: effectiveSessionId,
-              sessao: effectiveSessionId,
-              id_interno: idInterno || null,
-              unit,
-              year,
-              dataHoraReserva: isoNow,
-              data_hora: isoNow,
-              createdAt: now,
-              expiresAt: now + RESERVATION_TTL_MS,
-              status: markUtilized ? 'UTILIZADO' : 'RESERVADO',
-              confirmado: markUtilized,
-              dataHoraUtilizacao: markUtilized ? isoNow : null,
-              confirmedAt: markUtilized ? isoNow : null
-            };
-            if (markUtilized) {
-              await writeProtocolCounter(year, candidate);
-            }
-            allList.push(newItem);
-            await writeReservations(allList);
-            return {
-              ok: true,
-              conflict: true,
-              conflictResolved: true,
-              reallocated: true,
-              previousProtocol: proto,
-              protocolo: newProto,
-              numeroProtocolo: newProto,
-              id_sequencial: candidate,
-              reservationId: newResId,
-              reservation: newItem
-            };
-          }
-
-          const isoNow = new Date(now).toISOString();
-          if (matchingRes) {
-            const needsWrite = markUtilized ||
-              matchingRes.status !== 'RESERVADO' ||
-              (matchingRes.expiresAt - now <= 60000) ||
-              Boolean(idInterno && matchingRes.id_interno !== idInterno);
-
-            matchingRes.expiresAt = now + RESERVATION_TTL_MS;
-            if (idInterno) matchingRes.id_interno = idInterno;
-            if (clientId) {
-              matchingRes.clientId = clientId;
-              matchingRes.sessionId = clientId;
-              matchingRes.sessao = clientId;
-            }
-            if (markUtilized) {
-              matchingRes.status = 'UTILIZADO';
-              matchingRes.confirmado = true;
-              matchingRes.dataHoraUtilizacao = isoNow;
-              matchingRes.confirmedAt = isoNow;
-              await writeProtocolCounter(year, seqNum);
-            }
-            if (needsWrite) {
-              await writeReservations(allList);
-            }
-            return {
-              ok: true,
-              conflict: false,
-              conflictResolved: false,
-              reallocated: false,
-              protocolo: matchingRes.protocolo,
-              numeroProtocolo: matchingRes.numeroProtocolo || matchingRes.protocolo,
-              id_sequencial: matchingRes.id_sequencial,
-              reservationId: matchingRes.reservationId,
-              reservation: matchingRes
-            };
-          }
-
-          const newResId = reservationId || crypto.randomUUID();
-          const effectiveSessionId = clientId || newResId;
-          const createdItem = {
-            id_reserva: newResId,
-            reservationId: newResId,
-            numeroProtocolo: proto,
-            protocolo: proto,
-            id_sequencial: seqNum,
-            usuario: user,
-            user,
-            sessionId: effectiveSessionId,
-            clientId: effectiveSessionId,
-            sessao: effectiveSessionId,
-            id_interno: idInterno || null,
-            unit,
-            year,
-            dataHoraReserva: isoNow,
-            data_hora: isoNow,
-            createdAt: now,
-            expiresAt: now + RESERVATION_TTL_MS,
-            status: markUtilized ? 'UTILIZADO' : 'RESERVADO',
-            confirmado: markUtilized,
-            dataHoraUtilizacao: markUtilized ? isoNow : null,
-            confirmedAt: markUtilized ? isoNow : null
-          };
-          if (markUtilized) {
-            await writeProtocolCounter(year, seqNum);
-          }
-          allList.push(createdItem);
-          await writeReservations(allList);
-          return {
-            ok: true,
-            conflict: false,
-            conflictResolved: false,
-            reallocated: false,
-            protocolo: proto,
-            numeroProtocolo: proto,
-            id_sequencial: seqNum,
-            reservationId: newResId,
-            reservation: createdItem
-          };
-        }, traceEnabled);
-
+        const result = await confirmProtocolAtomic(payload);
         res.statusCode = result.ok ? 200 : 409;
         res.setHeader('Content-Type', 'application/json; charset=utf-8');
         res.end(JSON.stringify(result));
@@ -1239,50 +1257,10 @@ function createStorageMiddleware() {
         const bodyBuf = await readRawBody(req);
         let payload = {};
         try { payload = JSON.parse(bodyBuf.toString('utf8')); } catch {}
-        const proto = String(payload.protocolo || payload.numeroProtocolo || '').trim().toUpperCase();
-        const confirmedUse = Boolean(payload.confirmed || payload.utilized);
-        const clientId = String(payload.clientId || payload.sessionId || '').trim();
-        const reservationId = String(payload.reservationId || '').trim();
-        const idInterno = String(payload.id_interno || '').trim();
-
-        await withProtocolControlLock(payload.user || 'Sistema', clientId, async () => {
-          const seqMatch = /^OC-(\d{4})-(\d+)$/i.exec(proto);
-          const year = seqMatch ? parseInt(seqMatch[1], 10) : new Date().getFullYear();
-          const seqNum = seqMatch ? parseInt(seqMatch[2], 10) : 0;
-          const usedInFile = await extractExistingNumbersFromOcorrencias(year);
-          let allList = await readAllReservationsRaw(usedInFile, year);
-
-          if (proto) {
-            const isActuallySaved = confirmedUse || (seqNum > 0 && usedInFile.has(seqNum));
-            const isoNow = new Date().toISOString();
-
-            allList = allList.filter(r => {
-              const rProto = String(r.protocolo || r.numeroProtocolo || '').toUpperCase();
-              if (rProto !== proto) return true;
-              if (isActuallySaved || r.status === 'UTILIZADO' || r.status === 'CONFIRMADO' || r.confirmado) {
-                r.status = 'UTILIZADO';
-                r.confirmado = true;
-                r.dataHoraUtilizacao = r.dataHoraUtilizacao || r.confirmedAt || isoNow;
-                r.confirmedAt = r.dataHoraUtilizacao;
-                if (idInterno) r.id_interno = idInterno;
-                return true;
-              }
-              // Só permite cancelar reserva que pertence à mesma sessão/reservationId (ou sem dono)
-              if (reservationId && r.reservationId && r.reservationId !== reservationId) return true;
-              if (clientId && r.clientId && r.clientId !== clientId) return true;
-              return false;
-            });
-
-            if (isActuallySaved && seqNum > 0) {
-              await writeProtocolCounter(year, seqNum);
-            }
-          }
-          await writeReservations(allList);
-        });
-
+        const result = await releaseProtocolAtomic(payload);
         res.statusCode = 200;
         res.setHeader('Content-Type', 'application/json; charset=utf-8');
-        res.end(JSON.stringify({ ok: true, released: proto }));
+        res.end(JSON.stringify(result));
         return;
       }
 
@@ -1290,48 +1268,17 @@ function createStorageMiddleware() {
         const bodyBuf = await readRawBody(req);
         let payload = {};
         try { payload = JSON.parse(bodyBuf.toString('utf8')); } catch {}
-        const proto = String(payload.protocolo || payload.numeroProtocolo || '').trim().toUpperCase();
-        const clientId = String(payload.clientId || payload.sessionId || '').trim();
-        const reservationId = String(payload.reservationId || '').trim();
-        const seqMatch = /^OC-(\d{4})-(\d+)$/i.exec(proto);
-        const year = seqMatch ? parseInt(seqMatch[1], 10) : new Date().getFullYear();
-        const seqNum = seqMatch ? parseInt(seqMatch[2], 10) : 0;
-
-        const renewResult = await withProtocolControlLock(payload.user || 'Sistema', clientId, async () => {
-          const usedInFile = await extractExistingNumbersFromOcorrencias(year);
-          let allList = await readAllReservationsRaw(usedInFile, year);
-
-          if (seqNum > 0 && usedInFile.has(seqNum)) {
-            return { ok: false, conflict: true, reason: 'ALREADY_IN_CSV' };
-          }
-
-          const target = allList.find(r => {
-            const rProto = String(r.protocolo || r.numeroProtocolo || '').toUpperCase();
-            if (rProto !== proto) return false;
-            if (reservationId && r.reservationId === reservationId) return true;
-            if (clientId && (r.clientId === clientId || r.sessionId === clientId)) return true;
-            return !clientId && !reservationId;
-          });
-
-          if (!target || target.status !== 'RESERVADO') {
-            return { ok: false, conflict: true, reason: 'RESERVATION_NOT_ACTIVE' };
-          }
-
-          target.expiresAt = Date.now() + RESERVATION_TTL_MS;
-          await writeReservations(allList);
-          return { ok: true, conflict: false, expiresAt: target.expiresAt, reservation: target };
-        });
-
-        res.statusCode = 200;
+        const result = await renewProtocolAtomic(payload);
+        res.statusCode = result.ok ? 200 : 409;
         res.setHeader('Content-Type', 'application/json; charset=utf-8');
-        res.end(JSON.stringify(renewResult));
+        res.end(JSON.stringify(result));
         return;
       }
 
       if (pathname === '/protocol/list' || pathname === '/api/storage/protocol/list') {
         const year = parseInt(url.searchParams.get('year') || '', 10) || new Date().getFullYear();
-        const usedInFile = await extractExistingNumbersFromOcorrencias(year);
-        const list = await readAllReservationsRaw(usedInFile, year);
+        await ensureProtocolEngineInitialized(year);
+        const list = Array.from(protocolEngine.reservations.values()).filter(r => Number(r.year) === year);
         res.statusCode = 200;
         res.setHeader('Content-Type', 'application/json; charset=utf-8');
         res.end(JSON.stringify({ ok: true, reservations: list }));
@@ -1568,6 +1515,15 @@ function createStorageMiddleware() {
           }).catch(err => logProtocolError('confirmOnPutFile', err, { protoToConfirm }));
         }
 
+        broadcastStorageEvent('storage_mutation', {
+          action: 'put',
+          fileName: baseNameLower,
+          isOccurrence: isOccTarget,
+          mtimeMs: stat.mtimeMs,
+          size: stat.size,
+          protocol: releasedHeader || null
+        });
+
         res.statusCode = 200;
         res.setHeader('Content-Type', 'application/json; charset=utf-8');
         res.setHeader('X-File-Size', String(stat.size));
@@ -1625,6 +1581,14 @@ function createStorageMiddleware() {
           }).catch(err => logProtocolError('confirmOnAppend', err, { protoUpper }));
         }
 
+        broadcastStorageEvent('storage_mutation', {
+          action: 'append',
+          fileName: path.basename(target).toLowerCase(),
+          mtimeMs: stat.mtimeMs,
+          size: stat.size,
+          protocol: protoToRelease || null
+        });
+
         res.statusCode = 200;
         res.setHeader('Content-Type', 'application/json; charset=utf-8');
         res.setHeader('X-File-Size', String(stat.size));
@@ -1650,6 +1614,10 @@ function createStorageMiddleware() {
           if (baseNameLower === 'ocorrencias.csv' || isIndividualOccurrenceFile(baseNameLower)) {
             invalidateOcorrenciasProtocolCache();
           }
+        });
+        broadcastStorageEvent('storage_mutation', {
+          action: 'delete',
+          fileName: baseNameLower
         });
         res.statusCode = 200;
         res.setHeader('Content-Type', 'application/json; charset=utf-8');

@@ -1819,11 +1819,29 @@ async function smartPollSync(){
           return !alreadyPending;
         });
 
+        const newlyValidatedFromPending=(normalizedFresh||[]).filter(item=>{
+          const kInt=String(item.id_interno||'').trim().toUpperCase();
+          const kOcc=String(item.id_ocorrencia||'').trim().toUpperCase();
+          const kProto=String(item.numero_protocolo||'').trim().toUpperCase();
+          const wasPending=(kInt&&prevPendingKeys.has(kInt))||(kOcc&&prevPendingKeys.has(kOcc))||(kProto&&prevPendingKeys.has(kProto));
+          return wasPending&&isValidatedOccurrence(item);
+        });
+
         if(S.user&&newValidated.length>0){
-          showToast('🔔 Nova ocorrência registrada! Lista atualizada.','success','Atualização em Tempo Real');
+          const pName=newValidated[0]?.numero_protocolo?` (${newValidated[0].numero_protocolo})`:'';
+          showToast(`🔔 Nova ocorrência${pName} registrada no sistema!`,'success','Atualização em Tempo Real');
         }
-        if(S.user&&newPending.length>0&&canValidateOccurrence(S.user)){
-          showToast('🔔 Nova ocorrência aguardando validação!','success','Fila de Validação');
+        if(S.user&&newPending.length>0){
+          const pName=newPending[0]?.numero_protocolo?` (${newPending[0].numero_protocolo})`:'';
+          if(canValidateOccurrence(S.user)){
+            showToast(`🔔 Nova ocorrência${pName} aguardando sua validação!`,'warning','Fila de Validação');
+          }else{
+            showToast(`🔔 Ocorrência${pName} enviada para a fila de validação.`,'info','Ocorrência Registrada');
+          }
+        }
+        if(S.user&&newlyValidatedFromPending.length>0){
+          const pName=newlyValidatedFromPending[0]?.numero_protocolo?` ${newlyValidatedFromPending[0].numero_protocolo}`:'';
+          showToast(`✅ Ocorrência${pName} validada pelo supervisor!`,'success','Validação Concluída');
         }
 
         const occChanged=(normalizedFresh.length!==(S.occ||[]).length)||
@@ -1944,16 +1962,60 @@ async function smartPollSync(){
     _isPollingActive=false;
   }
 }
+let _sseSource=null;
+let _sseReconnectTimeout=null;
+
+function setupRealtimeEventsListener(){
+  if(typeof window==='undefined'||typeof EventSource==='undefined')return;
+  if(_sseSource){
+    try{_sseSource.close();}catch{}
+    _sseSource=null;
+  }
+  if(_sseReconnectTimeout)clearTimeout(_sseReconnectTimeout);
+
+  try{
+    _sseSource=new EventSource('/api/storage/events');
+    _sseSource.onopen=()=>{
+      console.debug('[SSE] Conexão em tempo real estabelecida com o servidor SIGESP.');
+    };
+    _sseSource.onmessage=(event)=>{
+      if(!event?.data)return;
+      try{
+        const payload=JSON.parse(event.data);
+        if(payload?.type==='storage_mutation'||payload?.type==='protocol_confirmed'||payload?.type==='protocol_reserved'){
+          smartPollSync({force:true,immediate:true}).catch(()=>{});
+        }
+      }catch{}
+    };
+    _sseSource.onerror=()=>{
+      try{_sseSource.close();}catch{}
+      _sseSource=null;
+      _sseReconnectTimeout=setTimeout(setupRealtimeEventsListener,2500);
+    };
+  }catch(err){
+    console.debug('[SSE] Fallback para polling regular:',err);
+  }
+}
+
 function startBackgroundPolling(){
   if(_pollIntervalId)clearInterval(_pollIntervalId);
+  setupRealtimeEventsListener();
   _pollIntervalId=setInterval(()=>{
     smartPollSync().catch(()=>{});
-  },5000);
+  },2000);
 }
 function stopBackgroundPolling(){
   if(_pollIntervalId){
     clearInterval(_pollIntervalId);
     _pollIntervalId=null;
+  }
+  if(_sseSource){
+    try{_sseSource.close();}catch{}
+    _sseSource=null;
+  }
+  if(_sseReconnectTimeout){
+    clearTimeout(_sseReconnectTimeout);
+    _sseReconnectTimeout=null;
   }
 }
 async function handleManualRefresh(){
@@ -2648,14 +2710,32 @@ async function saveOcc(ev){
   let savedPhotoPaths=[];
   try{
     const isEditCandidate=Boolean(form?.elements?.['id_ocorrencia']?.value||S.editing?.id_ocorrencia);
-    if(!isEditCandidate&&_openOccRegPromise){
-      // Não bloqueia mais que 350ms na promessa de reserva em background
-      try{
-        await Promise.race([
-          _openOccRegPromise,
-          new Promise(r=>setTimeout(r,350))
-        ]);
-      }catch{}
+    if(!isEditCandidate){
+      if(_openOccRegPromise){
+        try{
+          await Promise.race([
+            _openOccRegPromise,
+            new Promise(r=>setTimeout(r,1500))
+          ]);
+        }catch{}
+      }
+      if(!S.editing?.numero_protocolo||!S.editing?._reservationConfirmed){
+        try{
+          const directRes=await window.StorageService?.reserveProtocol(S.user?.login||'Operador',form.elements['unidade']?.value||S.editing?.unidade||'',{
+            clientId:getTabSessionClientId(),
+            forceNew:true
+          });
+          if(directRes?.protocolo){
+            if(!S.editing)S.editing={};
+            S.editing.numero_protocolo=directRes.protocolo;
+            S.editing._reservedProtocol=directRes.protocolo;
+            S.editing._reservationId=directRes.reservationId||directRes.id_reserva||'';
+            S.editing._reservationConfirmed=true;
+          }
+        }catch(dirErr){
+          console.warn('[saveOcc] Falha na alocação direta de protocolo:',dirErr);
+        }
+      }
     }
 
     const d=captureOccurrenceDraft(form)||{},editingBeforeSubmit={...(S.editing||{})};
@@ -3409,12 +3489,6 @@ async function ensureActiveProtocolReservation(options={}){
 
   if(!existingRes||forceNew){
     S.reservingProtocol=true;
-    if(S.editing&&!S.editing.id_ocorrencia&&!S.editing.numero_protocolo){
-      const quickProto=gerarProximoId(S.occ,S.pending).protocolo;
-      S.editing.numero_protocolo=quickProto;
-      S.editing._reservedProtocol=quickProto;
-      S.editing._reservationConfirmed=false;
-    }
     if(S.page==='occ-register')render();
   }
 
@@ -3491,25 +3565,30 @@ async function openOccurrenceRegistration(options={}){
   S.successPopup=null;
   S.modal=null;
   S.errorPopup=null;
-  const instantProto=storedRes?.numeroProtocolo||gerarProximoId(S.occ,S.pending).protocolo;
+
+  // Se já temos uma reserva local confirmada e válida, utilize-a
+  let activeProto=storedRes?.numeroProtocolo||'';
+  let isConfirmed=Boolean(storedRes?.numeroProtocolo);
+
   S.editing={
     ...draftToRestore,
-    numero_protocolo:storedRes?.numeroProtocolo||instantProto,
-    _reservedProtocol:storedRes?.numeroProtocolo||instantProto,
+    numero_protocolo:activeProto,
+    _reservedProtocol:activeProto,
     _reservationId:storedRes?.reservationId||'',
-    _reservationConfirmed:Boolean(storedRes?.numeroProtocolo),
+    _reservationConfirmed:isConfirmed,
     _clientId:clientId
   };
-  // Disponibiliza o protocolo e libera o formulário e botões imediatamente (0 ms)
-  S.reservingProtocol=false;
+  S.reservingProtocol=!isConfirmed;
   S.submitting=false;
   S.page='occ-register';
   S.activeMenu='ocorrencias';
   S.message='';
   render();
 
-  // Aciona a confirmação/reserva centralizada em background sem travar a digitação do operador
-  void ensureActiveProtocolReservation({forceNew,preserveForm:true});
+  // Reserva atômica no servidor/disco central: executa e atualiza o protocolo real imediatamente
+  ensureActiveProtocolReservation({forceNew,preserveForm:true}).catch(err=>{
+    console.warn('[SIGESP] Falha na reserva atômica:',err);
+  });
 }
 async function editOcc(id){if(hasProfile(S.user,'Operador')){denyOperatorAccess();return}try{const r=await findAuthorizedOccurrence(id);S.modal=null;S.successPopup=null;await loadImages(r);S.editing={...r};S.page='occ-register';S.activeMenu='ocorrencias';render()}catch(error){console.warn('Acesso negado à edição de ocorrência.',error);fail('Registro não encontrado ou sem autorização para acessá-lo.')}}
 async function viewOcc(id){try{const r=await findAuthorizedOccurrence(id);S.editing=null;await loadImages(r);S.modal={...r};render()}catch(error){console.warn('Acesso negado à visualização de ocorrência.',error);fail('Registro não encontrado ou sem autorização para acessá-lo.')}}
