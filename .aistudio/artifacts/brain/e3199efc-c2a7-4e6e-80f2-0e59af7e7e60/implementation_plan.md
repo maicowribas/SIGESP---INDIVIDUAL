@@ -1,88 +1,71 @@
-# Plano de Implementação: Login Case-Insensitive e Redesign Corporativo de Usuários
+# Plano de Correção: Sincronização em Tempo Real de Ocorrências Pendentes e Notificações de Validação
 
-Modernização da tela de Usuários com layout em cards/tabela inspirado no módulo de Chaves, abertura de formulário em modal popup com abas e autenticação com indiferença a maiúsculas/minúsculas no campo de login.
-
----
-
-### Decisões do Usuário & Requisitos Confirmados
-- **Login Case-Insensitive**: O login do usuário é autenticado de forma indiferente se digitado em maiúsculas ou minúsculas (`login.trim().toLowerCase()`), preservando o hash de senha PBKDF2/SHA-256 intacto.
-- **Formato da Tela de Usuários**: Grade de cards corporativos moderna com alternância dinâmica para visualização em tabela (idêntico à experiência de Chaves).
-- **Formulário de Criação/Edição**: Modal popup corporativo com abas (`Dados Pessoais & Acesso`, `Escopo & Lotação`, `Permissões & Segurança`), substituindo a coluna lateral fixa que comprimia a tabela.
+Correção e blindagem do pipeline de persistência, detecção de arquivos e sincronização em segundo plano (*smartPollSync*) para que ocorrências registradas por operadores emitam notificações instantâneas e apareçam de imediato na tela de "Validação de Ocorrências" da supervisão.
 
 ---
 
-## 1. Visão Geral & Conceito
+### Diagnóstico da Causa Raiz
 
-A tela de Usuários passará a seguir o mesmo padrão estético e de usabilidade de alta densidade inaugurado no módulo de Chaves:
-- **KPIs de Gestão de Acesso**: Acervo total de usuários, usuários ativos, usuários bloqueados e distribuição por perfil (Administradores, Supervisores, Operadores).
-- **Barra de Ferramentas & Filtros**: Busca em tempo real (nome, login, matrícula, e-mail), filtro por perfil, filtro por status (Ativo/Inativo) e alternador de visualização (`🗂️ Cards` / `📑 Tabela`).
-- **Cards de Usuário Corporativos**:
-  - Avatar gerado com as iniciais do nome e cor semântica do perfil.
-  - Indicador de status claro (Ativo / Inativo).
-  - Identificação de login com tipografia monoespelhada (`tabular-nums`).
-  - Lotação e escopo operacional (Supervisão e Unidades vinculadas).
-  - Botões de ação rápida organizados: `✏️ Editar`, `🔑 Alterar Senha`, `🔒/🔓 Alternar Status` e `🗑️ Remover`.
-- **Modal de Usuário em Abas**:
-  - Aba 1: Identificação (Nome completo, Login único, Status, Senha inicial se novo).
-  - Aba 2: Lotação Operacional (Supervisão responsável e Unidades autorizadas com seleção granular).
-  - Aba 3: Perfil de Acesso & Auditoria (Perfil com resumo das permissões corporativas associadas).
+1. **Invalidação Incompleta de Handles no Modo Pasta Nativa (`storageService.js`)**:
+   - Ao conectar a pasta compartilhada, `_scanAndIndexNativeDirectory(dir)` cria o mapa inicial `this._nativeFilesMap`.
+   - Quando um operador registra uma ocorrência, o arquivo individual (`ocorrencia_OC_2026_XXXXXX.csv`) é gravado em disco, porém o handle não era injetado em `this._nativeFilesMap` e o cache `this._nativeHandlesCache` não era descartado.
+   - Em sessões concorrentes (ex: aba do supervisor monitorando a mesma pasta), `_listNativeOccurrenceFileHandles` consultava apenas o `this._nativeFilesMap` antigo estático, ignorando novas ocorrências surgidas na pasta física de dados.
+   - Por conseguinte, `getFileStat('ocorrencias.csv')` calculava tamanho e mtime idênticos aos anteriores, fazendo `fetchFreshOccurrencesCsv({ onlyIfChanged: true })` retornar `null`.
+2. **Supressão do Ciclo de Notificações e Fila Pendente (`app.js`)**:
+   - Com `rawText === null`, o `smartPollSync` não identificava os registros em `newlyAdded`, nunca disparava o toast `🔔 Nova ocorrência aguardando validação!` e não atualizava `S.pending`.
+   - O módulo de validação (`pendingValidationPage`) dependia de um recarregamento forçado da página (F5) para indexar os arquivos recém-criados.
 
 ---
 
-## 2. Experiência do Usuário & Design Visual
+## 1. Visão Geral da Solução
+
+Garantir reatividade ponta-a-ponta entre o salvamento do operador e a tela do supervisor/administrador:
 
 ```
-┌────────────────────────────────────────────────────────────────────────┐
-│ Gestão de Usuários e Permissões                  [+ Novo Usuário]     │
-├────────────────────────────────────────────────────────────────────────┤
-│ [👥 Total: 12]  [🟢 Ativos: 11]  [🔒 Bloqueados: 1]  [🏢 Unidades: 8]  │
-├────────────────────────────────────────────────────────────────────────┤
-│ [🔍 Buscar usuário...] [Perfil: Todos ▼] [Status: Todos ▼] [🗂️ Cards|📑]│
-├────────────────────────────────────────────────────────────────────────┤
-│ ┌───────────────────────┐  ┌───────────────────────┐  ┌──────────────┐│
-│ │ 👤 Carlos Silva [Ativo]│  │ 👤 Marcos Rocha [Ativo]│  │ 👤 Ana Souza ││
-│ │ @carlos.silva · Admin │  │ @marcos.op · Operador │  │ @ana.sup     ││
-│ │ 📍 Matriz / 4 Unidades│  │ 📍 Portaria Principal │  │ 📍 Supervisão││
-│ │ [✏️ Editar] [🔑 Senha] │  │ [✏️ Editar] [🔑 Senha] │  │ [✏️ Editar]  ││
-│ └───────────────────────┘  └───────────────────────┘  └──────────────┘│
-└────────────────────────────────────────────────────────────────────────┘
+┌────────────────────────┐         Grava arquivo físico         ┌───────────────────────────────┐
+│ Operador (Sessão 1)    │ ───────────────────────────────────> │ Pasta de Dados (dados/)       │
+│ Registra ocorrência    │                                      │ ocorrencia_OC_2026_00000X.csv │
+└────────────────────────┘                                      └───────────────────────────────┘
+                                                                                │
+                                                                                │ Polling / Detecção ativa
+                                                                                ▼
+┌────────────────────────┐         Reatividade e Alerta         ┌───────────────────────────────┐
+│ Supervisor (Sessão 2)  │ <─────────────────────────────────── │ SmartPoll & StorageService    │
+│ • Notificação Toast 🔔 │                                      │ • Re-indexação com TTL curto  │
+│ • Linha na Validação   │                                      │ • Reconhecimento de novo hash │
+└────────────────────────┘                                      └───────────────────────────────┘
 ```
 
-- **Paleta de Cores**:
-  - Administrador: Roxo Corporativo (`#6366f1` / `#e0e7ff`).
-  - Supervisor: Azul Petróleo (`#0284c7` / `#e0f2fe`).
-  - Operador: Verde Esmeralda (`#059669` / `#ecfdf5`).
-  - Status Ativo: Verde militar suave com dot indicador.
-  - Status Inativo: Âmbar/Vermelho suave.
+---
+
+## 2. Decisões Técnicas e Arquitetura
+
+1. **Re-indexação Dinâmica e TTL no Storage Nativo (`storageService.js`)**:
+   - Atualizar `writeRawFile`: ao salvar qualquer arquivo de ocorrência (`isIndividualOccurrenceFileName`), atualizar imediatamente `this._nativeFilesMap.set(fileName, fh)` e zerar `this._nativeHandlesCache = null`, `_lastKnownBatchSig = ''` e `_rawFileCache.delete('ocorrencias.csv')`.
+   - Em `_listNativeOccurrenceFileHandles(dir)`: implementar expiração de cache (TTL de 2,5 segundos) ou opção `{ force: true }` para re-varrer `dir.entries()` ou `dir.values()`, garantindo que arquivos adicionados por outros operadores na pasta física de dados sejam detectados imediatamente no próximo ciclo de polling.
+   - Em `invalidateCache(fileName)`: garantir descarte completo de `this._nativeHandlesCache` e `_lastKnownBatchSig`.
+2. **Aperfeiçoamento da Detecção no `smartPollSync` (`app.js`)**:
+   - Na checagem de `fetchFreshRawCsv('ocorrencias.csv')`: ao detectar novas ocorrências pendentes (`newPending.length > 0`), disparar a notificação visual com prioridade para perfis autorizados (`canValidateOccurrence(S.user)`: Administrador, Supervisor, Líder):
+     ```javascript
+     showToast('🔔 Nova ocorrência aguardando validação!', 'success', 'Fila de Validação');
+     ```
+   - Atualizar reativamente `S.occ` e `S.pending = filteredPendingOccurrences()`.
+   - Se o supervisor já estiver na tela de Validação de Ocorrências (`S.page === 'occ-validation'`), acionar `render()` imediatamente sem fechar modais ou interromper a digitação.
+3. **Segurança e Escopo RBAC Preservados**:
+   - Manter as checagens rígidas de escopo por unidade (`canViewOccurrence`, `canAccessUnit`) e a integridade de criptografia AES-256-GCM em todos os envelopes de dados.
 
 ---
 
-## 3. Decisões Técnicas & Segurança (SecDevOps)
+## 3. Plano de Execução
 
-1. **Login Case-Insensitive**:
-   - Comparação normalizada: `user.login.trim().toLowerCase() === d.login.trim().toLowerCase()`.
-   - Na criação/validação de duplicidade de login: validação contra logins existentes com `toLowerCase()`, evitando conflitos onde `Admin` e `admin` coexistam.
-   - Preservação estrita dos hashes de senha PBKDF2 existentes.
-2. **Arquitetura de Estado & Reatividade**:
-   - Variáveis de estado `S.userViewMode = 'grid' | 'table'`, `S.userSearchQuery = ''`, `S.userProfileFilter = 'todos'`, `S.userStatusFilter = 'todos'`.
-   - Abertura de modal através de `S.userModal = { id_usuario, tab: 'geral', data: {...} }`, liberando 100% da largura útil da tela para os cards de usuários.
-3. **Controle de Acesso Baseado em Funções (RBAC)**:
-   - Mantém as regras já consolidadas: supervisores só gerenciam usuários de sua respectiva supervisão; administradores gerenciam escopo global; proibição de remover a si próprio ou o último administrador ativo.
-
----
-
-## 4. Plano de Execução
-
-1. **Autenticação**:
-   - Ajustar `login(ev)` em `app.js` para normalizar `d.login.trim().toLowerCase()`.
-   - Atualizar a verificação de duplicidade no salvamento de usuários em `saveUser`.
-2. **Componentes e Visualização de Usuários**:
-   - Implementar `usersPage()` com KPIs, toolbar (busca, filtros e alternador Cards/Tabela) e a grade `users-cards-grid`.
-   - Implementar o modal popup com abas `userEditModal()`.
-3. **Estilos em `style.css`**:
-   - Regras para `.user-card`, `.user-card-header`, `.user-avatar`, `.user-badge-role`, `.user-modal-tabs` e animações de transição.
-4. **Verificação & Testes**:
-   - Teste de login com maiúsculas/minúsculas.
-   - Teste de criação e edição via modal em abas.
-   - Teste de alternância entre Cards e Tabela.
-   - Compilação (`compile_applet`) e checagem de integridade sintática.
+1. **Atualizar `storageService.js`**:
+   - Implementar re-escaneamento resiliente com TTL em `_listNativeOccurrenceFileHandles`.
+   - Atualizar `writeRawFile` e `appendSingleRecord` para registrar novos file handles imediatamente e invalidar os caches de lote.
+   - Ajustar `fetchFreshOccurrencesCsv` para detectar adições e remoções de arquivos individuais.
+2. **Ajustar `app.js`**:
+   - Aprimorar o bloco de sincronização de ocorrências em `smartPollSync`, assegurando que `newlyAdded` com `isPendingOccurrence` dispare a notificação toast e atualize a tabela do módulo `occ-validation`.
+   - Assegurar que ao salvar uma ocorrência com perfil Operador, o status otimista e o registro persistido entrem diretamente em `S.pending` e reflitam no badge do menu.
+3. **Validação e Testes**:
+   - Simular criação de ocorrência por operador e verificar a recepção no supervisor.
+   - Testar detecção de novos arquivos adicionados diretamente na pasta física `dados/`.
+   - Executar `compile_applet` e `lint_applet` para confirmar ausência de erros e integridade do dev server.

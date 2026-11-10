@@ -1136,6 +1136,7 @@ const StorageService = (() => {
     getIndividualOccurrenceFileName,
 
     invalidateCache(fileName = null) {
+      this._nativeHandlesCache = null;
       if (fileName) {
         _rawFileCache.delete(fileName);
         if (fileName === 'ocorrencias.csv') {
@@ -1151,6 +1152,7 @@ const StorageService = (() => {
         _lastKnownBatchSig = '';
         _lastKnownBundleSig = '';
         _preloadedOccurrencesBatch = null;
+        _rawFileCache.delete('ocorrencias.csv');
       }
     },
 
@@ -1378,7 +1380,8 @@ const StorageService = (() => {
               if (fMtime > maxMtime) maxMtime = fMtime;
             }
           } catch {}
-          return { exists: hasAny, size: totalSize, mtimeMs: maxMtime };
+          const nativeSig = `${handles.length}:${maxMtime}:${totalSize}`;
+          return { exists: hasAny, size: totalSize, mtimeMs: maxMtime, sig: nativeSig };
         } catch {}
       }
 
@@ -1491,6 +1494,10 @@ const StorageService = (() => {
         if (info && typeof info.size === 'number' && info.size !== blob.size) {
           throw new Error(`Verificação de persistência falhou para ${fileName}: tamanho divergente.`);
         }
+        if (isIndividualOccurrenceFileName(fileName) || fileName === 'ocorrencias.csv') {
+          _rawFileCache.delete('ocorrencias.csv');
+          _lastKnownBatchSig = '';
+        }
         return {
           ok: true,
           size: info?.size ?? blob.size,
@@ -1542,6 +1549,14 @@ const StorageService = (() => {
         const verifyFile = await fh.getFile();
         if (strContent.length > 0 && verifyFile.size === 0) {
           throw new Error(`Confirmação de persistência falhou: ${fileName} ficou vazio após gravação.`);
+        }
+        if (this._nativeFilesMap) {
+          this._nativeFilesMap.set(fileName, fh);
+        }
+        this._nativeHandlesCache = null;
+        if (isIndividualOccurrenceFileName(fileName) || fileName === 'ocorrencias.csv') {
+          _rawFileCache.delete('ocorrencias.csv');
+          _lastKnownBatchSig = '';
         }
         if (options?.releasedProtocol && fileName === 'ocorrencias.csv') {
           await this._markNativeProtocolUtilized(options.releasedProtocol, options.id_interno || '').catch(err => {
@@ -1675,46 +1690,59 @@ const StorageService = (() => {
       return window.CryptoService.isEncryptedFile(content);
     },
 
-    async _listNativeOccurrenceFileHandles(dir) {
+    async _listNativeOccurrenceFileHandles(dir, options = {}) {
       if (!dir) return [];
       const now = Date.now();
-      if (this._nativeHandlesCache && this._nativeHandlesCache.dir === dir && now - this._nativeHandlesCache.ts < 5000) {
+      if (!options?.force && this._nativeHandlesCache && this._nativeHandlesCache.dir === dir && (now - this._nativeHandlesCache.ts < 2000)) {
         return this._nativeHandlesCache.handles;
       }
-      if (this._nativeFilesMap) {
-        const found = [];
+      const found = [];
+      let count = 0;
+      let scanned = false;
+      try {
+        if (typeof dir.entries === 'function') {
+          for await (const [name, handle] of dir.entries()) {
+            if (handle.kind === 'file') {
+              if (this._nativeFilesMap) {
+                this._nativeFilesMap.set(name, handle);
+              }
+              if (isIndividualOccurrenceFileName(name)) {
+                found.push({ name, handle });
+              }
+            }
+            if ((++count & 255) === 0) {
+              await new Promise(r => setTimeout(r, 0));
+            }
+          }
+          scanned = true;
+        } else if (typeof dir.values === 'function') {
+          for await (const handle of dir.values()) {
+            if (handle.kind === 'file') {
+              if (this._nativeFilesMap) {
+                this._nativeFilesMap.set(handle.name, handle);
+              }
+              if (isIndividualOccurrenceFileName(handle.name)) {
+                found.push({ name: handle.name, handle });
+              }
+            }
+            if ((++count & 255) === 0) {
+              await new Promise(r => setTimeout(r, 0));
+            }
+          }
+          scanned = true;
+        }
+      } catch (err) {
+        console.warn('[StorageService] Falha ao varrer diretório nativo para ocorrências:', err);
+      }
+
+      if (!scanned && this._nativeFilesMap) {
         for (const [name, handle] of this._nativeFilesMap.entries()) {
           if (isIndividualOccurrenceFileName(name)) {
             found.push({ name, handle });
           }
         }
-        found.sort((a, b) => a.name.localeCompare(b.name));
-        this._nativeHandlesCache = { dir, ts: Date.now(), handles: found };
-        return found;
       }
-      const found = [];
-      let count = 0;
-      try {
-        if (typeof dir.entries === 'function') {
-          for await (const [name, handle] of dir.entries()) {
-            if (handle.kind === 'file' && isIndividualOccurrenceFileName(name)) {
-              found.push({ name, handle });
-            }
-            if ((++count & 255) === 0) {
-              await new Promise(r => setTimeout(r, 0));
-            }
-          }
-        } else if (typeof dir.values === 'function') {
-          for await (const handle of dir.values()) {
-            if (handle.kind === 'file' && isIndividualOccurrenceFileName(handle.name)) {
-              found.push({ name: handle.name, handle });
-            }
-            if ((++count & 255) === 0) {
-              await new Promise(r => setTimeout(r, 0));
-            }
-          }
-        }
-      } catch {}
+
       found.sort((a, b) => a.name.localeCompare(b.name));
       this._nativeHandlesCache = { dir, ts: Date.now(), handles: found };
       return found;
@@ -1905,7 +1933,7 @@ const StorageService = (() => {
         }
 
         // MODO 2: Pasta Local Nativa (FileSystemDirectoryHandle)
-        const handles = await this._listNativeOccurrenceFileHandles(dir);
+        const handles = await this._listNativeOccurrenceFileHandles(dir, options);
         let legacyFile = null;
         try {
           const legFh = await dir.getFileHandle('ocorrencias.csv', { create: false });
@@ -2232,11 +2260,11 @@ const StorageService = (() => {
       const prevMeta = metaMap ? metaMap.get(fileName) : null;
       const stat = await this.getFileStat(fileName).catch(() => ({ exists: false, size: 0, mtimeMs: 0 }));
 
-      if (options?.onlyIfChanged && prevMeta) {
-        if (stat.sig && _lastKnownBatchSig && stat.sig === _lastKnownBatchSig) {
+      if (options?.onlyIfChanged && prevMeta && !options?.force) {
+        if (stat.sig && prevMeta.rawSig && stat.sig === prevMeta.rawSig && stat.size === prevMeta.size) {
           return null;
         }
-        if (stat.mtimeMs > 0 && Math.abs(stat.mtimeMs - prevMeta.mtimeMs) <= 2 && stat.size === prevMeta.size) {
+        if (!stat.sig && stat.mtimeMs > 0 && Math.abs(stat.mtimeMs - prevMeta.mtimeMs) <= 2 && stat.size === prevMeta.size) {
           return null;
         }
       }
@@ -2244,7 +2272,7 @@ const StorageService = (() => {
       const prevSig = _lastKnownBatchSig;
       const rows = await this._readOccurrencesBatchFromStorage({ force: true, optional: true });
       const cached = _rawFileCache.get(fileName);
-      if (options?.onlyIfChanged && prevSig && cached?.rawSig === prevSig) {
+      if (options?.onlyIfChanged && !options?.force && prevSig && cached?.rawSig && cached.rawSig === prevSig && cached.rawSig === prevMeta?.rawSig) {
         if (metaMap && cached) {
           metaMap.set(fileName, { mtimeMs: cached.mtimeMs, size: cached.size, rawSig: cached.rawSig });
         }

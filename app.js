@@ -1184,7 +1184,8 @@ if(hasProfile(user,'Supervisor')){
 const unit=unitForName(occ.unidade);
 const userSupId=effectiveSupervisionId(user);
 if(unit&&unit.id_supervisao&&unit.id_supervisao===userSupId)return true;
-if(occ.supervisao&&S.supervisions.some(s=>s.id_supervisao===userSupId&&s.nome===occ.supervisao))return true;
+if(occ.supervisao&&S.supervisions.some(s=>s.id_supervisao===userSupId&&(s.nome===occ.supervisao||s.id_supervisao===occ.supervisao)))return true;
+if(user.supervisao&&occ.supervisao&&(user.supervisao===occ.supervisao||user.supervisao_id===occ.supervisao))return true;
 return canAccessUnit(occ.unidade,user);
 }
 if(hasProfile(user,'Líder'))return canAccessUnit(occ.unidade,user);
@@ -1260,7 +1261,7 @@ async function load(forceReload=false,skipRender=false){
     }
   }
   S.occ=normOcc;
-  S.pending=S.occ.filter(isPendingOccurrence);
+  S.pending=filteredPendingOccurrences();
   S.keys=k;
   S.moves=m;
   S.audits=a;
@@ -1795,6 +1796,7 @@ async function smartPollSync(){
         const normalizedFresh=(freshOcc||[]).map((x,idx)=>normalizeOccurrenceRow(x,idx,freshOcc)).filter(Boolean);
 
         const prevOccKeys=new Set();
+        const prevPendingKeys=new Set((S.pending||[]).map(p=>String(p.id_interno||p.id_ocorrencia||p.numero_protocolo||'').trim().toUpperCase()).filter(Boolean));
         for(const x of (S.occ||[])){
           if(x.id_interno)prevOccKeys.add(String(x.id_interno).trim());
           if(x.id_ocorrencia)prevOccKeys.add(String(x.id_ocorrencia).trim());
@@ -1808,7 +1810,14 @@ async function smartPollSync(){
           return !exists;
         });
         const newValidated=newlyAdded.filter(isValidatedOccurrence);
-        const newPending=newlyAdded.filter(isPendingOccurrence);
+        const freshPending=(normalizedFresh||[]).filter(isPendingOccurrence);
+        const newPending=freshPending.filter(item=>{
+          const kInt=String(item.id_interno||'').trim().toUpperCase();
+          const kOcc=String(item.id_ocorrencia||'').trim().toUpperCase();
+          const kProto=String(item.numero_protocolo||'').trim().toUpperCase();
+          const alreadyPending=(kInt&&prevPendingKeys.has(kInt))||(kOcc&&prevPendingKeys.has(kOcc))||(kProto&&prevPendingKeys.has(kProto));
+          return !alreadyPending;
+        });
 
         if(S.user&&newValidated.length>0){
           showToast('🔔 Nova ocorrência registrada! Lista atualizada.','success','Atualização em Tempo Real');
@@ -1823,7 +1832,7 @@ async function smartPollSync(){
             return !old||old.id_ocorrencia!==item.id_ocorrencia||old.versao_registro!==item.versao_registro||old.status!==item.status||old.status_validacao!==item.status_validacao;
           });
 
-        if(occChanged||newlyAdded.length>0){
+        if(occChanged||newlyAdded.length>0||newPending.length>0){
           S.occ=normalizedFresh;
           S.pending=filteredPendingOccurrences();
           CSVService.buildEntry('ocorrencias.csv',normalizedFresh);
@@ -2704,7 +2713,7 @@ async function saveOcc(ev){
         S.occ=[optimisticRow,...S.occ];
       }
     }
-    S.pending=S.occ.filter(isPendingOccurrence);
+    S.pending=filteredPendingOccurrences();
     _occFilterMemo={rowsRef:null,query:'',result:[]};
     _histFilterMemo={rowsRef:null,filterKey:'',result:[]};
     _dashSeriesMemo={rowsRef:null,result:null};
@@ -2749,7 +2758,7 @@ async function saveOcc(ev){
               ?window.StorageService.consolidateVersionedRows([...(S.occ||[]),row])
               :[...(S.occ||[]),row];
             S.occ=consolidated.map((x,idx)=>normalizeOccurrenceRow(x,idx,consolidated)).filter(Boolean);
-            S.pending=S.occ.filter(isPendingOccurrence);
+            S.pending=filteredPendingOccurrences();
             if(typeof CSVService!=='undefined'){
               CSVService.buildEntry('ocorrencias.csv',S.occ);
             }
@@ -2902,7 +2911,7 @@ async function savePendingDraft(form){
 
   // 1. ATUALIZAÇÃO INSTANTÂNEA DA INTERFACE (0 ms)
   S.occ=S.occ.map(x=>(String(x.id_ocorrencia)===id||String(x.id_interno)===id)?updated:x);
-  S.pending=S.occ.filter(isPendingOccurrence);
+  S.pending=filteredPendingOccurrences();
   S.validationModal=null;
   cleanup();
   hideLoading();
@@ -3015,7 +3024,7 @@ async function validatePendingOcc(id,form=null){
   cleanup();
   hideLoading();
   S.occ=S.occ.map(x=>(String(x.id_ocorrencia)===normId||String(x.id_interno)===normId||String(x.numero_protocolo)===String(current.numero_protocolo))?updatedRow:x);
-  S.pending=S.occ.filter(isPendingOccurrence);
+  S.pending=filteredPendingOccurrences();
   _apuracaoFilterMemo={rowsRef:null,fKey:'',result:[]};
   _occFilterMemo={rowsRef:null,query:'',result:[]};
   _histFilterMemo={rowsRef:null,filterKey:'',result:[]};
@@ -3076,7 +3085,7 @@ async function deletePendingOcc(id){
   // Optimistic UI: Fecha o modal imediatamente e remove o registro da interface sem latência (0ms)
   S.deletePendingTarget=null;
   S.occ=(S.occ||[]).filter(x=>String(x.id_ocorrencia||'').trim()!==normId&&(!x.id_interno||String(x.id_interno).trim()!==normId)&&String(x.numero_protocolo||'').trim().toUpperCase()!==normId.toUpperCase());
-  S.pending=S.occ.filter(isPendingOccurrence);
+  S.pending=filteredPendingOccurrences();
   render();
   showToast('Ocorrência pendente excluída com sucesso.','success','Fila de Validação');
 
@@ -3145,7 +3154,7 @@ async function executeRecordDeletion(){
   S.deleteRecordTarget=null;
   if(modulo==='Ocorrências'){
     S.occ=(S.occ||[]).filter(x=>x.id_ocorrencia!==id&&x.numero_protocolo!==id);
-    S.pending=S.occ.filter(isPendingOccurrence);
+    S.pending=filteredPendingOccurrences();
   }else if(modulo==='Chaves'){
     S.keys=(S.keys||[]).filter(x=>x.id_chave!==id&&x.codigo!==id);
   }else if(modulo==='Meio Ambiente'){
