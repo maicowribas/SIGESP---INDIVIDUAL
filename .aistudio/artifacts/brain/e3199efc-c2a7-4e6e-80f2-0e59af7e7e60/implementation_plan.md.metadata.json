@@ -1,6 +1,6 @@
 {
-  "summary":  "Plano arquitetural detalhado para correção da sincronização em tempo real de novas ocorrências criadas por operadores, garantindo a exibição imediata das notificações de alerta e a inclusão automática na fila do módulo 'Validação de Ocorrências' tanto em modo pasta nativa quanto servidor.",
-  "updatedAt":  "2026-11-09T14:57:48.079337580Z",
+  "summary":  "Plano arquitetural completo para otimização de velocidade na abertura de ocorrências (protocolo instantâneo sem travamento do botão de salvar), novo brasão vetorial corporativo do SIGESP com gradiente metálico e estrela de segurança na barra lateral, e redesign profissional de alta densidade do Dashboard com paleta vibrante de cores e cartões analíticos.",
+  "updatedAt":  "2026-11-10T09:39:02.879494041Z",
   "requestFeedback":  true,
   "userFacing":  true
 }

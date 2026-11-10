@@ -2602,14 +2602,32 @@ async function persistEditedOccurrence(d,editingBeforeSubmit,photoPaths,initialD
   throw Error('Não foi possível confirmar a alteração da ocorrência.');
 }
 let _lastOccSaveClick=0;
+let _occSaveWatchdogTimer=null;
+function unlockOccurrenceSubmitBtn(){
+  S.submitting=false;
+  _lastOccSaveClick=0;
+  if(_occSaveWatchdogTimer){
+    clearTimeout(_occSaveWatchdogTimer);
+    _occSaveWatchdogTimer=null;
+  }
+  const form=document.getElementById('occForm');
+  const btn=form?.querySelector('button[type="submit"],button.primary,button:not([type])');
+  if(btn){
+    btn.disabled=false;
+    btn.classList.remove('opacity-50','cursor-not-allowed');
+    btn.textContent=btn.dataset.origText||'Salvar ocorrência';
+  }
+}
+
 async function saveOcc(ev){
   ev.preventDefault();
   const clickTime=Date.now();
-  if(S.submitting||(clickTime-_lastOccSaveClick<1800))return;
+  // Previne duplo clique acidental rápido (debounce de 600ms seguro em vez de 1800ms)
+  if(S.submitting||(clickTime-_lastOccSaveClick<600))return;
   _lastOccSaveClick=clickTime;
   S.submitting=true;
 
-  const form=ev.currentTarget;
+  const form=ev.currentTarget||document.getElementById('occForm');
   const submitButton=form?.querySelector('button[type="submit"],button.primary,button:not([type])');
   if(submitButton){
     submitButton.disabled=true;
@@ -2618,24 +2636,33 @@ async function saveOcc(ev){
     submitButton.textContent='Salvando...';
   }
 
+  // Watchdog de segurança: se após 4 segundos o botão ainda estiver travado por qualquer motivo assíncrono, destrava
+  if(_occSaveWatchdogTimer)clearTimeout(_occSaveWatchdogTimer);
+  _occSaveWatchdogTimer=setTimeout(()=>{
+    if(S.submitting||submitButton?.disabled){
+      console.warn('[SIGESP] Watchdog acionado: destravando botão de salvar ocorrência');
+      unlockOccurrenceSubmitBtn();
+    }
+  },4000);
+
   let savedPhotoPaths=[];
   try{
-    const isEditCandidate=Boolean(form.elements['id_ocorrencia']?.value||S.editing?.id_ocorrencia);
+    const isEditCandidate=Boolean(form?.elements?.['id_ocorrencia']?.value||S.editing?.id_ocorrencia);
     if(!isEditCandidate&&_openOccRegPromise){
-      try{await _openOccRegPromise;}catch{}
+      // Não bloqueia mais que 350ms na promessa de reserva em background
+      try{
+        await Promise.race([
+          _openOccRegPromise,
+          new Promise(r=>setTimeout(r,350))
+        ]);
+      }catch{}
     }
 
     const d=captureOccurrenceDraft(form)||{},editingBeforeSubmit={...(S.editing||{})};
     if(hasProfile(S.user,'Operador')&&d.id_ocorrencia){
       cleanup();
       S.editing={};
-      S.submitting=false;
-      _lastOccSaveClick=0;
-      if(submitButton){
-        submitButton.disabled=false;
-        submitButton.classList.remove('opacity-50','cursor-not-allowed');
-        submitButton.textContent=submitButton.dataset.origText||'Salvar ocorrência';
-      }
+      unlockOccurrenceSubmitBtn();
       denyOperatorAccess();
       return;
     }
@@ -2778,17 +2805,11 @@ async function saveOcc(ev){
         render();
         showToast(bgErr.message||'Falha ao gravar no disco. Ocorrência restaurada.','error','Erro de Gravação');
       }finally{
-        S.submitting=false;
+        unlockOccurrenceSubmitBtn();
       }
     })();
   }catch(error){
-    S.submitting=false;
-    _lastOccSaveClick=0;
-    if(submitButton){
-      submitButton.disabled=false;
-      submitButton.classList.remove('opacity-50','cursor-not-allowed');
-      submitButton.textContent=submitButton.dataset.origText||'Salvar ocorrência';
-    }
+    unlockOccurrenceSubmitBtn();
     if(error instanceof OccurrenceValidationError){
       showOccurrenceValidationError(error.message,'Validação do formulário');
     }else{
@@ -3479,13 +3500,16 @@ async function openOccurrenceRegistration(options={}){
     _reservationConfirmed:Boolean(storedRes?.numeroProtocolo),
     _clientId:clientId
   };
-  S.reservingProtocol=!storedRes?.numeroProtocolo;
+  // Disponibiliza o protocolo e libera o formulário e botões imediatamente (0 ms)
+  S.reservingProtocol=false;
+  S.submitting=false;
   S.page='occ-register';
   S.activeMenu='ocorrencias';
   S.message='';
   render();
 
-  await ensureActiveProtocolReservation({forceNew,preserveForm:true});
+  // Aciona a confirmação/reserva centralizada em background sem travar a digitação do operador
+  void ensureActiveProtocolReservation({forceNew,preserveForm:true});
 }
 async function editOcc(id){if(hasProfile(S.user,'Operador')){denyOperatorAccess();return}try{const r=await findAuthorizedOccurrence(id);S.modal=null;S.successPopup=null;await loadImages(r);S.editing={...r};S.page='occ-register';S.activeMenu='ocorrencias';render()}catch(error){console.warn('Acesso negado à edição de ocorrência.',error);fail('Registro não encontrado ou sem autorização para acessá-lo.')}}
 async function viewOcc(id){try{const r=await findAuthorizedOccurrence(id);S.editing=null;await loadImages(r);S.modal={...r};render()}catch(error){console.warn('Acesso negado à visualização de ocorrência.',error);fail('Registro não encontrado ou sem autorização para acessá-lo.')}}
@@ -6904,7 +6928,296 @@ function settingsMasterList(){const entity=S.settingsTab,query=normalizedMasterN
 function settingsMasterEditor(){if(!S.masterEditor||!hasProfile(S.user,'Administrador'))return'';const{entity,id,data}=S.masterEditor,title=`${id?'Editar':'Cadastrar'} ${masterEntityName(entity)}`,supOptions=S.supervisions.filter(item=>activeMaster(item)||(id&&item.id_supervisao===data.id_supervisao)).map(item=>({value:item.id_supervisao,label:item.nome}));return `<div class="modalbg popup-backdrop"><div class="card modal"><button type="button" class="close cancelMasterEditor" aria-label="Fechar">×</button><h2>${esc(title)}</h2><form id="masterDataForm" class="stack"><label><span class="label">Nome</span><input class="field" name="nome" value="${esc(data.nome||'')}" required maxlength="120"></label>${entity==='unit'?`<label><span class="label">Supervisão</span><select class="field" name="supervisao_id" required><option value="">Selecione uma Supervisão</option>${selectOptions(supOptions,data.id_supervisao||'')}</select></label>`:''}<div class="row" style="justify-content:flex-end"><button type="button" id="cancelMasterEditor" class="btn">Cancelar</button><button type="submit" class="btn primary" ${S.masterBusy?'disabled':''}>Salvar</button></div></form></div></div>`}
 function masterConfirmationModal(){const item=S.masterConfirmation;if(!item)return'';const title=item.error?'Não foi possível verificar dependências':`Confirmar ${item.active?'reativação':'inativação'}?`,message=item.error?item.error:`Tem certeza de que deseja ${item.active?'reativar':'inativar'} ${masterEntityName(item.entity)} “${item.name}”?`;return `<div class="modalbg popup-backdrop"><div class="result-dialog result-error"><div class="error-strip"></div><div class="error-body"><div class="error-icon">!</div><div><div class="result-kicker error-kicker">Confirmação necessária</div><h2>${esc(title)}</h2><p>${esc(message)}</p>${item.dependencies?.length?`<p class="muted">Dependências: ${esc(item.dependencies.join('; '))}. Os registros históricos e vínculos serão preservados; a inativação impede novos usos.</p>`:''}</div></div><div class="result-actions error-actions"><button id="cancelMasterConfirmation" class="btn">Cancelar</button>${item.error?'':`<button id="confirmMasterDeactivation" class="btn danger">${item.active?'Reativar':'Inativar'}</button>`}</div></div></div>`}
 function settingsPage(){const tabs=[['supervisions','Supervisões'],['units','Unidades'],['natures','Naturezas de Ocorrência']],admin=hasProfile(S.user,'Administrador');return `<div class="settings-heading"><h2>Configurações</h2><p class="muted">Administração centralizada dos dados mestres e persistência automática do SIGESP.</p></div><div class="settings-tabs" role="tablist">${tabs.map(([id,label])=>`<button class="btn settingsTab ${S.settingsTab===id?'primary':''}" data-tab="${id}" role="tab" aria-selected="${S.settingsTab===id}">${label}</button>`).join('')}</div>${settingsMasterList()}<div class="card settings-folder"><div class="row between"><div><h3>Armazenamento Automático de Dados (Pasta dados)</h3><p class="muted">Os dados são lidos e salvos automaticamente na pasta <b>dados</b> (localizada no mesmo diretório do index.html), protegidos por criptografia nativa AES-GCM de 256 bits.</p></div><div class="row"><button id="syncServerFolder" type="button" class="btn">Sincronizar pasta dados</button><button id="selectFolderSettings" type="button" class="btn">Selecionar outra pasta...</button><button id="downloadAllCsvs" type="button" class="btn primary">Baixar todos os CSVs</button>${admin?`<label class="btn" style="cursor:pointer;display:inline-flex;align-items:center;gap:6px">Importar CSV(s)<input id="uploadCsvInput" class="hidden" type="file" accept=".csv" multiple></label>`:''}</div></div><div class="status" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px"><span>Pasta ativa: <b>${esc(S.dir?.name||'dados')}</b> · Persistência centralizada</span><span style="display:inline-flex;align-items:center;gap:6px;background:rgba(22,163,74,0.12);color:#166534;padding:4px 10px;border-radius:4px;font-size:12px;font-weight:600">🔒 Criptografia AES-GCM 256 bits (Web Crypto API) Ativa</span></div><div class="tablewrap" style="margin-top:12px"><table class="table"><thead><tr><th>Arquivo CSV</th><th>Descrição</th><th>Registros carregados</th><th>Ação</th></tr></thead><tbody>${HYBRID_CSVS.map(([file,desc,countFn])=>`<tr><td><b>${esc(file)}</b></td><td>${esc(desc)}</td><td>${countFn()}</td><td><button type="button" class="btn downloadSingleCsv" data-file="${esc(file)}" style="padding:6px 10px;font-size:12px">Baixar CSV</button></td></tr>`).join('')}</tbody></table></div></div>`}
-function dashboardPage(){if(denyOperatorAccess())return'';const rows=scope(S.occ||[]),series=dashboardSeries(rows),summary={},unitCounts={};for(let i=0,len=rows.length;i<len;i++){const item=rows[i],st=normalizeApuracaoStatus(item.status),un=String(item.unidade||item.local_ocorrencia||'Sem unidade').trim();summary[st]=(summary[st]||0)+1;unitCounts[un]=(unitCounts[un]||0)+1}const pendingCount=filteredPendingOccurrences().length;const catalogUnits=authorizedUnitRecords();for(let i=0,len=catalogUnits.length;i<len;i++){const uName=String(catalogUnits[i]?.nome||'').trim();if(uName&&!(uName in unitCounts)){unitCounts[uName]=0}}const periods=series.months.slice(-6),totals=series.totals.slice(-6),unitEntries=Object.entries(unitCounts),topUnits=unitEntries.sort((a,b)=>b[1]-a[1]).slice(0,5),featured=ambientalDashboard();const registeredUnitsCount=catalogUnits.length||S.unitCatalog.length;const unitsWithOccurrences=unitEntries.filter(([un,count])=>un!=='Sem unidade'&&count>0).length;return `<div class="section-block"><div class="dashboard-heading"><div><h2>DASHBOARD</h2><p class="muted">Visão geral operativa do SIGESP</p></div><span class="dashboard-period">Últimos 6 meses</span></div><div class="grid metrics">${[['Total de registros',rows.length],['Ocorrências pendentes',pendingCount],['Em apuração',summary['Em Apuração']||0],['Encerradas',summary['Encerrada']||0],['Unidades cadastradas',registeredUnitsCount],['Unidades com registros',unitsWithOccurrences]].map(([label,value])=>`<div class="card metric-card"><span class="metric-label">${esc(label)}</span><strong>${esc(String(value))}</strong></div>`).join('')}</div><div class="corporate-dashboard-grid"><section class="card chart-card"><div class="chart-title"><div><h3>Evolução operacional</h3><p>Ocorrências por período</p></div><span class="chart-badge">Período</span></div>${periods.length?`<div class="ambiental-mini-chart">${periods.map((month,index)=>{const value=totals[index]||0;const maxTotal=Math.max(1,...totals);const height=Math.max(8,(value/maxTotal)*100);return `<div class="ambiental-small-bar-wrap" style="position:relative;display:flex;flex-direction:column;align-items:center;justify-content:flex-end"><span class="bar-data-label" style="font-size:11px;font-weight:700;color:#1e40af;margin-bottom:4px;line-height:1">${value}</span><div class="ambiental-small-bar" style="height:${height}%" title="${value} ocorrência(s) em ${corporateMonthLabel(month)}"></div><span>${esc(corporateMonthLabel(month).slice(0,6))}</span></div>`}).join('')}</div>`:`<div class="chart-empty">Nenhum dado disponível para o período.</div>`}</section><section class="card chart-card"><div class="chart-title"><div><h3>Top unidades</h3><p>Registros por unidade no escopo</p></div><span class="chart-badge">Unidades</span></div><div class="ambiental-stack">${topUnits.length?topUnits.map(([unit,count])=>`<div class="ambiental-legend-row"><span>${esc(unit)}</span><strong>${count}</strong></div>`).join(''):`<div class="chart-empty">Sem registros para exibir.</div>`}</div></section></div>${featured}</div>`}
+function dashboardPage(){
+  if(denyOperatorAccess())return'';
+  const rows=scope(S.occ||[]);
+  const series=dashboardSeries(rows);
+  const summary={};
+  const unitCounts={};
+  const natureCounts={};
+
+  for(let i=0,len=rows.length;i<len;i++){
+    const item=rows[i];
+    const st=normalizeApuracaoStatus(item.status);
+    const un=String(item.unidade||item.local_ocorrencia||'Sem unidade').trim();
+    const nat=String(item.natureza_ocorrencia||'Não especificada').trim();
+    summary[st]=(summary[st]||0)+1;
+    unitCounts[un]=(unitCounts[un]||0)+1;
+    if(nat)natureCounts[nat]=(natureCounts[nat]||0)+1;
+  }
+
+  const pendingCount=filteredPendingOccurrences().length;
+  const catalogUnits=authorizedUnitRecords();
+  for(let i=0,len=catalogUnits.length;i<len;i++){
+    const uName=String(catalogUnits[i]?.nome||'').trim();
+    if(uName&&!(uName in unitCounts)){
+      unitCounts[uName]=0;
+    }
+  }
+
+  const periods=series.months.slice(-6);
+  const totals=series.totals.slice(-6);
+  const unitEntries=Object.entries(unitCounts);
+  const topUnits=unitEntries.sort((a,b)=>b[1]-a[1]).slice(0,6);
+  const topNatures=Object.entries(natureCounts).sort((a,b)=>b[1]-a[1]).slice(0,5);
+  const featured=ambientalDashboard();
+  const registeredUnitsCount=catalogUnits.length||S.unitCatalog.length;
+  const unitsWithOccurrences=unitEntries.filter(([un,count])=>un!=='Sem unidade'&&count>0).length;
+
+  // Cálculo de Chaves Operacionais no Claviculário
+  const allKeys=scope(S.keys||[]);
+  let chavesLivres=0,chavesRetiradas=0;
+  for(let i=0;i<allKeys.length;i++){
+    if(isKeyLivre(allKeys[i]))chavesLivres++;
+    else chavesRetiradas++;
+  }
+
+  return `<div class="section-block dash-executive-wrapper">
+    <!-- Header Executivo do Dashboard -->
+    <div class="dash-executive-header">
+      <div class="dash-executive-brand">
+        <div class="dash-header-icon-badge">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="3" width="7" height="7"/>
+            <rect x="14" y="3" width="7" height="7"/>
+            <rect x="14" y="14" width="7" height="7"/>
+            <rect x="3" y="14" width="7" height="7"/>
+          </svg>
+        </div>
+        <div>
+          <h2>PAINEL EXECUTIVO DE OPERAÇÕES</h2>
+          <p class="muted">Centro Integrado de Comando, Monitoramento e Gestão Patrimonial</p>
+        </div>
+      </div>
+      <div class="dash-header-meta">
+        <span class="dash-badge-live"><span class="dash-pulse-dot"></span> TEMPO REAL</span>
+        <span class="dashboard-period">Últimos 6 meses</span>
+      </div>
+    </div>
+
+    <!-- Cards KPI Vibrantes Corporativos -->
+    <div class="dash-kpi-grid">
+      <!-- 1. Total de Registros (Azul Safira) -->
+      <div class="dash-kpi-card dash-kpi-blue">
+        <div class="dash-kpi-inner">
+          <div class="dash-kpi-header">
+            <span class="dash-kpi-label">TOTAL DE OCORRÊNCIAS</span>
+            <div class="dash-kpi-icon-wrap">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                <polyline points="14 2 14 8 20 8"/>
+                <line x1="16" y1="13" x2="8" y2="13"/>
+                <line x1="16" y1="17" x2="8" y2="17"/>
+              </svg>
+            </div>
+          </div>
+          <strong class="dash-kpi-value">${rows.length}</strong>
+          <div class="dash-kpi-footer">
+            <span>Base consolidada de ocorrências</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- 2. Pendentes de Validação (Âmbar Ouro) -->
+      <div class="dash-kpi-card dash-kpi-amber">
+        <div class="dash-kpi-inner">
+          <div class="dash-kpi-header">
+            <span class="dash-kpi-label">PENDENTES DE VALIDAÇÃO</span>
+            <div class="dash-kpi-icon-wrap">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="10"/>
+                <line x1="12" y1="8" x2="12" y2="12"/>
+                <line x1="12" y1="16" x2="12.01" y2="16"/>
+              </svg>
+            </div>
+          </div>
+          <strong class="dash-kpi-value">${pendingCount}</strong>
+          <div class="dash-kpi-footer">
+            <span>${pendingCount>0?'Requer ação da supervisão':'Fila operacional regularizada'}</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- 3. Em Apuração Ativa (Roxo Real) -->
+      <div class="dash-kpi-card dash-kpi-purple">
+        <div class="dash-kpi-inner">
+          <div class="dash-kpi-header">
+            <span class="dash-kpi-label">EM APURAÇÃO ATIVA</span>
+            <div class="dash-kpi-icon-wrap">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="11" cy="11" r="8"/>
+                <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+              </svg>
+            </div>
+          </div>
+          <strong class="dash-kpi-value">${summary['Em Apuração']||0}</strong>
+          <div class="dash-kpi-footer">
+            <span>Investigações e sindicâncias</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- 4. Encerradas / Concluídas (Verde Esmeralda) -->
+      <div class="dash-kpi-card dash-kpi-emerald">
+        <div class="dash-kpi-inner">
+          <div class="dash-kpi-header">
+            <span class="dash-kpi-label">ENCERRADAS / RESOLVIDAS</span>
+            <div class="dash-kpi-icon-wrap">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
+                <polyline points="22 4 12 14.01 9 11.01"/>
+              </svg>
+            </div>
+          </div>
+          <strong class="dash-kpi-value">${summary['Encerrada']||0}</strong>
+          <div class="dash-kpi-footer">
+            <span>Ciclo de atendimento concluído</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- 5. Cobertura de Unidades (Ciano / Oceano) -->
+      <div class="dash-kpi-card dash-kpi-cyan">
+        <div class="dash-kpi-inner">
+          <div class="dash-kpi-header">
+            <span class="dash-kpi-label">UNIDADES MONITORADAS</span>
+            <div class="dash-kpi-icon-wrap">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                <polygon points="1 6 1 22 8 18 16 22 23 18 23 2 16 6 8 2 1 6"/>
+                <line x1="8" y1="2" x2="8" y2="18"/>
+                <line x1="16" y1="6" x2="16" y2="22"/>
+              </svg>
+            </div>
+          </div>
+          <strong class="dash-kpi-value">${registeredUnitsCount}</strong>
+          <div class="dash-kpi-footer">
+            <span>${unitsWithOccurrences} unidade(s) com registros</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- 6. Claviculário / Chaves em Uso (Rubi / Coral) -->
+      <div class="dash-kpi-card dash-kpi-rose">
+        <div class="dash-kpi-inner">
+          <div class="dash-kpi-header">
+            <span class="dash-kpi-label">CLAVICULÁRIO / CHAVES</span>
+            <div class="dash-kpi-icon-wrap">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M21 2l-2 2m-1-1l-3 3m-2-2l-3 3m-2-2l-3 3m-2-2l-3 3"/>
+                <circle cx="7.5" cy="15.5" r="5.5"/>
+                <path d="m11.5 11.5 8.5-8.5"/>
+              </svg>
+            </div>
+          </div>
+          <strong class="dash-kpi-value">${chavesRetiradas} <small style="font-size:15px;font-weight:700;color:inherit;opacity:.85">em uso</small></strong>
+          <div class="dash-kpi-footer">
+            <span>${chavesLivres} chave(s) livres no claviculário</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Gráficos Corporativos com Mais Cores e Profundidade -->
+    <div class="corporate-dashboard-grid">
+      <!-- Gráfico 1: Evolução Operacional -->
+      <section class="card chart-card dash-chart-card">
+        <div class="chart-title">
+          <div style="display:flex;align-items:center;gap:10px">
+            <div style="width:34px;height:34px;border-radius:8px;background:#eff6ff;color:#2563eb;display:flex;align-items:center;justify-content:center">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>
+            </div>
+            <div>
+              <h3>Evolução Operacional Mensal</h3>
+              <p>Histórico volumétrico de ocorrências atendidas</p>
+            </div>
+          </div>
+          <span class="chart-badge dash-badge-blue">Volume Mensal</span>
+        </div>
+        ${periods.length?`
+          <div class="dash-monthly-chart">
+            ${periods.map((month,index)=>{
+              const value=totals[index]||0;
+              const maxTotal=Math.max(1,...totals);
+              const height=Math.max(10,(value/maxTotal)*100);
+              const monthName=corporateMonthLabel(month);
+              return `<div class="dash-bar-column">
+                <span class="dash-bar-value">${value}</span>
+                <div class="dash-bar-track">
+                  <div class="dash-bar-fill" style="height:${height}%" title="${value} ocorrência(s) em ${monthName}">
+                    <div class="dash-bar-glow"></div>
+                  </div>
+                </div>
+                <span class="dash-bar-label">${esc(monthName.slice(0,6))}</span>
+              </div>`;
+            }).join('')}
+          </div>
+        `:`<div class="chart-empty">Nenhum registro disponível para o período.</div>`}
+      </section>
+
+      <!-- Gráfico 2: Top Unidades com Barras de Progresso Coloridas -->
+      <section class="card chart-card dash-chart-card">
+        <div class="chart-title">
+          <div style="display:flex;align-items:center;gap:10px">
+            <div style="width:34px;height:34px;border-radius:8px;background:#fef2f2;color:#dc2626;display:flex;align-items:center;justify-content:center">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg>
+            </div>
+            <div>
+              <h3>Unidades com Maior Atividade</h3>
+              <p>Concentração por posto e unidade no escopo</p>
+            </div>
+          </div>
+          <span class="chart-badge dash-badge-red">Top Unidades</span>
+        </div>
+        <div class="dash-units-list">
+          ${topUnits.length?topUnits.map(([unit,count],idx)=>{
+            const maxCount=Math.max(1,...topUnits.map(x=>x[1]));
+            const pct=Math.round((count/maxCount)*100);
+            const paletteClasses=['dash-bar-p1','dash-bar-p2','dash-bar-p3','dash-bar-p4','dash-bar-p5','dash-bar-p6'];
+            const barClass=paletteClasses[idx%paletteClasses.length];
+            return `<div class="dash-unit-row">
+              <div class="dash-unit-info">
+                <span class="dash-unit-name"><b>#${idx+1}</b> ${esc(unit)}</span>
+                <strong class="dash-unit-count">${count} <small>ocorrência(s)</small></strong>
+              </div>
+              <div class="dash-unit-progress-track">
+                <div class="dash-unit-progress-bar ${barClass}" style="width:${pct}%"></div>
+              </div>
+            </div>`;
+          }).join(''):`<div class="chart-empty">Sem registros para exibir.</div>`}
+        </div>
+      </section>
+    </div>
+
+    <!-- Seção de Distribuição por Natureza -->
+    ${topNatures.length?`
+      <div class="card dash-natures-card" style="margin-top:16px">
+        <div class="chart-title" style="border-bottom:none;padding-bottom:0">
+          <div style="display:flex;align-items:center;gap:10px">
+            <div style="width:34px;height:34px;border-radius:8px;background:#f5f3ff;color:#7c3aed;display:flex;align-items:center;justify-content:center">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>
+            </div>
+            <div>
+              <h3>Principais Naturezas de Ocorrência</h3>
+              <p>Tipologias mais incidentes no período</p>
+            </div>
+          </div>
+          <span class="chart-badge dash-badge-purple">Naturezas Ativas</span>
+        </div>
+        <div class="dash-nature-tags-grid">
+          ${topNatures.map(([nature,count],idx)=>{
+            return `<div class="dash-nature-badge">
+              <span class="dash-nature-rank">0${idx+1}</span>
+              <span class="dash-nature-name">${esc(nature)}</span>
+              <strong class="dash-nature-qty">${count}</strong>
+            </div>`;
+          }).join('')}
+        </div>
+      </div>
+    `:''}
+
+    ${featured}
+  </div>`;
+}
 const unguardedRestrictedViews={dashboard:dashboardPage,occList,occurrenceHistoryPage,pendingValidationPage,apuracaoOccurrencesPage,usersPage,auditPage,reportsPage,settingsPage};
 function dashboard(){if(denyOperatorAccess())return'';return unguardedRestrictedViews.dashboard();}
 occList=function(){if(denyOperatorAccess())return'';return unguardedRestrictedViews.occList()};
@@ -7121,7 +7434,66 @@ function renderSidebarMenu(){
   ];
   return items.filter(Boolean).join('');
 }
+function renderSigespBrandShield(){
+  return `<div class="sigesp-sidebar-brand" title="SIGESP - Sistema Integrado de Gestão e Segurança Patrimonial">
+    <div class="sigesp-brand-crest">
+      <svg width="38" height="44" viewBox="0 0 76 88" fill="none" xmlns="http://www.w3.org/2000/svg" class="sigesp-shield-svg" aria-hidden="true">
+        <defs>
+          <linearGradient id="crestMetalBorder" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#ffffff"/>
+            <stop offset="25%" stop-color="#94a3b8"/>
+            <stop offset="50%" stop-color="#cbd5e1"/>
+            <stop offset="75%" stop-color="#64748b"/>
+            <stop offset="100%" stop-color="#e2e8f0"/>
+          </linearGradient>
+          <linearGradient id="crestNavyBody" x1="50%" y1="0%" x2="50%" y2="100%">
+            <stop offset="0%" stop-color="#1e3a8a"/>
+            <stop offset="45%" stop-color="#0f265c"/>
+            <stop offset="100%" stop-color="#06122c"/>
+          </linearGradient>
+          <linearGradient id="crestGoldFacet" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#fef08a"/>
+            <stop offset="50%" stop-color="#f59e0b"/>
+            <stop offset="100%" stop-color="#b45309"/>
+          </linearGradient>
+          <linearGradient id="crestGoldDark" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#d97706"/>
+            <stop offset="100%" stop-color="#78350f"/>
+          </linearGradient>
+          <filter id="crestGlow" x="-20%" y="-20%" width="140%" height="140%">
+            <feDropShadow dx="0" dy="3" stdDeviation="4" flood-color="#0284c7" flood-opacity="0.35"/>
+          </filter>
+        </defs>
+        <!-- Outer Metallic Border -->
+        <path d="M38 3L69 14V38C69 58 56 74 38 83C20 74 7 58 7 38V14L38 3Z" fill="url(#crestMetalBorder)" filter="url(#crestGlow)"/>
+        <!-- Inner Deep Blue Field -->
+        <path d="M38 7L65 17V38C65 55 53 70 38 78C23 70 11 55 11 38V17L38 7Z" fill="url(#crestNavyBody)"/>
+        <!-- Inner Bevel Accent -->
+        <path d="M38 10L62 19V38C62 53 51 66 38 74V10Z" fill="#ffffff" fill-opacity="0.06"/>
+        <!-- Corporate Security Star (Faceted Golden Star) -->
+        <g transform="translate(38, 38)">
+          <!-- Left Facets (Lighter Gold) -->
+          <path d="M0 -17L4.5 -5H17L7 3L10.5 15L0 8V-17Z" fill="url(#crestGoldFacet)"/>
+          <!-- Right Facets (Deep Shaded Gold) -->
+          <path d="M0 -17L-4.5 -5H-17L-7 3L-10.5 15L0 8V-17Z" fill="url(#crestGoldDark)"/>
+          <!-- Center Core Gem -->
+          <circle cx="0" cy="1" r="2.8" fill="#ffffff" opacity="0.95"/>
+        </g>
+        <!-- Lower Security Chevron -->
+        <path d="M26 58L38 66L50 58" stroke="#38bdf8" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" opacity="0.85"/>
+      </svg>
+    </div>
+    <div class="sigesp-brand-info">
+      <span class="sigesp-brand-title">SIGESP</span>
+      <span class="sigesp-brand-tag">SEGURANÇA CORPORATIVA</span>
+    </div>
+  </div>`;
+}
+
 function shell(){
+  if(S.permissionNeeded)return permissionV();
+  if(!S.dir)return connectV();
+  if(!S.user)return loginV();
   if(!canAccessPage(S.page)){
     S.page='occ-register';
     S.editing=S.editing||{};
@@ -7157,7 +7529,7 @@ function shell(){
     S.page==='relatorios'?reportsPage():
     settingsPage();
 
-  return `<div class="shell"><aside class="sidebar" aria-label="Navegação lateral do sistema"><div class="brand">🛡️ SIGESP</div><nav class="menu" aria-label="Menu principal">${renderSidebarMenu()}</nav></aside><main class="main"><header class="topbar"><div style="display:flex;align-items:center;gap:10px"><button type="button" id="topbarFolderBadge" class="btn" style="padding:5px 10px;font-size:12px;display:inline-flex;align-items:center;gap:6px;background:#ecfdf5;color:#047857;border-color:#a7f3d0" title="Pasta de dados ativa. Clique para gerenciar ou selecionar outra."><span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:#16a34a"></span><b>Pasta: ${esc(S.dir?.name||'dados')}</b></button><b>${esc(S.user.nome)} · ${esc(S.user.perfil)}</b></div><div style="display:flex;align-items:center;gap:10px"><div class="sync-status-badge" id="syncStatusBadge" title="Sincronização em segundo plano ativa"><span class="sync-pulse-dot" aria-hidden="true"></span><span id="syncStatusText">Sincronizado às ${formatSyncTime()}</span></div>${operator?'':'<button id="refresh" class="btn">Atualizar</button>'}</div></header><section class="content">${alert()}${body}</section></main>${modal()}${validationModal()}${apuracaoModal()}${deletePendingAlertDialog()}${deleteRecordAlertDialog()}${keyWithdrawModal()}${keyReturnModal()}${keyHistoryModal()}${toastContainer()}${userPasswordModal()}${userRemovalModal()}${userFormModal()}${successModal()}${errorModal()}${settingsMasterEditor()}${masterConfirmationModal()}${S.viewUrl?`<div class="viewer"><button id="closeViewer">×</button><img src="${S.viewUrl}"></div>`:''}</div>${accessDeniedModal()}${folderSelectionModal()}`
+  return `<div class="shell"><aside class="sidebar" aria-label="Navegação lateral do sistema">${renderSigespBrandShield()}<nav class="menu" aria-label="Menu principal">${renderSidebarMenu()}</nav></aside><main class="main"><header class="topbar"><div style="display:flex;align-items:center;gap:10px"><button type="button" id="topbarFolderBadge" class="btn" style="padding:5px 10px;font-size:12px;display:inline-flex;align-items:center;gap:6px;background:#ecfdf5;color:#047857;border-color:#a7f3d0" title="Pasta de dados ativa. Clique para gerenciar ou selecionar outra."><span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:#16a34a"></span><b>Pasta: ${esc(S.dir?.name||'dados')}</b></button><b>${esc(S.user.nome)} · ${esc(S.user.perfil)}</b></div><div style="display:flex;align-items:center;gap:10px"><div class="sync-status-badge" id="syncStatusBadge" title="Sincronização em segundo plano ativa"><span class="sync-pulse-dot" aria-hidden="true"></span><span id="syncStatusText">Sincronizado às ${formatSyncTime()}</span></div>${operator?'':'<button id="refresh" class="btn">Atualizar</button>'}</div></header><section class="content">${alert()}${body}</section></main>${modal()}${validationModal()}${apuracaoModal()}${deletePendingAlertDialog()}${deleteRecordAlertDialog()}${keyWithdrawModal()}${keyReturnModal()}${keyHistoryModal()}${toastContainer()}${userPasswordModal()}${userRemovalModal()}${userFormModal()}${successModal()}${errorModal()}${settingsMasterEditor()}${masterConfirmationModal()}${S.viewUrl?`<div class="viewer"><button id="closeViewer">×</button><img src="${S.viewUrl}"></div>`:''}</div>${accessDeniedModal()}${folderSelectionModal()}`
 }
 let _searchDebounceTimer=null;
 function scheduleSearchRender(delay=300){if(_searchDebounceTimer)clearTimeout(_searchDebounceTimer);_searchDebounceTimer=setTimeout(()=>{_searchDebounceTimer=null;render()},delay)}
@@ -7391,7 +7763,13 @@ function bind(){
 
   document.getElementById('newOcc')?.addEventListener('click',()=>openOccurrenceRegistration({forceNew:false}));
   document.getElementById('occForm')?.addEventListener('submit',saveOcc);
-  document.getElementById('occForm')?.addEventListener('input',e=>{if(S.editing?._reservedProtocol)renewProtocolHeartbeat(S.editing._reservedProtocol);if(e.target.name&&S.editing){S.editing[e.target.name]=e.target.value}});
+  document.getElementById('occForm')?.addEventListener('input',e=>{
+    if(S.submitting){
+      unlockOccurrenceSubmitBtn();
+    }
+    if(S.editing?._reservedProtocol)renewProtocolHeartbeat(S.editing._reservedProtocol);
+    if(e.target.name&&S.editing){S.editing[e.target.name]=e.target.value}
+  });
   document.getElementById('occForm')?.addEventListener('change',e=>{if(e.target.name==='tipo_vinculo'){handleVinculoChange(e);return}if(e.target.name)captureOccurrenceDraft(e.currentTarget)});
   document.getElementById('occTipoVinculo')?.addEventListener('change',handleVinculoChange);
   document.getElementById('cancelOcc')?.addEventListener('click',async()=>{const wasEditingExisting=Boolean(S.editing?.id_ocorrencia);cleanup();S.occurrenceDraft=null;if(wasEditingExisting){S.editing=null;S.page=hasProfile(S.user,'Operador')?'occ-register':'occ-history';if(S.page==='occ-register'){await openOccurrenceRegistration({forceNew:false,clearDraft:true});}else{render();}}else{await openOccurrenceRegistration({forceNew:false,clearDraft:true});}});

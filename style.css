@@ -1764,5 +1764,451 @@
   }
 }
 
+/* ==========================================================================
+   ESCUDO METÁLICO CORPORATIVO DO SIGESP NA BARRA LATERAL
+   ========================================================================== */
+.sigesp-sidebar-brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 10px 18px 4px;
+  margin-bottom: 18px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.09);
+  transition: opacity 0.2s ease;
+  user-select: none;
+}
 
+.sigesp-sidebar-brand:hover {
+  opacity: 0.95;
+}
 
+.sigesp-brand-crest {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  filter: drop-shadow(0 4px 12px rgba(2, 132, 199, 0.35));
+  transition: transform 0.25s ease;
+}
+
+.sigesp-sidebar-brand:hover .sigesp-brand-crest {
+  transform: translateY(-1px) scale(1.02);
+}
+
+.sigesp-shield-svg {
+  display: block;
+}
+
+.sigesp-brand-info {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.sigesp-brand-title {
+  font-size: 20px;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  color: #ffffff;
+  line-height: 1.1;
+  text-shadow: 0 2px 4px rgba(0, 0, 0, 0.4);
+}
+
+.sigesp-brand-tag {
+  font-size: 9.5px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  color: #38bdf8;
+  margin-top: 3px;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+/* ==========================================================================
+   PAINEL EXECUTIVO DO DASHBOARD (VIBRANTE, CORPORATIVO & COLORIDO)
+   ========================================================================== */
+.dash-executive-wrapper {
+  margin-top: 10px;
+}
+
+.dash-executive-header {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 20px;
+  flex-wrap: wrap;
+}
+
+.dash-executive-brand {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.dash-header-icon-badge {
+  width: 48px;
+  height: 48px;
+  border-radius: 12px;
+  background: linear-gradient(135deg, #1e3a8a 0%, #2563eb 100%);
+  color: #ffffff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 4px 14px rgba(37, 99, 235, 0.3);
+  flex-shrink: 0;
+}
+
+.dash-executive-header h2 {
+  margin: 0;
+  font-size: 21px;
+  font-weight: 900;
+  letter-spacing: -0.02em;
+  color: #0f172a;
+}
+
+.dash-executive-header p {
+  margin: 4px 0 0;
+  font-size: 13px;
+  color: #64748b;
+}
+
+.dash-header-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.dash-badge-live {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: #ecfdf5;
+  border: 1px solid #a7f3d0;
+  color: #065f46;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+  padding: 6px 12px;
+  border-radius: 6px;
+}
+
+.dash-pulse-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #10b981;
+  box-shadow: 0 0 0 2px #d1fae5;
+  animation: syncPulse 2s infinite ease-in-out;
+}
+
+/* Grade de KPIs Vibrantes */
+.dash-kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr));
+  gap: 16px;
+  margin-bottom: 22px;
+}
+
+.dash-kpi-card {
+  position: relative;
+  border-radius: 14px;
+  overflow: hidden;
+  box-shadow: 0 4px 16px rgba(15, 23, 42, 0.06);
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+  border: 1px solid rgba(255, 255, 255, 0.4);
+}
+
+.dash-kpi-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.12);
+}
+
+.dash-kpi-inner {
+  padding: 18px 20px;
+  color: #ffffff;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  min-height: 130px;
+}
+
+/* Paleta Vibrante dos Cards */
+.dash-kpi-blue {
+  background: linear-gradient(135deg, #1d4ed8 0%, #2563eb 50%, #3b82f6 100%);
+}
+.dash-kpi-amber {
+  background: linear-gradient(135deg, #b45309 0%, #d97706 50%, #f59e0b 100%);
+}
+.dash-kpi-purple {
+  background: linear-gradient(135deg, #581c87 0%, #7c3aed 50%, #8b5cf6 100%);
+}
+.dash-kpi-emerald {
+  background: linear-gradient(135deg, #065f46 0%, #059669 50%, #10b981 100%);
+}
+.dash-kpi-cyan {
+  background: linear-gradient(135deg, #075985 0%, #0284c7 50%, #38bdf8 100%);
+}
+.dash-kpi-rose {
+  background: linear-gradient(135deg, #9f1239 0%, #e11d48 50%, #f43f5e 100%);
+}
+
+.dash-kpi-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.dash-kpi-label {
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: rgba(255, 255, 255, 0.9);
+}
+
+.dash-kpi-icon-wrap {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.18);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #ffffff;
+  flex-shrink: 0;
+}
+
+.dash-kpi-value {
+  font-size: 34px;
+  font-weight: 900;
+  line-height: 1.1;
+  margin: 10px 0 6px;
+  letter-spacing: -0.02em;
+  color: #ffffff;
+}
+
+.dash-kpi-footer {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.85);
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+/* Gráficos do Dashboard */
+.dash-chart-card {
+  background: #ffffff;
+  border: 1px solid #dce5f2;
+  border-radius: 14px;
+  box-shadow: 0 4px 16px rgba(15, 23, 42, 0.05);
+}
+
+.dash-badge-blue {
+  background: #eff6ff;
+  color: #2563eb;
+  border: 1px solid #bfdbfe;
+  font-weight: 700;
+}
+
+.dash-badge-red {
+  background: #fef2f2;
+  color: #dc2626;
+  border: 1px solid #fecaca;
+  font-weight: 700;
+}
+
+.dash-badge-purple {
+  background: #f5f3ff;
+  color: #7c3aed;
+  border: 1px solid #ddd6fe;
+  font-weight: 700;
+}
+
+/* Gráfico de Barras Mensais */
+.dash-monthly-chart {
+  display: flex;
+  align-items: stretch;
+  gap: 12px;
+  height: 270px;
+  padding-top: 28px;
+  box-sizing: border-box;
+}
+
+.dash-bar-column {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-end;
+  height: 100%;
+  min-width: 38px;
+}
+
+.dash-bar-value {
+  font-size: 13px;
+  font-weight: 800;
+  color: #1e3a8a;
+  margin-bottom: 6px;
+  line-height: 1;
+}
+
+.dash-bar-track {
+  width: 100%;
+  max-width: 44px;
+  flex: 1;
+  background: #f1f5f9;
+  border-radius: 8px 8px 3px 3px;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  overflow: hidden;
+  position: relative;
+}
+
+.dash-bar-fill {
+  width: 100%;
+  background: linear-gradient(180deg, #38bdf8 0%, #2563eb 60%, #1e3a8a 100%);
+  border-radius: 8px 8px 0 0;
+  box-shadow: 0 4px 12px rgba(37, 99, 235, 0.3);
+  position: relative;
+  transition: height 0.4s ease;
+}
+
+.dash-bar-glow {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 6px;
+  background: #93c5fd;
+  opacity: 0.8;
+  border-radius: 8px 8px 0 0;
+}
+
+.dash-bar-label {
+  font-size: 11.5px;
+  font-weight: 700;
+  color: #64748b;
+  margin-top: 8px;
+  white-space: nowrap;
+}
+
+/* Lista de Unidades com Barras de Progresso Coloridas */
+.dash-units-list {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding-top: 18px;
+}
+
+.dash-unit-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.dash-unit-info {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 13px;
+}
+
+.dash-unit-name {
+  color: #1e293b;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.dash-unit-name b {
+  color: #2563eb;
+  font-weight: 800;
+}
+
+.dash-unit-count {
+  font-size: 14px;
+  font-weight: 800;
+  color: #0f172a;
+}
+
+.dash-unit-count small {
+  font-size: 11px;
+  font-weight: 600;
+  color: #64748b;
+}
+
+.dash-unit-progress-track {
+  height: 8px;
+  background: #f1f5f9;
+  border-radius: 999px;
+  overflow: hidden;
+  width: 100%;
+}
+
+.dash-unit-progress-bar {
+  height: 100%;
+  border-radius: 999px;
+  transition: width 0.4s ease;
+}
+
+.dash-bar-p1 { background: linear-gradient(90deg, #2563eb, #38bdf8); }
+.dash-bar-p2 { background: linear-gradient(90deg, #d97706, #fbbf24); }
+.dash-bar-p3 { background: linear-gradient(90deg, #7c3aed, #a78bfa); }
+.dash-bar-p4 { background: linear-gradient(90deg, #059669, #34d399); }
+.dash-bar-p5 { background: linear-gradient(90deg, #0284c7, #67e8f9); }
+.dash-bar-p6 { background: linear-gradient(90deg, #e11d48, #fb7185); }
+
+/* Badges de Naturezas */
+.dash-nature-tags-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr));
+  gap: 12px;
+  margin-top: 18px;
+}
+
+.dash-nature-badge {
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  padding: 12px 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  transition: all 0.18s ease;
+}
+
+.dash-nature-badge:hover {
+  background: #ffffff;
+  border-color: #cbd5e1;
+  box-shadow: 0 4px 12px rgba(15, 23, 42, 0.05);
+}
+
+.dash-nature-rank {
+  font-size: 11px;
+  font-weight: 800;
+  color: #7c3aed;
+  background: #f5f3ff;
+  border: 1px solid #ede9fe;
+  padding: 2px 7px;
+  border-radius: 5px;
+}
+
+.dash-nature-name {
+  font-size: 13px;
+  font-weight: 700;
+  color: #1e293b;
+  flex: 1;
+}
+
+.dash-nature-qty {
+  font-size: 16px;
+  font-weight: 900;
+  color: #0f172a;
+}
