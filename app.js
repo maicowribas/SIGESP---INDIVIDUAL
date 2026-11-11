@@ -450,10 +450,8 @@ function normalizeOccurrenceRow(raw,index=0,existingList=[]){
   const validadoPor=String(getField('validado_por')||'').trim();
   const isOpPending=(perfilReg==='operador'&&!validadoPor&&valLower!=='validada');
 
-  if(stLower==='pendente'||stLower==='pendente de validação'||valLower.includes('pendente')||isOpPending){
-    statusVal='pendente';
-    statusValidacao='Pendente de validação';
-  }else if(valLower==='validada'||validadoPor||stLower==='validada'||stLower==='em apuração'||stLower==='em apuracao'||stLower==='encerrada'){
+  const isValidated = valLower === 'validada' || Boolean(validadoPor) || stLower === 'validada' || stLower === 'em apuração' || stLower === 'em apuracao' || stLower === 'encerrada';
+  if(isValidated){
     statusValidacao='Validada';
     if(stLower==='em apuração'||stLower==='em apuracao'){
       statusVal='Em Apuração';
@@ -464,6 +462,9 @@ function normalizeOccurrenceRow(raw,index=0,existingList=[]){
     }else{
       statusVal='Registrada';
     }
+  }else if(stLower==='pendente'||stLower==='pendente de validação'||valLower.includes('pendente')||isOpPending){
+    statusVal='pendente';
+    statusValidacao='Pendente de validação';
   }else{
     statusValidacao='Validada';
     statusVal='Registrada';
@@ -1733,16 +1734,16 @@ function hideManualRefreshingModal(){
 let _pollIntervalId=null;
 let _isPollingActive=false;
 let _lastPollStart=0;
-async function smartPollSync(){
-  if(typeof document!=='undefined'&&document.visibilityState==='hidden')return;
+async function smartPollSync(options = {}){
+  if(typeof document!=='undefined'&&document.visibilityState==='hidden'&&!options?.immediate)return;
   if(isFilePickerBlockingSync()||S.folderModal)return;
   if(!S.dir||S.restoring||S.permissionNeeded)return;
-  if(S.submitting)return;
+  if(S.submitting&&!options?.force)return;
 
   const now=Date.now();
   if(_isPollingActive){
-    if(now - _lastPollStart > 12000){
-      console.warn('[SmartPoll] Watchdog: resetando lock de polling travado.');
+    if(options?.force||options?.immediate||(now - _lastPollStart > 12000)){
+      if(!options?.force&&!options?.immediate)console.warn('[SmartPoll] Watchdog: resetando lock de polling travado.');
       _isPollingActive=false;
     }else{
       return;
@@ -1755,7 +1756,7 @@ async function smartPollSync(){
 
     // 1. Sincronização em tempo real de usuários (essencial na tela de login e sessão ativa)
     try{
-      const rawUsersText=await fetchFreshRawCsv('usuarios.csv',{onlyIfChanged:true});
+      const rawUsersText=await fetchFreshRawCsv('usuarios.csv',{onlyIfChanged: !options?.force, force: Boolean(options?.force)});
       if(rawUsersText){
         const freshUsers=parseAndConsolidateCsv(rawUsersText);
         const normalizedFreshUsers=normalizedUsers(freshUsers);
@@ -1790,7 +1791,7 @@ async function smartPollSync(){
 
     // 2. Sincronização em tempo real de ocorrências
     try{
-      const rawText=await fetchFreshRawCsv('ocorrencias.csv',{onlyIfChanged:true});
+      const rawText=await fetchFreshRawCsv('ocorrencias.csv',{onlyIfChanged: !options?.force, force: Boolean(options?.force)});
       if(rawText!==null){
         const freshOcc=rawText?parseAndConsolidateCsv(rawText):[];
         const normalizedFresh=(freshOcc||[]).map((x,idx)=>normalizeOccurrenceRow(x,idx,freshOcc)).filter(Boolean);
@@ -1850,8 +1851,9 @@ async function smartPollSync(){
             return !old||old.id_ocorrencia!==item.id_ocorrencia||old.versao_registro!==item.versao_registro||old.status!==item.status||old.status_validacao!==item.status_validacao;
           });
 
-        if(occChanged||newlyAdded.length>0||newPending.length>0){
+        if(occChanged||newlyAdded.length>0||newPending.length>0||newlyValidatedFromPending.length>0||options?.force){
           S.occ=normalizedFresh;
+          _scopeMemo={rowsRef:null,userKey:'',orgVer:-1,result:[]};
           S.pending=filteredPendingOccurrences();
           CSVService.buildEntry('ocorrencias.csv',normalizedFresh);
           window.StorageService?.IndexedDBEngine?.saveRecordsBulkLocally('ocorrencias.csv',normalizedFresh);
@@ -2069,6 +2071,8 @@ async function login(ev){
     const u=S.users.find(x=>String(x.login||'').trim().toLowerCase()===inputLogin&&x.senha_hash===ph&&x.status==='Ativo');
     if(!u)throw Error('Login, senha ou status inválido.');
     S.user={...u,perfil:canonicalPerfil(u.perfil)};
+    _scopeMemo={rowsRef:null,userKey:'',orgVer:-1,result:[]};
+    S.pending=filteredPendingOccurrences();
     const isOp=hasProfile(S.user,'Operador');
     S.page=isOp?'occ-register':'dashboard';
     S.editing=isOp?{}:null;
@@ -2080,6 +2084,9 @@ async function login(ev){
     S.activeMenu=isOp?'ocorrencias':null;
     S.message='';
     startBackgroundPolling();
+    if(canValidateOccurrence(S.user)){
+      smartPollSync({force:true,immediate:true}).catch(()=>{});
+    }
     if(isOp){
       await openOccurrenceRegistration({forceNew:false});
     }else{
@@ -3147,6 +3154,9 @@ async function validatePendingOcc(id,form=null){
       await withWriteLock('occurrences',async()=>{
         const finalRow={
           ...updatedRow,
+          status:'Registrada',
+          status_validacao:'Validada',
+          validado_por:S.user.login,
           anexos_referencias:finalPhotoPaths.join('|')
         };
         let savedResult=null;
@@ -3156,13 +3166,20 @@ async function validatePendingOcc(id,form=null){
           savedResult=await CSVService.append('ocorrencias.csv',finalRow,H.occ);
         }
         await window.StorageService?.updateOccurrenceInLegacyBase?.(finalRow);
+        const updatedList=S.occ.map(x=>(String(x.id_ocorrencia)===normId||String(x.id_interno)===normId||String(x.numero_protocolo)===String(current.numero_protocolo))?finalRow:x);
+        const consolidatedOcc=window.StorageService?.consolidateVersionedRows
+          ?window.StorageService.consolidateVersionedRows(updatedList)
+          :updatedList;
+        S.occ=consolidatedOcc.map((x,idx)=>normalizeOccurrenceRow(x,idx,consolidatedOcc)).filter(Boolean);
+        _scopeMemo={rowsRef:null,userKey:'',orgVer:-1,result:[]};
+        S.pending=filteredPendingOccurrences();
         if(typeof CSVService!=='undefined'){
           CSVService.buildEntry('ocorrencias.csv',S.occ);
         }
         window.StorageService?.IndexedDBEngine?.saveRecordsBulkLocally('ocorrencias.csv',S.occ).catch(()=>{});
         const stat=await window.StorageService?.getFileStat('ocorrencias.csv').catch(()=>null);
         if(stat){
-          _freshCsvMeta.set('ocorrencias.csv',{mtimeMs:stat.mtimeMs,size:stat.size,rawSig:''});
+          _freshCsvMeta.set('ocorrencias.csv',{mtimeMs:stat.mtimeMs,size:stat.size,rawSig:stat.sig||''});
         }
       });
       prevNewPhotos.forEach(x=>x.url&&URL.revokeObjectURL(x.url));
@@ -4567,8 +4584,8 @@ function filteredPendingOccurrences(){
   for(let i=0,len=list.length;i<len;i++){
     const item=list[i];
     if(isValidatedOccurrence(item)){
-      const idInt=String(item.id_interno||'').trim();
-      const idOcc=String(item.id_ocorrencia||'').trim();
+      const idInt=String(item.id_interno||'').trim().toUpperCase();
+      const idOcc=String(item.id_ocorrencia||'').trim().toUpperCase();
       const proto=String(item.numero_protocolo||'').trim().toUpperCase();
       if(idInt)validatedInts.add(idInt);
       if(idOcc)validatedOccs.add(idOcc);
@@ -4581,8 +4598,8 @@ function filteredPendingOccurrences(){
     const item=list[i];
     if(!isPendingOccurrence(item))continue;
 
-    const idInt=String(item.id_interno||'').trim();
-    const idOcc=String(item.id_ocorrencia||'').trim();
+    const idInt=String(item.id_interno||'').trim().toUpperCase();
+    const idOcc=String(item.id_ocorrencia||'').trim().toUpperCase();
     const proto=String(item.numero_protocolo||'').trim().toUpperCase();
 
     if(idInt&&validatedInts.has(idInt))continue;

@@ -568,12 +568,31 @@ const StorageService = (() => {
         const idOcc = String(r.id_ocorrencia || '').trim();
         const proto = String(r.numero_protocolo || '').trim().toUpperCase();
 
-        if (idInt && byIdInterno.has(idInt)) {
-          key = byIdInterno.get(idInt);
-        } else if (idOcc && byIdOcorrencia.has(idOcc)) {
-          key = byIdOcorrencia.get(idOcc);
-        } else if (proto && byProtocolo.has(proto)) {
-          key = byProtocolo.get(proto);
+        const candidateKeys = [];
+        if (idInt && byIdInterno.has(idInt)) candidateKeys.push(byIdInterno.get(idInt));
+        if (idOcc && byIdOcorrencia.has(idOcc)) candidateKeys.push(byIdOcorrencia.get(idOcc));
+        if (proto && byProtocolo.has(proto)) candidateKeys.push(byProtocolo.get(proto));
+
+        if (candidateKeys.length > 0) {
+          key = candidateKeys[0];
+          // Se múltiplos identificadores apontavam para chaves distintas, unifica no map
+          for (let c = 1; c < candidateKeys.length; c++) {
+            const otherKey = candidateKeys[c];
+            if (otherKey !== key && map.has(otherKey)) {
+              const otherVal = map.get(otherKey);
+              map.delete(otherKey);
+              const curVal = map.get(key);
+              if (curVal && otherVal) {
+                const curValid = isRowValidated(curVal);
+                const othValid = isRowValidated(otherVal);
+                if (othValid && !curValid) {
+                  map.set(key, { ...curVal, ...otherVal });
+                } else {
+                  map.set(key, { ...otherVal, ...curVal });
+                }
+              }
+            }
+          }
         } else {
           key = idInt ? `INT:${idInt}` : (idOcc ? `OCC:${idOcc}` : `PROTO:${proto}`);
         }
@@ -636,13 +655,13 @@ const StorageService = (() => {
           if (existHasApur && !newHasApur) {
             continue;
           }
-        } else {
-          // vNew < vExist: Linha anterior no histórico de append não pode reverter estado consolidado
+        } else if (!newValid && existValid) {
+          // vNew < vExist ou versão legada não validada não pode reverter registro validado
           continue;
         }
 
         const merged = { ...existing, ...r };
-        if (newPend) {
+        if (newPend && !existValid && !newValid) {
           merged.status_validacao = 'Pendente de validação';
           merged.status = 'pendente';
         } else if (newValid || existValid) {
@@ -671,9 +690,47 @@ const StorageService = (() => {
         }
       }
     }
-    const out = order.map(k => map.get(k)).filter(Boolean);
-    Object.defineProperty(out, '_consolidated', { value: true, enumerable: false, configurable: true });
-    return out;
+
+    const out = [];
+    const seenFinalKeys = new Set();
+    for (const k of order) {
+      if (seenFinalKeys.has(k)) continue;
+      seenFinalKeys.add(k);
+      const val = map.get(k);
+      if (val) out.push(val);
+    }
+
+    // Passagem de limpeza estrita: garante que nenhum registro pendente permaneça
+    // se qualquer versão correspondente já estiver validada
+    const valProtos = new Set();
+    const valInts = new Set();
+    const valOccs = new Set();
+    for (const item of out) {
+      if (isRowValidated(item)) {
+        const p = String(item.numero_protocolo || '').trim().toUpperCase();
+        const intId = String(item.id_interno || '').trim();
+        const occId = String(item.id_ocorrencia || '').trim();
+        if (p) valProtos.add(p);
+        if (intId) valInts.add(intId);
+        if (occId) valOccs.add(occId);
+      }
+    }
+
+    const finalOut = [];
+    for (const item of out) {
+      if (isRowPending(item)) {
+        const p = String(item.numero_protocolo || '').trim().toUpperCase();
+        const intId = String(item.id_interno || '').trim();
+        const occId = String(item.id_ocorrencia || '').trim();
+        if ((p && valProtos.has(p)) || (intId && valInts.has(intId)) || (occId && valOccs.has(occId))) {
+          continue;
+        }
+      }
+      finalOut.push(item);
+    }
+
+    Object.defineProperty(finalOut, '_consolidated', { value: true, enumerable: false, configurable: true });
+    return finalOut;
   }
 
   /**
@@ -1315,6 +1372,9 @@ const StorageService = (() => {
             const res = await fetch(batchUrl, { method: 'GET', headers: { 'Cache-Control': 'no-cache' } });
             if (res.ok) {
               const payload = await res.json();
+              if (payload && !payload.unchanged) {
+                _preloadedOccurrencesBatch = payload;
+              }
               const size = Number(payload?.totalSize ?? payload?.size ?? 0);
               const mtimeMs = Number(payload?.maxMtimeMs ?? payload?.mtimeMs ?? 0);
               return { exists: size > 0 || (payload?.count || 0) > 0, size, mtimeMs, sig: payload?.sig || '' };
@@ -2258,9 +2318,10 @@ const StorageService = (() => {
     async fetchFreshOccurrencesCsv(options = {}, metaMap = null) {
       const fileName = 'ocorrencias.csv';
       const prevMeta = metaMap ? metaMap.get(fileName) : null;
+      const isForce = Boolean(options?.force);
       const stat = await this.getFileStat(fileName).catch(() => ({ exists: false, size: 0, mtimeMs: 0 }));
 
-      if (options?.onlyIfChanged && prevMeta && !options?.force) {
+      if (options?.onlyIfChanged && prevMeta && !isForce) {
         if (stat.sig && prevMeta.rawSig && stat.sig === prevMeta.rawSig && stat.size === prevMeta.size) {
           return null;
         }
@@ -2272,7 +2333,7 @@ const StorageService = (() => {
       const prevSig = _lastKnownBatchSig;
       const rows = await this._readOccurrencesBatchFromStorage({ force: true, optional: true });
       const cached = _rawFileCache.get(fileName);
-      if (options?.onlyIfChanged && !options?.force && prevSig && cached?.rawSig && cached.rawSig === prevSig && cached.rawSig === prevMeta?.rawSig) {
+      if (options?.onlyIfChanged && !isForce && prevSig && cached?.rawSig && cached.rawSig === prevSig && cached.rawSig === prevMeta?.rawSig) {
         if (metaMap && cached) {
           metaMap.set(fileName, { mtimeMs: cached.mtimeMs, size: cached.size, rawSig: cached.rawSig });
         }
@@ -3806,15 +3867,21 @@ const StorageService = (() => {
       const idInt = String(record.id_interno || '').trim();
 
       const cachedOcc = _rawFileCache.get('ocorrencias.csv');
+      let updated = false;
       if (cachedOcc && Array.isArray(cachedOcc.rows)) {
-        let updated = false;
         cachedOcc.rows = cachedOcc.rows.map(row => {
           const rProto = String(row.numero_protocolo || '').trim().toUpperCase();
           const rId = String(row.id_ocorrencia || '').trim();
           const rInt = String(row.id_interno || '').trim();
           if ((proto && rProto === proto) || (id && rId === id) || (idInt && rInt === idInt)) {
             updated = true;
-            return { ...row, ...record, status: 'Registrada', status_validacao: 'Validada' };
+            return {
+              ...row,
+              ...record,
+              status: record.status || 'Registrada',
+              status_validacao: 'Validada',
+              validado_por: record.validado_por || 'Supervisor'
+            };
           }
           return row;
         });
@@ -3824,6 +3891,43 @@ const StorageService = (() => {
             legEntry.rows = cachedOcc.rows;
           }
         }
+      }
+
+      // Sincronização persistente com o arquivo no disco dados/ocorrencias.csv
+      try {
+        const dir = getActiveDirectoryHandle();
+        if (dir) {
+          const rawText = await this.readEncryptedCsv('ocorrencias.csv', { force: true, optional: true }).catch(() => []);
+          const existingRows = Array.isArray(rawText) ? rawText : (cachedOcc?.rows || []);
+          let diskChanged = false;
+          const nextRows = existingRows.map(row => {
+            const rProto = String(row.numero_protocolo || '').trim().toUpperCase();
+            const rId = String(row.id_ocorrencia || '').trim();
+            const rInt = String(row.id_interno || '').trim();
+            if ((proto && rProto === proto) || (id && rId === id) || (idInt && rInt === idInt)) {
+              diskChanged = true;
+              return {
+                ...row,
+                ...record,
+                status: record.status || 'Registrada',
+                status_validacao: 'Validada',
+                validado_por: record.validado_por || 'Supervisor'
+              };
+            }
+            return row;
+          });
+
+          if (diskChanged && nextRows.length > 0) {
+            const headers = CANONICAL_SEEDS['ocorrencias.csv']?.headers || Object.keys(nextRows[0] || {});
+            const serialized = serializeCsv(nextRows, headers);
+            if (window.CryptoService) {
+              const enc = await window.CryptoService.encrypt(serialized, { fileName: 'ocorrencias.csv' });
+              await this.writeRawFile('ocorrencias.csv', enc);
+            }
+          }
+        }
+      } catch (legacyDiskErr) {
+        console.warn('[StorageService] updateOccurrenceInLegacyBase sincronização de disco:', legacyDiskErr);
       }
     }
   };
