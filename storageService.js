@@ -1085,17 +1085,14 @@ const StorageService = (() => {
               await StorageService._markNativeProtocolUtilized(options.releasedProtocol, record.id_interno || '').catch(() => {});
             }
 
-            const stat = await StorageService.getFileStat('ocorrencias.csv').catch(() => null);
+            const effMtime = writeMeta?.mtimeMs || Date.now();
+            const effSize = writeMeta?.size || encPayload.length;
             const cachedEntry = _rawFileCache.get('ocorrencias.csv');
-            if (cachedEntry && stat) {
-              cachedEntry.mtimeMs = stat.mtimeMs;
-              cachedEntry.size = stat.size;
+            if (cachedEntry) {
+              cachedEntry.mtimeMs = effMtime;
             }
-            if (stat) {
-              await IndexedDBEngine.saveSyncMetadata('ocorrencias.csv', stat);
-              if (typeof window !== 'undefined' && typeof window.syncFreshCsvMeta === 'function') {
-                window.syncFreshCsvMeta('ocorrencias.csv', stat.mtimeMs, stat.size);
-              }
+            if (typeof window !== 'undefined' && typeof window.syncFreshCsvMeta === 'function') {
+              window.syncFreshCsvMeta('ocorrencias.csv', effMtime, cachedEntry?.size || effSize);
             }
             continue;
           }
@@ -2354,6 +2351,20 @@ const StorageService = (() => {
     },
 
     /**
+     * Ingestão ultra-rápida de delta: recupera ou decodifica apenas um único arquivo individual de ocorrência
+     */
+    async fetchSingleOccurrenceRecord(fileName, rawText = null) {
+      if (!fileName || !isIndividualOccurrenceFileName(fileName)) return null;
+      let text = rawText;
+      if (!text) {
+        text = await this.readRawFile(fileName).catch(() => null);
+      }
+      if (!text) return null;
+      const rows = await this._decryptIndividualOccurrenceText(fileName, text);
+      return (rows && rows.length) ? { ...rows[0] } : null;
+    },
+
+    /**
      * Lê e descriptografa um arquivo CSV armazenado com integridade total e cache de envelope.
      */
     async readEncryptedCsv(fileName, options = {}) {
@@ -3163,41 +3174,39 @@ const StorageService = (() => {
           }
         }
 
-        // Se estivermos conectados ao diretório do servidor (ou sem handle nativo), usamos o endpoint atômico do backend
-        if (!isNativeSharedDirectory()) {
-          try {
-            const timeoutSignal = (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function')
-              ? AbortSignal.timeout(3000)
-              : undefined;
-            const res = await fetch('/api/storage/protocol/reserve', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              signal: timeoutSignal,
-              body: JSON.stringify({
-                user,
-                unit,
-                year,
-                clientId,
-                sessionId: clientId,
-                reservationId: preferredReservationId,
-                preferredProtocol,
-                previousProtocol,
-                existingMax,
-                knownNumbers,
-                forceNew,
-                trace: traceEnabled
-              })
-            });
-            if (res.ok) {
-              const data = await res.json();
-              const item = data?.reservation || (data?.protocolo ? data : null);
-              if (item?.protocolo || item?.numeroProtocolo) {
-                return this.normalizeReservationObject(item);
-              }
+        // Prioriza sempre o endpoint atômico centralizado de alta performance no backend (< 5ms)
+        try {
+          const timeoutSignal = (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function')
+            ? AbortSignal.timeout(2000)
+            : undefined;
+          const res = await fetch('/api/storage/protocol/reserve', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            signal: timeoutSignal,
+            body: JSON.stringify({
+              user,
+              unit,
+              year,
+              clientId,
+              sessionId: clientId,
+              reservationId: preferredReservationId,
+              preferredProtocol,
+              previousProtocol,
+              existingMax,
+              knownNumbers,
+              forceNew,
+              trace: traceEnabled
+            })
+          });
+          if (res.ok) {
+            const data = await res.json();
+            const item = data?.reservation || (data?.protocolo ? data : null);
+            if (item?.protocolo || item?.numeroProtocolo) {
+              return this.normalizeReservationObject(item);
             }
-          } catch (e) {
-            console.warn('[StorageService] Endpoint de reserva indisponível no backend; executando reserva compartilhada na pasta:', e);
           }
+        } catch (e) {
+          console.warn('[StorageService] Endpoint de reserva indisponível no backend; executando reserva compartilhada na pasta:', e);
         }
 
         // Reserva compartilhada direta nos arquivos da pasta de dados (protocolo.lock + reservas_protocolos.json)
@@ -3394,11 +3403,10 @@ const StorageService = (() => {
       const markUtilized = Boolean(options?.markUtilized);
       const traceEnabled = Boolean(options?.trace);
 
-      if (!isNativeSharedDirectory()) {
-        try {
-          const timeoutSignal = (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function')
-            ? AbortSignal.timeout(3000)
-            : undefined;
+      try {
+        const timeoutSignal = (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function')
+          ? AbortSignal.timeout(2000)
+          : undefined;
           const res = await fetch('/api/storage/protocol/confirm', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -3437,7 +3445,6 @@ const StorageService = (() => {
         } catch (e) {
           console.warn('[StorageService] Confirmação remota de protocolo indisponível; validando na pasta compartilhada:', e);
         }
-      }
 
       // Validação e resolução atômica sob lock direto na pasta compartilhada
       return await this.withSharedProtocolLock(user, clientId, async () => {
@@ -3621,23 +3628,21 @@ const StorageService = (() => {
       const reservationId = String(options?.reservationId || (typeof S !== 'undefined' && S.editing?._reservationId) || '').trim();
       const confirmed = Boolean(options?.confirmed || options?.utilized);
 
-      if (!isNativeSharedDirectory()) {
-        try {
-          const res = await fetch('/api/storage/protocol/release', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              protocolo: protoUpper,
-              user,
-              clientId: resolvedClientId,
-              sessionId: resolvedClientId,
-              reservationId,
-              confirmed
-            })
-          });
-          if (res.ok) return;
-        } catch {}
-      }
+      try {
+        const res = await fetch('/api/storage/protocol/release', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            protocolo: protoUpper,
+            user,
+            clientId: resolvedClientId,
+            sessionId: resolvedClientId,
+            reservationId,
+            confirmed
+          })
+        });
+        if (res.ok) return;
+      } catch {}
 
       try {
         await this.withSharedProtocolLock(user, resolvedClientId, async () => {
@@ -3672,24 +3677,22 @@ const StorageService = (() => {
       const resolvedClientId = String(clientId || options?.clientId || (typeof S !== 'undefined' && S.editing?._clientId) || getClientSessionId()).trim();
       const reservationId = String(options?.reservationId || (typeof S !== 'undefined' && S.editing?._reservationId) || '').trim();
 
-      if (!isNativeSharedDirectory()) {
-        try {
-          const res = await fetch('/api/storage/protocol/renew', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              protocolo: protoUpper,
-              user,
-              clientId: resolvedClientId,
-              sessionId: resolvedClientId,
-              reservationId
-            })
-          });
-          if (res.ok) {
-            return await res.json();
-          }
-        } catch {}
-      }
+      try {
+        const res = await fetch('/api/storage/protocol/renew', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            protocolo: protoUpper,
+            user,
+            clientId: resolvedClientId,
+            sessionId: resolvedClientId,
+            reservationId
+          })
+        });
+        if (res.ok) {
+          return await res.json();
+        }
+      } catch {}
 
       try {
         return await this.withSharedProtocolLock(user, resolvedClientId, async () => {

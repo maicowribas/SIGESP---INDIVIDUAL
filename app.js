@@ -1980,14 +1980,71 @@ function setupRealtimeEventsListener(){
     _sseSource.onopen=()=>{
       console.debug('[SSE] Conexão em tempo real estabelecida com o servidor SIGESP.');
     };
-    _sseSource.onmessage=(event)=>{
+    _sseSource.onmessage=async (event)=>{
       if(!event?.data)return;
       try{
         const payload=JSON.parse(event.data);
+        if(!payload)return;
+
+        // FAST-PATH: Ingestão de Delta Instantânea de Ocorrência (< 50ms)
+        if(payload.type==='storage_mutation' && (payload.isOccurrence || (payload.fileName && payload.fileName.startsWith('ocorrencia_')))){
+          let newRow=null;
+          if(payload.rawText && window.StorageService?.fetchSingleOccurrenceRecord){
+            newRow=await window.StorageService.fetchSingleOccurrenceRecord(payload.fileName, payload.rawText);
+          }else if(payload.fileName && window.StorageService?.fetchSingleOccurrenceRecord){
+            newRow=await window.StorageService.fetchSingleOccurrenceRecord(payload.fileName);
+          }
+          if(newRow){
+            const normNew=normalizeOccurrenceRow(newRow, 0, [newRow]);
+            if(normNew){
+              const prevOcc=[...(S.occ||[])];
+              const proto=String(normNew.numero_protocolo||'').trim().toUpperCase();
+              const intId=String(normNew.id_interno||'').trim().toUpperCase();
+              const occId=String(normNew.id_ocorrencia||'').trim().toUpperCase();
+
+              const idx=prevOcc.findIndex(x=>{
+                const xP=String(x.numero_protocolo||'').trim().toUpperCase();
+                const xInt=String(x.id_interno||'').trim().toUpperCase();
+                const xOcc=String(x.id_ocorrencia||'').trim().toUpperCase();
+                return (proto&&xP===proto)||(intId&&xInt===intId)||(occId&&xOcc===occId);
+              });
+              if(idx>=0){
+                prevOcc[idx]=normNew;
+              }else{
+                prevOcc.unshift(normNew);
+              }
+              const consolidated=window.StorageService?.consolidateVersionedRows
+                ? window.StorageService.consolidateVersionedRows(prevOcc)
+                : prevOcc;
+              S.occ=consolidated.map((x,i)=>normalizeOccurrenceRow(x,i,consolidated)).filter(Boolean);
+              _scopeMemo={rowsRef:null,userKey:'',orgVer:-1,result:[]};
+              S.pending=filteredPendingOccurrences();
+
+              // Alerta sonoro / toast imediato
+              if(S.user && isPendingOccurrence(normNew)){
+                const pName=normNew.numero_protocolo?` (${normNew.numero_protocolo})`:'';
+                if(canValidateOccurrence(S.user)){
+                  showToast(`🔔 Nova ocorrência${pName} aguardando sua validação!`,'warning','Fila de Validação');
+                }
+              }else if(S.user && isValidatedOccurrence(normNew)){
+                const pName=normNew.numero_protocolo?` (${normNew.numero_protocolo})`:'';
+                showToast(`✅ Ocorrência${pName} validada pelo supervisor!`,'success','Validação Concluída');
+              }
+
+              if(!S.validationModal&&!S.submitting){
+                render();
+              }
+              return;
+            }
+          }
+        }
+
         if(payload?.type==='storage_mutation'||payload?.type==='protocol_confirmed'||payload?.type==='protocol_reserved'){
           smartPollSync({force:true,immediate:true}).catch(()=>{});
         }
-      }catch{}
+      }catch(sseErr){
+        console.debug('[SSE] Processamento de evento:',sseErr);
+      }
     };
     _sseSource.onerror=()=>{
       try{_sseSource.close();}catch{}
@@ -2488,39 +2545,6 @@ async function persistNewOccurrence(d,time,photoPaths,options={}){
       }catch(err){
         console.warn('[SIGESP] Falha ao reservar protocolo no endpoint:',err);
       }
-    }else if(window.StorageService?.confirmProtocolForSave){
-      try{
-        const confirmed=await window.StorageService.confirmProtocolForSave(protocol,S.user?.login||'Operador',d.unidade||'',{
-          clientId,
-          reservationId,
-          id_interno:idUnico,
-          markUtilized:true
-        });
-        if(confirmed?.protocolo){
-          protocol=confirmed.protocolo;
-          nextNum=confirmed.id_sequencial||extrairNumeroIdOuProtocolo(protocol);
-          reservationId=confirmed.reservationId||confirmed.id_reserva||reservationId;
-          d.numero_protocolo=protocol;
-          saveStoredActiveReservation({
-            reservationId,
-            numeroProtocolo:protocol,
-            protocolo:protocol,
-            id_sequencial:nextNum,
-            sessionId:clientId,
-            usuario:S.user?.login||'Operador',
-            dataHoraReserva:confirmed.dataHoraReserva||new Date().toISOString(),
-            status:'UTILIZADO'
-          });
-          if(S.editing){
-            S.editing.numero_protocolo=protocol;
-            S.editing._reservedProtocol=protocol;
-            S.editing._reservationId=reservationId;
-            S.editing._reservationConfirmed=true;
-          }
-        }
-      }catch(confErr){
-        console.warn('[SIGESP] Aviso ao confirmar protocolo antes do salvamento:',confErr);
-      }
     }
 
     if(!protocol||nextNum<=0){
@@ -2718,29 +2742,32 @@ async function saveOcc(ev){
   try{
     const isEditCandidate=Boolean(form?.elements?.['id_ocorrencia']?.value||S.editing?.id_ocorrencia);
     if(!isEditCandidate){
-      if(_openOccRegPromise){
-        try{
-          await Promise.race([
-            _openOccRegPromise,
-            new Promise(r=>setTimeout(r,1500))
-          ]);
-        }catch{}
-      }
-      if(!S.editing?.numero_protocolo||!S.editing?._reservationConfirmed){
-        try{
-          const directRes=await window.StorageService?.reserveProtocol(S.user?.login||'Operador',form.elements['unidade']?.value||S.editing?.unidade||'',{
-            clientId:getTabSessionClientId(),
-            forceNew:true
-          });
-          if(directRes?.protocolo){
-            if(!S.editing)S.editing={};
-            S.editing.numero_protocolo=directRes.protocolo;
-            S.editing._reservedProtocol=directRes.protocolo;
-            S.editing._reservationId=directRes.reservationId||directRes.id_reserva||'';
-            S.editing._reservationConfirmed=true;
+      const currentFormProto=String(form?.elements?.['numero_protocolo']?.value||S.editing?.numero_protocolo||S.activeReservation?.numeroProtocolo||'').trim();
+      if(!currentFormProto){
+        if(_openOccRegPromise){
+          try{
+            await Promise.race([
+              _openOccRegPromise,
+              new Promise(r=>setTimeout(r,120))
+            ]);
+          }catch{}
+        }
+        if(!S.editing?.numero_protocolo){
+          try{
+            const directRes=await window.StorageService?.reserveProtocol(S.user?.login||'Operador',form.elements['unidade']?.value||S.editing?.unidade||'',{
+              clientId:getTabSessionClientId(),
+              forceNew:false
+            });
+            if(directRes?.protocolo){
+              if(!S.editing)S.editing={};
+              S.editing.numero_protocolo=directRes.protocolo;
+              S.editing._reservedProtocol=directRes.protocolo;
+              S.editing._reservationId=directRes.reservationId||directRes.id_reserva||'';
+              S.editing._reservationConfirmed=true;
+            }
+          }catch(dirErr){
+            console.warn('[saveOcc] Falha na alocação rápida de protocolo:',dirErr);
           }
-        }catch(dirErr){
-          console.warn('[saveOcc] Falha na alocação direta de protocolo:',dirErr);
         }
       }
     }

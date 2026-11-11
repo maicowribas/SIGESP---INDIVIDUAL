@@ -695,14 +695,18 @@ async function readReservations() {
 
 async function writeReservations(list) {
   await fs.mkdir(DADOS_DIR, { recursive: true });
-  const payload = Buffer.from(JSON.stringify(list, null, 2), 'utf8');
+  const now = Date.now();
+  // Mantém reservas ativas, utilizadas ou criadas nas últimas 2 horas
+  const activeOrRecent = (Array.isArray(list) ? list : []).filter(r => {
+    if (!r) return false;
+    if (r.status === 'UTILIZADO' || r.status === 'CONFIRMADO') return true;
+    if (r.status === 'RESERVADO' && r.expiresAt > now) return true;
+    if (r.createdAt && now - r.createdAt < 2 * 60 * 60 * 1000) return true;
+    return false;
+  });
+  const payload = Buffer.from(JSON.stringify(activeOrRecent, null, 2), 'utf8');
   await atomicWriteFile(RESERVATIONS_FILE, payload);
-  const verifyRaw = await fs.readFile(RESERVATIONS_FILE, 'utf8');
-  const verifyParsed = JSON.parse(verifyRaw);
-  if (!Array.isArray(verifyParsed)) {
-    throw new Error('Falha na confirmação de persistência das reservas de protocolo.');
-  }
-  return verifyParsed;
+  return activeOrRecent;
 }
 
 function deriveServerKey(saltB64) {
@@ -832,7 +836,6 @@ async function extractExistingNumbersFromOcorrencias(year) {
   const used = new Set();
   const regex = new RegExp(`OC-${year}-(\\d{1,8})`, 'gi');
   const fileNameProtoRegex = new RegExp(`OC-${year}-(\\d{1,8})`, 'i');
-  const indivFilesToRead = [];
 
   for (const fileName of occNames) {
     const nameMatch = fileNameProtoRegex.exec(fileName);
@@ -840,14 +843,12 @@ async function extractExistingNumbersFromOcorrencias(year) {
       const num = parseInt(nameMatch[1], 10);
       if (!isNaN(num) && num > 0) {
         used.add(num);
-        continue;
       }
     }
-    indivFilesToRead.push({ name: fileName, path: path.join(DADOS_DIR, fileName), size: 1 });
   }
 
-  const allToRead = [...indivFilesToRead, ...stats];
-  for (const item of allToRead) {
+  // Lê apenas arquivos consolidados stats (ocorrencias.csv e registros_apagados.csv) com regex ultrarrápida
+  for (const item of stats) {
     if (item.size <= 0) continue;
     try {
       const raw = await fs.readFile(item.path, 'utf8');
@@ -856,14 +857,6 @@ async function extractExistingNumbersFromOcorrencias(year) {
       while ((m = regex.exec(raw)) !== null) {
         const num = parseInt(m[1], 10);
         if (!isNaN(num) && num > 0) used.add(num);
-      }
-      if (raw.includes('SIGESP_ENC_v1:')) {
-        const decrypted = decryptEncryptedContent(raw);
-        regex.lastIndex = 0;
-        while ((m = regex.exec(decrypted)) !== null) {
-          const num = parseInt(m[1], 10);
-          if (!isNaN(num) && num > 0) used.add(num);
-        }
       }
     } catch {}
   }
@@ -1521,7 +1514,8 @@ function createStorageMiddleware() {
           isOccurrence: isOccTarget,
           mtimeMs: stat.mtimeMs,
           size: stat.size,
-          protocol: releasedHeader || null
+          protocol: releasedHeader || null,
+          rawText: isOccTarget && buffer.length < 131072 ? buffer.toString('utf8') : undefined
         });
 
         res.statusCode = 200;
@@ -1581,12 +1575,16 @@ function createStorageMiddleware() {
           }).catch(err => logProtocolError('confirmOnAppend', err, { protoUpper }));
         }
 
+        const baseNameAppend = path.basename(target).toLowerCase();
+        const isOccAppend = baseNameAppend === 'ocorrencias.csv' || isIndividualOccurrenceFile(baseNameAppend);
         broadcastStorageEvent('storage_mutation', {
           action: 'append',
-          fileName: path.basename(target).toLowerCase(),
+          fileName: baseNameAppend,
+          isOccurrence: isOccAppend,
           mtimeMs: stat.mtimeMs,
           size: stat.size,
-          protocol: protoToRelease || null
+          protocol: protoToRelease || null,
+          rawText: isOccAppend && chunk.length < 131072 ? chunkStr : undefined
         });
 
         res.statusCode = 200;
