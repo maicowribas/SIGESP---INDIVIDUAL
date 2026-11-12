@@ -118,6 +118,8 @@ const StorageService = (() => {
   let _lastKnownBundleSig = '';
   let _preloadedOccurrencesBatch = null;
   let _clientSessionId = null;
+  let _legacyDiskSyncTimer = null;
+  let _legacyDiskSyncPromise = Promise.resolve();
 
   function isTombstonedOccurrence(record) {
     if (!record || typeof record !== 'object') return false;
@@ -146,7 +148,7 @@ const StorageService = (() => {
     if (clean) _deletedOccurrencesTombstones.set(clean, exp);
   }
 
-  function registerPendingValidation(record, ttlMs = 45000) {
+  function registerPendingValidation(record, ttlMs = 120000) {
     if (!record || typeof record !== 'object') return;
     const exp = Date.now() + ttlMs;
     const proto = String(record.numero_protocolo || '').trim().toUpperCase();
@@ -159,16 +161,22 @@ const StorageService = (() => {
   }
 
   function getActivePendingValidation(record) {
-    if (!record || typeof record !== 'object') return null;
+    if (!record) return null;
     const now = Date.now();
-    const proto = String(record.numero_protocolo || '').trim().toUpperCase();
-    const occ = String(record.id_ocorrencia || '').trim().toUpperCase();
-    const idInt = String(record.id_interno || '').trim().toUpperCase();
-    const keys = [
-      idInt ? `INT:${idInt}` : '',
-      occ ? `OCC:${occ}` : '',
-      proto ? `PROTO:${proto}` : ''
-    ].filter(Boolean);
+    let keys = [];
+    if (typeof record === 'string') {
+      const norm = record.trim().toUpperCase();
+      keys = [`PROTO:${norm}`, `OCC:${norm}`, `INT:${norm}`, norm];
+    } else if (typeof record === 'object') {
+      const proto = String(record.numero_protocolo || '').trim().toUpperCase();
+      const occ = String(record.id_ocorrencia || '').trim().toUpperCase();
+      const idInt = String(record.id_interno || '').trim().toUpperCase();
+      keys = [
+        idInt ? `INT:${idInt}` : '',
+        occ ? `OCC:${occ}` : '',
+        proto ? `PROTO:${proto}` : ''
+      ].filter(Boolean);
+    }
     for (const k of keys) {
       const entry = _pendingValidationsMap.get(k);
       if (entry) {
@@ -1961,7 +1969,7 @@ const StorageService = (() => {
       if (parsed.length > 5000) {
         await new Promise(r => setTimeout(r, 0));
       }
-      const rows = parsed.length <= 1 ? parsed : consolidateVersionedRows(parsed);
+      const rows = (!parsed || !parsed.length) ? [] : consolidateVersionedRows(parsed);
       _individualOccFileCache.set(indivName, {
         rawSig,
         mtimeMs: mtimeMs || Date.now(),
@@ -4041,6 +4049,10 @@ const StorageService = (() => {
       const id = String(record.id_ocorrencia || '').trim();
       const idInt = String(record.id_interno || '').trim();
 
+      // Registra no mapa de validações imediatas da sessão
+      registerPendingValidation(record, 120000);
+
+      // 1. Atualização atômica em memória dos caches
       const cachedOcc = _rawFileCache.get('ocorrencias.csv');
       let updated = false;
       if (cachedOcc && Array.isArray(cachedOcc.rows)) {
@@ -4068,42 +4080,34 @@ const StorageService = (() => {
         }
       }
 
-      // Sincronização persistente com o arquivo no disco dados/ocorrencias.csv
-      try {
-        const dir = getActiveDirectoryHandle();
-        if (dir) {
-          const rawText = await this.readEncryptedCsv('ocorrencias.csv', { force: true, optional: true }).catch(() => []);
-          const existingRows = Array.isArray(rawText) ? rawText : (cachedOcc?.rows || []);
-          let diskChanged = false;
-          const nextRows = existingRows.map(row => {
-            const rProto = String(row.numero_protocolo || '').trim().toUpperCase();
-            const rId = String(row.id_ocorrencia || '').trim();
-            const rInt = String(row.id_interno || '').trim();
-            if ((proto && rProto === proto) || (id && rId === id) || (idInt && rInt === idInt)) {
-              diskChanged = true;
-              return {
-                ...row,
-                ...record,
-                status: record.status || 'Registrada',
-                status_validacao: 'Validada',
-                validado_por: record.validado_por || 'Supervisor'
-              };
-            }
-            return row;
-          });
-
-          if (diskChanged && nextRows.length > 0) {
-            const headers = CANONICAL_SEEDS['ocorrencias.csv']?.headers || Object.keys(nextRows[0] || {});
-            const serialized = serializeCsv(nextRows, headers);
-            if (window.CryptoService) {
-              const enc = await window.CryptoService.encrypt(serialized, { fileName: 'ocorrencias.csv' });
-              await this.writeRawFile('ocorrencias.csv', enc);
-            }
-          }
-        }
-      } catch (legacyDiskErr) {
-        console.warn('[StorageService] updateOccurrenceInLegacyBase sincronização de disco:', legacyDiskErr);
+      // 2. Atualização debounced e serializada no disco dados/ocorrencias.csv sem releituras destrutivas da rede
+      if (_legacyDiskSyncTimer) {
+        clearTimeout(_legacyDiskSyncTimer);
       }
+      _legacyDiskSyncTimer = setTimeout(() => {
+        _legacyDiskSyncTimer = null;
+        _legacyDiskSyncPromise = _legacyDiskSyncPromise.catch(() => {}).then(async () => {
+          try {
+            const dir = getActiveDirectoryHandle();
+            if (!dir) return;
+            const currentCache = _rawFileCache.get('ocorrencias.csv');
+            const rowsToPersist = Array.isArray(currentCache?.rows) && currentCache.rows.length > 0
+              ? currentCache.rows
+              : (typeof S !== 'undefined' && Array.isArray(S.occ) ? S.occ : []);
+
+            if (rowsToPersist.length > 0) {
+              const headers = CANONICAL_SEEDS['ocorrencias.csv']?.headers || Object.keys(rowsToPersist[0] || {});
+              const serialized = serializeCsv(rowsToPersist, headers);
+              if (window.CryptoService) {
+                const enc = await window.CryptoService.encrypt(serialized, { fileName: 'ocorrencias.csv' });
+                await this.writeRawFile('ocorrencias.csv', enc);
+              }
+            }
+          } catch (diskErr) {
+            console.warn('[StorageService] updateOccurrenceInLegacyBase sync disco:', diskErr);
+          }
+        });
+      }, 120);
     },
     addOccurrenceTombstone,
     isTombstonedOccurrence,

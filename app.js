@@ -448,10 +448,16 @@ function normalizeOccurrenceRow(raw,index=0,existingList=[]){
   const valLower=String(statusValidacao).trim().toLowerCase();
   const stLower=String(statusVal).trim().toLowerCase();
   const perfilReg=String(getField('perfil_registro')||getField('perfil')||'').trim().toLowerCase();
-  const validadoPor=String(getField('validado_por')||'').trim();
-  const isOpPending=(perfilReg==='operador'&&!validadoPor&&valLower!=='validada');
+  let validadoPor=String(getField('validado_por')||'').trim();
+  const activeValidationEntry = (typeof window!=='undefined'&&window.StorageService?.getActivePendingValidation)
+    ? (window.StorageService.getActivePendingValidation(proto) || window.StorageService.getActivePendingValidation(idOcc) || window.StorageService.getActivePendingValidation(idInt) || window.StorageService.getActivePendingValidation(raw))
+    : null;
+  if(activeValidationEntry && !validadoPor){
+    validadoPor=String(activeValidationEntry.validado_por||'Supervisor').trim();
+  }
+  const isOpPending=(perfilReg==='operador'&&!validadoPor&&!activeValidationEntry&&valLower!=='validada');
 
-  const isValidated = valLower === 'validada' || Boolean(validadoPor) || stLower === 'validada' || stLower === 'em apuração' || stLower === 'em apuracao' || stLower === 'encerrada';
+  const isValidated = valLower === 'validada' || Boolean(validadoPor) || Boolean(activeValidationEntry) || stLower === 'validada' || stLower === 'em apuração' || stLower === 'em apuracao' || stLower === 'encerrada';
   if(isValidated){
     statusValidacao='Validada';
     if(stLower==='em apuração'||stLower==='em apuracao'){
@@ -2534,7 +2540,16 @@ async function persistNewOccurrence(d,time,photoPaths,options={}){
   const clientId=d._clientId||S.editing?._clientId||S.activeReservation?.sessionId||(window.StorageService?.getClientSessionId?window.StorageService.getClientSessionId():uid());
   let reservationId=d._reservationId||S.editing?._reservationId||S.activeReservation?.reservationId||'';
 
-  for(let attempt=0;attempt<5;attempt++){
+  if(_openOccRegPromise){
+    try{
+      await Promise.race([
+        _openOccRegPromise,
+        new Promise((_, reject)=>setTimeout(()=>reject(new Error('timeout')),2000))
+      ]);
+    }catch{}
+  }
+
+  for(let attempt=0;attempt<2;attempt++){
     let protocol=String(d.numero_protocolo||S.editing?.numero_protocolo||S.activeReservation?.numeroProtocolo||S.activeReservation?.protocolo||'').trim();
     let nextNum=extrairNumeroIdOuProtocolo(protocol);
 
@@ -2774,11 +2789,11 @@ async function saveOcc(ev){
           try{
             await Promise.race([
               _openOccRegPromise,
-              new Promise(r=>setTimeout(r,120))
+              new Promise((_, reject)=>setTimeout(()=>reject(new Error('timeout')),2000))
             ]);
           }catch{}
         }
-        if(!S.editing?.numero_protocolo){
+        if(!S.editing?.numero_protocolo&&!S.activeReservation?.numeroProtocolo){
           try{
             const directRes=await window.StorageService?.reserveProtocol(S.user?.login||'Operador',form.elements['unidade']?.value||S.editing?.unidade||'',{
               clientId:getTabSessionClientId(),
@@ -3233,7 +3248,16 @@ async function validatePendingOcc(id,form=null){
   S.validationModal=null;
   cleanup();
   hideLoading();
-  S.occ=S.occ.map(x=>(String(x.id_ocorrencia)===normId||String(x.id_interno)===normId||String(x.numero_protocolo)===String(current.numero_protocolo))?updatedRow:x);
+  const targetProto = String(current.numero_protocolo || '').trim().toUpperCase();
+  S.occ = S.occ.map(x => {
+    const xOcc = String(x.id_ocorrencia || '').trim();
+    const xInt = String(x.id_interno || '').trim();
+    const xProto = String(x.numero_protocolo || '').trim().toUpperCase();
+    if ((normId && (xOcc === normId || xInt === normId)) || (targetProto && xProto === targetProto)) {
+      return updatedRow;
+    }
+    return x;
+  });
   S.pending=filteredPendingOccurrences();
   _apuracaoFilterMemo={rowsRef:null,fKey:'',result:[]};
   _occFilterMemo={rowsRef:null,query:'',result:[]};
@@ -3241,8 +3265,11 @@ async function validatePendingOcc(id,form=null){
   render();
   showToast('Ocorrência validada com sucesso','success');
 
-  // 2. PERSISTÊNCIA ASSÍNCRONA EM BACKGROUND COM RESILIÊNCIA E WRITE LOCK
-  (async()=>{
+  // 2. PERSISTÊNCIA SERIALIZADA EM FILA FIFO (PREVINE CONCORRÊNCIA E REVERSÃO EM LOTE)
+  if (!window._validationExecutionChain) {
+    window._validationExecutionChain = Promise.resolve();
+  }
+  window._validationExecutionChain = window._validationExecutionChain.catch(()=>{}).then(async ()=>{
     try{
       await ensureDataWritePermission();
       let savedNew=[];
@@ -3262,7 +3289,7 @@ async function validatePendingOcc(id,form=null){
           anexos_referencias:finalPhotoPaths.join('|')
         };
         if(window.StorageService?.registerPendingValidation){
-          window.StorageService.registerPendingValidation(finalRow);
+          window.StorageService.registerPendingValidation(finalRow, 120000);
         }
         let savedResult=null;
         if(window.StorageService?.appendSingleRecord){
@@ -3271,7 +3298,15 @@ async function validatePendingOcc(id,form=null){
           savedResult=await CSVService.append('ocorrencias.csv',finalRow,H.occ);
         }
         await window.StorageService?.updateOccurrenceInLegacyBase?.(finalRow);
-        const updatedList=S.occ.map(x=>(String(x.id_ocorrencia)===normId||String(x.id_interno)===normId||String(x.numero_protocolo)===String(current.numero_protocolo))?finalRow:x);
+        const updatedList=(S.occ||[]).map(x=>{
+          const xOcc=String(x.id_ocorrencia||'').trim();
+          const xInt=String(x.id_interno||'').trim();
+          const xProto=String(x.numero_protocolo||'').trim().toUpperCase();
+          if((normId&&(xOcc===normId||xInt===normId))||(targetProto&&xProto===targetProto)){
+            return finalRow;
+          }
+          return x;
+        });
         const consolidatedOcc=window.StorageService?.consolidateVersionedRows
           ?window.StorageService.consolidateVersionedRows(updatedList)
           :updatedList;
@@ -3290,12 +3325,21 @@ async function validatePendingOcc(id,form=null){
       prevNewPhotos.forEach(x=>x.url&&URL.revokeObjectURL(x.url));
     }catch(bgErr){
       console.error('[Rollback] Falha ao persistir validação no disco:',bgErr);
-      S.occ=prevOcc;
-      S.pending=prevPending;
+      // Rollback cirúrgico apenas para esta ocorrência sem afetar outras da sessão
+      S.occ=(S.occ||[]).map(x=>{
+        const xOcc=String(x.id_ocorrencia||'').trim();
+        const xInt=String(x.id_interno||'').trim();
+        const xProto=String(x.numero_protocolo||'').trim().toUpperCase();
+        if((normId&&(xOcc===normId||xInt===normId))||(targetProto&&xProto===targetProto)){
+          return current;
+        }
+        return x;
+      });
+      S.pending=filteredPendingOccurrences();
       render();
       showToast(bgErr.message||'Falha ao gravar validação no disco. Ocorrência restaurada.','error','Erro na Validação');
     }
-  })();
+  });
 }
 async function deletePendingOcc(id){
   if(hasProfile(S.user,'Operador'))return denyOperatorAccess();
