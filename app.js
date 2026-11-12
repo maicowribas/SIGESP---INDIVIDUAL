@@ -1,6 +1,6 @@
 'use strict';
 const DB_NAME='SIGESP_DB',DB_STORE='CONFIG',DB_KEY='rootFolder';
-const H={users:['id_usuario','nome','login','senha_hash','perfil','unidades_permitidas','supervisao_id','status','data_criacao','ultimo_acesso','versao_registro','data_atualizacao','usuario_ultima_alteracao'],org:['tipo','id','nome','supervisao_id','ativo','aliases'],nature:['id_natureza','nome','ativo','aliases'],units:['id_unidade','nome','id_supervisao'],supervisions:['id_supervisao','nome'],occ:['id_ocorrencia','id_interno','numero_protocolo','data_ocorrencia','hora_ocorrencia','gerencia','supervisao','unidade','area','local_especifico','natureza_ocorrencia','tipo_vinculo','nome_envolvido','empresa_envolvido','matricula_id','telefone','documento','placa_veiculo','gerencia_envolvido','gerencia_geral','diretoria','relato_detalhado','providencias_adotadas','prioridade','status','anexos_referencias','responsavel_registro','perfil_registro','data_registro','versao_registro','usuario_ultima_alteracao','status_validacao','data_envio_validacao','validado_por','data_validacao','observacao_validacao'],keys:['id_chave','codigo','descricao','setor','unidade','status','observacoes','versao_registro','data_atualizacao','usuario_ultima_alteracao'],moves:['id_movimento','id_chave','codigo_chave','tipo_movimento','retirante','matricula_documento','data_hora_retirada','data_hora_devolucao','observacoes','usuario_registro','versao_registro','data_atualizacao'],audit:['id_auditoria','data_hora','usuario','perfil','modulo','acao','id_registro','codigo_registro','detalhes'],inspecoes:['id','data','realizar_monitoramento','motivo_nao_execucao','placa','transportadora','nota','laudo','observacao','responsavel','matricula_responsavel','usuario_registro','data_hora_registro','data_hora_alteracao','alterado_por','unidade','supervisao'],registros_apagados:['id_exclusao','modulo_origem','data_hora_exclusao','administrador','id_registro','codigo_registro','dados_originais','motivo_exclusao']};
+const H={users:['id_usuario','nome','login','senha_hash','perfil','unidades_permitidas','supervisao_id','status','data_criacao','ultimo_acesso','versao_registro','data_atualizacao','usuario_ultima_alteracao'],org:['tipo','id','nome','supervisao_id','ativo','aliases'],nature:['id_natureza','nome','ativo','aliases'],units:['id_unidade','nome','id_supervisao'],supervisions:['id_supervisao','nome'],occ:['id_ocorrencia','id_interno','numero_protocolo','data_ocorrencia','hora_ocorrencia','gerencia','supervisao','unidade','area','local_especifico','natureza_ocorrencia','tipo_vinculo','nome_envolvido','empresa_envolvido','matricula_id','telefone','documento','placa_veiculo','gerencia_envolvido','gerencia_geral','diretoria','relato_detalhado','providencias_adotadas','prioridade','status','anexos_referencias','responsavel_registro','perfil_registro','data_registro','versao_registro','usuario_ultima_alteracao','status_validacao','data_envio_validacao','validado_por','data_validacao','observacao_validacao','status_apuracao','apuracao_notas','apuracao_conclusao','apuracao_plano_acao','apuracao_responsavel','apuracao_data'],keys:['id_chave','codigo','descricao','setor','unidade','status','observacoes','versao_registro','data_atualizacao','usuario_ultima_alteracao'],moves:['id_movimento','id_chave','codigo_chave','tipo_movimento','retirante','matricula_documento','data_hora_retirada','data_hora_devolucao','observacoes','usuario_registro','versao_registro','data_atualizacao'],audit:['id_auditoria','data_hora','usuario','perfil','modulo','acao','id_registro','codigo_registro','detalhes'],inspecoes:['id','data','realizar_monitoramento','motivo_nao_execucao','placa','transportadora','nota','laudo','observacao','responsavel','matricula_responsavel','usuario_registro','data_hora_registro','data_hora_alteracao','alterado_por','unidade','supervisao'],registros_apagados:['id_exclusao','modulo_origem','data_hora_exclusao','administrador','id_registro','codigo_registro','dados_originais','motivo_exclusao']};
 const H_PENDING=H.occ;
 const PRI=['Baixa','Média','Alta','Crítica'],OST=['Rascunho','Registrada','Em Apuração','Encerrada'],KST=['Disponível','Retirada','Inativa','Manutenção','Extraviada'],MAX=6,WIDTH=1280,QUALITY=.72;
 const ENVIRONMENTAL_FILE='inspecao_fumaca_preta.csv';
@@ -13,6 +13,7 @@ function hasProfile(user, ...names){const current=normalizePerfil(user?.perfil);
 function getRightsForUser(user=S.user){const profile=canonicalPerfil(user?.perfil);return RIGHTS[profile]||{}}
 function canRegisterOccurrence(user=S.user){return hasProfile(user,'Administrador','Supervisor','Líder','Operador')}
 function canValidateOccurrence(user=S.user){return hasProfile(user,'Administrador','Supervisor','Líder')}
+function shouldReceiveOccurrenceNotifications(user=S.user){if(!user)return false;return !hasProfile(user,'Operador','Consulta')}
 function canManageUsers(user=S.user){return Boolean(getRightsForUser(user).users)}
 function isAdministratorUser(user=S.user){if(!user)return false;return normalizePerfil(user.perfil)==='administrador'||hasProfile(user,'Administrador')||user.login==='admin'}
 function manageableUsers(){if(!canManageUsers())return[];return hasProfile(S.user,'Supervisor')?S.users.filter(user=>!isAdministratorUser(user)):S.users}
@@ -543,8 +544,31 @@ function normalizeOccurrenceRow(raw,index=0,existingList=[]){
     data_envio_validacao:getField('data_envio_validacao')||(statusVal==='pendente'?dataReg:''),
     validado_por:getField('validado_por')||(statusVal==='validada'?userLogin:''),
     data_validacao:getField('data_validacao')||(statusVal==='validada'?dataReg:''),
-    observacao_validacao:getField('observacao_validacao')
+    observacao_validacao:getField('observacao_validacao'),
+    status_apuracao:String(getField('status_apuracao')||raw.status_apuracao||((stLower==='em apuração'||stLower==='em apuracao')?'Em Apuração':(stLower==='encerrada'||stLower==='concluída'||stLower==='concluida')?'Encerrada':(isValidated?'Registrada':''))),
+    apuracao_notas:String(getField('apuracao_notas')||raw.apuracao_notas||''),
+    apuracao_conclusao:String(getField('apuracao_conclusao')||raw.apuracao_conclusao||''),
+    apuracao_plano_acao:String(getField('apuracao_plano_acao')||raw.apuracao_plano_acao||''),
+    apuracao_responsavel:String(getField('apuracao_responsavel')||raw.apuracao_responsavel||''),
+    apuracao_data:String(getField('apuracao_data')||raw.apuracao_data||'')
   };
+
+  // Extração defensiva retrocompatível caso a linha venha de base legada com os campos apenas em observacao_validacao
+  const rawObs=String(resObj.observacao_validacao||'').trim();
+  if((!resObj.apuracao_notas||!resObj.apuracao_conclusao)&&rawObs.includes('[APURAÇÃO]')){
+    const parts=rawObs.split('[APURAÇÃO]').pop();
+    const mNotas=/NOTAS:\s*([\s\S]*?)(?=\s*\|\s*CONCLUS[ÃA]O:|$)/i.exec(parts);
+    const mConcl=/CONCLUS[ÃA]O:\s*([\s\S]*?)(?=\s*\|\s*PLANO DE A[ÇC][ÃA]O:|$)/i.exec(parts);
+    const mPlano=/PLANO DE A[ÇC][ÃA]O:\s*([\s\S]*?)(?=\s*\|\s*RESPONS[ÁA]VEL:|$)/i.exec(parts);
+    const mResp=/RESPONS[ÁA]VEL:\s*([\s\S]*?)(?=\s*\|\s*DATA:|$)/i.exec(parts);
+    const mData=/DATA:\s*([\s\S]*?)$/i.exec(parts);
+    if(mNotas&&!resObj.apuracao_notas)resObj.apuracao_notas=mNotas[1].trim();
+    if(mConcl&&!resObj.apuracao_conclusao)resObj.apuracao_conclusao=mConcl[1].trim();
+    if(mPlano&&!resObj.apuracao_plano_acao)resObj.apuracao_plano_acao=mPlano[1].trim();
+    if(mResp&&!resObj.apuracao_responsavel)resObj.apuracao_responsavel=mResp[1].trim();
+    if(mData&&!resObj.apuracao_data)resObj.apuracao_data=mData[1].trim();
+    if(!resObj.status_apuracao&&resObj.status)resObj.status_apuracao=resObj.status;
+  }
   Object.defineProperty(resObj,'_norm',{value:true,enumerable:false,configurable:true});
   return resObj;
 }
@@ -1828,21 +1852,21 @@ async function smartPollSync(options = {}){
           return wasPending&&isValidatedOccurrence(item);
         });
 
-        if(S.user&&newValidated.length>0){
-          const pName=newValidated[0]?.numero_protocolo?` (${newValidated[0].numero_protocolo})`:'';
-          showToast(`🔔 Nova ocorrência${pName} registrada no sistema!`,'success','Atualização em Tempo Real');
-        }
-        if(S.user&&newPending.length>0){
-          const pName=newPending[0]?.numero_protocolo?` (${newPending[0].numero_protocolo})`:'';
-          if(canValidateOccurrence(S.user)){
-            showToast(`🔔 Nova ocorrência${pName} aguardando sua validação!`,'warning','Fila de Validação');
-          }else{
-            showToast(`🔔 Ocorrência${pName} enviada para a fila de validação.`,'info','Ocorrência Registrada');
+        if(S.user && shouldReceiveOccurrenceNotifications(S.user) && !options?.suppressOccurrenceToasts){
+          if(newValidated.length>0){
+            const pName=newValidated[0]?.numero_protocolo?` (${newValidated[0].numero_protocolo})`:'';
+            showToast(`🔔 Nova ocorrência${pName} registrada no sistema!`,'success','Atualização em Tempo Real');
           }
-        }
-        if(S.user&&newlyValidatedFromPending.length>0){
-          const pName=newlyValidatedFromPending[0]?.numero_protocolo?` ${newlyValidatedFromPending[0].numero_protocolo}`:'';
-          showToast(`✅ Ocorrência${pName} validada pelo supervisor!`,'success','Validação Concluída');
+          if(newPending.length>0){
+            const pName=newPending[0]?.numero_protocolo?` (${newPending[0].numero_protocolo})`:'';
+            if(canValidateOccurrence(S.user)){
+              showToast(`🔔 Nova ocorrência${pName} aguardando sua validação!`,'warning','Fila de Validação');
+            }
+          }
+          if(newlyValidatedFromPending.length>0){
+            const pName=newlyValidatedFromPending[0]?.numero_protocolo?` ${newlyValidatedFromPending[0].numero_protocolo}`:'';
+            showToast(`✅ Ocorrência${pName} validada pelo supervisor!`,'success','Validação Concluída');
+          }
         }
 
         const occChanged=(normalizedFresh.length!==(S.occ||[]).length)||
@@ -2021,14 +2045,16 @@ function setupRealtimeEventsListener(){
               S.pending=filteredPendingOccurrences();
 
               // Alerta sonoro / toast imediato
-              if(S.user && isPendingOccurrence(normNew)){
-                const pName=normNew.numero_protocolo?` (${normNew.numero_protocolo})`:'';
-                if(canValidateOccurrence(S.user)){
-                  showToast(`🔔 Nova ocorrência${pName} aguardando sua validação!`,'warning','Fila de Validação');
+              if(S.user && shouldReceiveOccurrenceNotifications(S.user)){
+                if(isPendingOccurrence(normNew)){
+                  const pName=normNew.numero_protocolo?` (${normNew.numero_protocolo})`:'';
+                  if(canValidateOccurrence(S.user)){
+                    showToast(`🔔 Nova ocorrência${pName} aguardando sua validação!`,'warning','Fila de Validação');
+                  }
+                }else if(isValidatedOccurrence(normNew)){
+                  const pName=normNew.numero_protocolo?` (${normNew.numero_protocolo})`:'';
+                  showToast(`✅ Ocorrência${pName} validada pelo supervisor!`,'success','Validação Concluída');
                 }
-              }else if(S.user && isValidatedOccurrence(normNew)){
-                const pName=normNew.numero_protocolo?` (${normNew.numero_protocolo})`:'';
-                showToast(`✅ Ocorrência${pName} validada pelo supervisor!`,'success','Validação Concluída');
               }
 
               if(!S.validationModal&&!S.submitting){
@@ -2142,7 +2168,7 @@ async function login(ev){
     S.message='';
     startBackgroundPolling();
     if(canValidateOccurrence(S.user)){
-      smartPollSync({force:true,immediate:true}).catch(()=>{});
+      smartPollSync({force:true,immediate:true,suppressOccurrenceToasts:true}).catch(()=>{});
     }
     if(isOp){
       await openOccurrenceRegistration({forceNew:false});
@@ -2934,12 +2960,58 @@ async function saveOcc(ev){
 }
 let _toastTimer=null;
 function renderToastPortal(){
-let root=document.getElementById('toast-portal-root');
-if(!root){root=document.createElement('div');root.id='toast-portal-root';root.className='toast-portal-root';root.setAttribute('aria-live','polite');root.style.cssText='position:fixed;top:0;left:0;right:0;bottom:0;pointer-events:none;z-index:100000!important;';document.body.appendChild(root)}
-if(!S.toast){root.innerHTML='';return}
-const isSuccess=S.toast.type==='success';
-root.innerHTML=`<div class="toast-container" style="position:fixed;top:24px;right:24px;z-index:100000!important;display:flex;flex-direction:column;gap:10px;pointer-events:none"><div id="appToast" class="toast toast-visible ${isSuccess?'toast-success':'toast-error'}" role="alert" style="pointer-events:auto;box-shadow:0 16px 40px rgba(15,23,42,0.22);border:1px solid ${isSuccess?'#86efac':'#fca5a5'};background:${isSuccess?'#f0fdf4':'#fef2f2'};color:${isSuccess?'#14532d':'#7f1d1d'}"><div class="toast-icon">${isSuccess?`<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#16a34a" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>`:`<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#dc2626" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>`}</div><div class="toast-content">${S.toast.title?`<div style="font-weight:800;font-size:12px;text-transform:uppercase;letter-spacing:.03em;margin-bottom:2px">${esc(S.toast.title)}</div>`:''}<span>${esc(S.toast.message)}</span></div><button type="button" id="closeToastPortal" class="toast-close" aria-label="Fechar notificação">×</button></div></div>`;
-document.getElementById('closeToastPortal')?.addEventListener('click',()=>{S.toast=null;renderToastPortal()})}
+  let root=document.getElementById('toast-portal-root');
+  if(!root){
+    root=document.createElement('div');
+    root.id='toast-portal-root';
+    root.className='toast-portal-root';
+    root.setAttribute('aria-live','polite');
+    root.style.cssText='position:fixed;top:0;left:0;right:0;bottom:0;pointer-events:none;z-index:100000!important;';
+    document.body.appendChild(root);
+  }
+  if(!S.toast){root.innerHTML='';return}
+  const tType=S.toast.type||'success';
+  const isSuccess=tType==='success';
+  const isWarning=tType==='warning';
+  const isInfo=tType==='info';
+
+  let borderStyle='#86efac';
+  let bgStyle='#f0fdf4';
+  let colorStyle='#14532d';
+  let titleColor='#166534';
+  let badgeBorder='';
+  let iconSvg=`<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#16a34a" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>`;
+
+  if(isWarning){
+    // Layout Corporativo Profissional Amarelo/Âmbar de Alta Densidade
+    borderStyle='#d97706';
+    bgStyle='linear-gradient(135deg, #fffdf5 0%, #fef3c7 100%)';
+    colorStyle='#78350f';
+    titleColor='#92400e';
+    badgeBorder='border-left: 5px solid #d97706;';
+    iconSvg=`<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <path d="M12 2L4 6V11C4 16.55 7.84 21.74 12 23C16.16 21.74 20 16.55 20 11V6L12 2Z" fill="#fde68a" stroke="#d97706" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M12 8V12" stroke="#b45309" stroke-width="2.5" stroke-linecap="round"/>
+      <circle cx="12" cy="16" r="1.2" fill="#b45309"/>
+    </svg>`;
+  }else if(isInfo){
+    borderStyle='#93c5fd';
+    bgStyle='#eff6ff';
+    colorStyle='#1e3a8a';
+    titleColor='#1d4ed8';
+    iconSvg=`<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#2563eb" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>`;
+  }else if(!isSuccess){
+    borderStyle='#fca5a5';
+    bgStyle='#fef2f2';
+    colorStyle='#7f1d1d';
+    titleColor='#991b1b';
+    iconSvg=`<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#dc2626" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>`;
+  }
+
+  const toastClass=isWarning?'toast-warning':(isSuccess?'toast-success':'toast-error');
+  root.innerHTML=`<div class="toast-container" style="position:fixed;top:24px;right:24px;z-index:100000!important;display:flex;flex-direction:column;gap:10px;pointer-events:none"><div id="appToast" class="toast toast-visible ${toastClass}" role="alert" style="pointer-events:auto;box-shadow:0 18px 42px -6px rgba(15,23,42,0.24),0 4px 12px rgba(0,0,0,0.06);border:1.5px solid ${borderStyle};background:${bgStyle};color:${colorStyle};${badgeBorder}border-radius:10px;padding:12px 16px;display:flex;align-items:center;min-width:320px;max-width:440px"><div class="toast-icon" style="display:flex;align-items:center;justify-content:center;margin-right:12px;flex-shrink:0">${iconSvg}</div><div class="toast-content" style="flex:1">${S.toast.title?`<div style="font-weight:800;font-size:12px;text-transform:uppercase;letter-spacing:.04em;margin-bottom:2px;color:${titleColor}">${esc(S.toast.title)}</div>`:''}<span style="font-weight:600;font-size:13px;line-height:1.4">${esc(S.toast.message)}</span></div><button type="button" id="closeToastPortal" class="toast-close" aria-label="Fechar notificação" style="color:${titleColor};opacity:0.8;font-size:18px;font-weight:bold;cursor:pointer;border:none;background:transparent;padding:0 0 0 8px;margin-left:8px;line-height:1">×</button></div></div>`;
+  document.getElementById('closeToastPortal')?.addEventListener('click',()=>{S.toast=null;renderToastPortal()});
+}
 function showToast(message,type='success',title=''){S.toast={message,type,title,id:Date.now()};if(_toastTimer)clearTimeout(_toastTimer);renderToastPortal();_toastTimer=setTimeout(()=>{S.toast=null;const toastEl=document.getElementById('appToast');if(toastEl){toastEl.classList.remove('toast-visible');setTimeout(()=>{renderToastPortal()},250)}else{renderToastPortal()}},4000)}
 async function viewPendingOcc(id){
 try{
@@ -3155,6 +3227,9 @@ async function validatePendingOcc(id,form=null){
   };
 
   // 1. ATUALIZAÇÃO INSTANTÂNEA DA INTERFACE (0 ms)
+  if(window.StorageService?.registerPendingValidation){
+    window.StorageService.registerPendingValidation(updatedRow);
+  }
   S.validationModal=null;
   cleanup();
   hideLoading();
@@ -3186,6 +3261,9 @@ async function validatePendingOcc(id,form=null){
           validado_por:S.user.login,
           anexos_referencias:finalPhotoPaths.join('|')
         };
+        if(window.StorageService?.registerPendingValidation){
+          window.StorageService.registerPendingValidation(finalRow);
+        }
         let savedResult=null;
         if(window.StorageService?.appendSingleRecord){
           savedResult=await window.StorageService.appendSingleRecord('ocorrencias.csv',finalRow,H.occ,{isNewRecord:false});
@@ -3227,6 +3305,14 @@ async function deletePendingOcc(id){
   const prevOcc=[...(S.occ||[])];
   const prevPending=[...(S.pending||[])];
   
+  const targetOcc=(S.occ||[]).find(x=>String(x.id_ocorrencia||'').trim()===normId||(x.id_interno&&String(x.id_interno).trim()===normId)||String(x.numero_protocolo||'').trim().toUpperCase()===normId.toUpperCase());
+  if(window.StorageService?.addOccurrenceTombstone){
+    window.StorageService.addOccurrenceTombstone(normId);
+    if(targetOcc?.numero_protocolo)window.StorageService.addOccurrenceTombstone(targetOcc.numero_protocolo);
+    if(targetOcc?.id_interno)window.StorageService.addOccurrenceTombstone(targetOcc.id_interno);
+    if(targetOcc?.id_ocorrencia)window.StorageService.addOccurrenceTombstone(targetOcc.id_ocorrencia);
+  }
+
   // Optimistic UI: Fecha o modal imediatamente e remove o registro da interface sem latência (0ms)
   S.deletePendingTarget=null;
   S.occ=(S.occ||[]).filter(x=>String(x.id_ocorrencia||'').trim()!==normId&&(!x.id_interno||String(x.id_interno).trim()!==normId)&&String(x.numero_protocolo||'').trim().toUpperCase()!==normId.toUpperCase());
@@ -3240,9 +3326,7 @@ async function deletePendingOcc(id){
       await ensureDataWritePermission();
       await withWriteLock('occurrences',async()=>{
         await refreshAccessContext();
-        const rawText=await fetchFreshRawCsv('ocorrencias.csv');
-        const freshRows=parseAndConsolidateCsv(rawText);
-        const target=freshRows.find(x=>String(x.id_ocorrencia||'').trim()===normId||String(x.id_interno||'').trim()===normId||String(x.numero_protocolo||'').trim().toUpperCase()===normId.toUpperCase());
+        const target=targetOcc||(S.occ||[]).find(x=>String(x.id_ocorrencia||'').trim()===normId||String(x.id_interno||'').trim()===normId||String(x.numero_protocolo||'').trim().toUpperCase()===normId.toUpperCase());
         if(target){
           assertUnitAccess(target.unidade);
           const auditItem={
@@ -3261,11 +3345,17 @@ async function deletePendingOcc(id){
             const currentDeleted=await read('registros_apagados.csv').catch(()=>[]);
             await write('registros_apagados.csv',[auditItem,...currentDeleted],H.registros_apagados);
           }
-          const nextRows=freshRows.filter(x=>String(x.id_ocorrencia||'').trim()!==normId&&(!x.id_interno||String(x.id_interno).trim()!==normId)&&String(x.numero_protocolo||'').trim().toUpperCase()!==normId.toUpperCase());
-          await write('ocorrencias.csv',nextRows,H.occ);
         }
         await window.StorageService?.deleteOccurrenceRecord?.(target?.numero_protocolo||target?.id_ocorrencia||normId);
+        if(target?.numero_protocolo)await window.StorageService?.deleteOccurrenceRecord?.(target.numero_protocolo);
+        if(target?.id_interno)await window.StorageService?.deleteOccurrenceRecord?.(target.id_interno);
         await window.StorageService?.deleteOccurrenceRecord?.(normId);
+
+        // Atualiza a lista e cache em memória
+        const cachedOcc=window.StorageService?._rawFileCache?.get('ocorrencias.csv');
+        if(cachedOcc&&Array.isArray(cachedOcc.rows)){
+          cachedOcc.rows=cachedOcc.rows.filter(x=>String(x.id_ocorrencia||'').trim()!==normId&&(!x.id_interno||String(x.id_interno).trim()!==normId)&&String(x.numero_protocolo||'').trim().toUpperCase()!==normId.toUpperCase());
+        }
       });
     }catch(error){
       console.error('Falha na persistência da exclusão de ocorrência pendente:',error);
@@ -5608,16 +5698,17 @@ async function saveApuracao(id,form){
           }else{
             savedResult=await CSVService.append('ocorrencias.csv',finalRow,H.occ);
           }
+          const updatedList=S.occ.map(x=>(String(x.id_ocorrencia)===normId||String(x.id_interno)===normId||String(x.numero_protocolo)===String(current.numero_protocolo))?finalRow:x);
+          const consolidatedOcc=window.StorageService?.consolidateVersionedRows
+            ?window.StorageService.consolidateVersionedRows(updatedList)
+            :updatedList;
+          S.occ=consolidatedOcc.map((x,idx)=>normalizeOccurrenceRow(x,idx,consolidatedOcc)).filter(Boolean);
           if(typeof CSVService!=='undefined'){
             CSVService.buildEntry('ocorrencias.csv',S.occ);
           }
           window.StorageService?.IndexedDBEngine?.saveRecordsBulkLocally('ocorrencias.csv',S.occ).catch(()=>{});
-          const stat=await window.StorageService?.getFileStat('ocorrencias.csv').catch(()=>null);
-          if(stat){
-            _freshCsvMeta.set('ocorrencias.csv',{mtimeMs:stat.mtimeMs,size:stat.size,rawSig:''});
-          }
         });
-        await auditApuracaoAction('APURACAO_ATUALIZADA',updatedRow,`Status: ${updatedRow.status} | Gravidade: ${updatedRow.prioridade}`);
+        await auditApuracaoAction('APURACAO_ATUALIZADA',finalRow,`Status: ${finalRow.status} | Gravidade: ${finalRow.prioridade}`);
       }catch(bgErr){
         console.error('[Rollback] Falha ao persistir apuração no disco:',bgErr);
         S.occ=prevOcc;

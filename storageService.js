@@ -73,11 +73,11 @@ const StorageService = (() => {
       ]
     },
     'ocorrencias.csv': {
-      headers: ['id_ocorrencia', 'id_interno', 'numero_protocolo', 'data_ocorrencia', 'hora_ocorrencia', 'gerencia', 'supervisao', 'unidade', 'area', 'local_especifico', 'natureza_ocorrencia', 'tipo_vinculo', 'nome_envolvido', 'empresa_envolvido', 'matricula_id', 'telefone', 'documento', 'placa_veiculo', 'gerencia_envolvido', 'gerencia_geral', 'diretoria', 'relato_detalhado', 'providencias_adotadas', 'prioridade', 'status', 'anexos_referencias', 'responsavel_registro', 'perfil_registro', 'data_registro', 'versao_registro', 'usuario_ultima_alteracao', 'status_validacao', 'data_envio_validacao', 'validado_por', 'data_validacao', 'observacao_validacao'],
+      headers: ['id_ocorrencia', 'id_interno', 'numero_protocolo', 'data_ocorrencia', 'hora_ocorrencia', 'gerencia', 'supervisao', 'unidade', 'area', 'local_especifico', 'natureza_ocorrencia', 'tipo_vinculo', 'nome_envolvido', 'empresa_envolvido', 'matricula_id', 'telefone', 'documento', 'placa_veiculo', 'gerencia_envolvido', 'gerencia_geral', 'diretoria', 'relato_detalhado', 'providencias_adotadas', 'prioridade', 'status', 'anexos_referencias', 'responsavel_registro', 'perfil_registro', 'data_registro', 'versao_registro', 'usuario_ultima_alteracao', 'status_validacao', 'data_envio_validacao', 'validado_por', 'data_validacao', 'observacao_validacao', 'status_apuracao', 'apuracao_notas', 'apuracao_conclusao', 'apuracao_plano_acao', 'apuracao_responsavel', 'apuracao_data'],
       rows: []
     },
     'ocorrencias_pendentes.csv': {
-      headers: ['id_ocorrencia', 'id_interno', 'numero_protocolo', 'data_ocorrencia', 'hora_ocorrencia', 'gerencia', 'supervisao', 'unidade', 'area', 'local_especifico', 'natureza_ocorrencia', 'tipo_vinculo', 'nome_envolvido', 'empresa_envolvido', 'matricula_id', 'telefone', 'documento', 'placa_veiculo', 'gerencia_envolvido', 'gerencia_geral', 'diretoria', 'relato_detalhado', 'providencias_adotadas', 'prioridade', 'status', 'anexos_referencias', 'responsavel_registro', 'perfil_registro', 'data_registro', 'versao_registro', 'usuario_ultima_alteracao', 'status_validacao', 'data_envio_validacao', 'validado_por', 'data_validacao', 'observacao_validacao'],
+      headers: ['id_ocorrencia', 'id_interno', 'numero_protocolo', 'data_ocorrencia', 'hora_ocorrencia', 'gerencia', 'supervisao', 'unidade', 'area', 'local_especifico', 'natureza_ocorrencia', 'tipo_vinculo', 'nome_envolvido', 'empresa_envolvido', 'matricula_id', 'telefone', 'documento', 'placa_veiculo', 'gerencia_envolvido', 'gerencia_geral', 'diretoria', 'relato_detalhado', 'providencias_adotadas', 'prioridade', 'status', 'anexos_referencias', 'responsavel_registro', 'perfil_registro', 'data_registro', 'versao_registro', 'usuario_ultima_alteracao', 'status_validacao', 'data_envio_validacao', 'validado_por', 'data_validacao', 'observacao_validacao', 'status_apuracao', 'apuracao_notas', 'apuracao_conclusao', 'apuracao_plano_acao', 'apuracao_responsavel', 'apuracao_data'],
       rows: []
     },
     'inspecao_fumaca_preta.csv': {
@@ -110,10 +110,74 @@ const StorageService = (() => {
   const _individualOccFileCache = new Map();
   // Mapa de chave canônica de ocorrência -> nome do arquivo individual atual no disco
   const _recordKeyToFileMap = new Map();
+  // Tombstones de ocorrências excluídas para evitar ressuscitação durante sincronizações concorrentes
+  const _deletedOccurrencesTombstones = new Map();
+  // Mapa de validações ativas recentes para proteger o estado contra sobrescrita por leituras do disco em trânsito
+  const _pendingValidationsMap = new Map();
   let _lastKnownBatchSig = '';
   let _lastKnownBundleSig = '';
   let _preloadedOccurrencesBatch = null;
   let _clientSessionId = null;
+
+  function isTombstonedOccurrence(record) {
+    if (!record || typeof record !== 'object') return false;
+    const now = Date.now();
+    const idInt = String(record.id_interno || '').trim().toUpperCase();
+    const idOcc = String(record.id_ocorrencia || '').trim().toUpperCase();
+    const proto = String(record.numero_protocolo || '').trim().toUpperCase();
+
+    const keys = [idInt, idOcc, proto].filter(Boolean);
+    for (const k of keys) {
+      const exp = _deletedOccurrencesTombstones.get(k);
+      if (exp) {
+        if (now < exp) return true;
+        _deletedOccurrencesTombstones.delete(k);
+      }
+    }
+    return false;
+  }
+
+  function addOccurrenceTombstone(idOrProto, ttlMs = 3600000) {
+    if (!idOrProto) return;
+    const norm = String(idOrProto).trim().toUpperCase();
+    const clean = norm.replace(/[^A-Z0-9_-]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '');
+    const exp = Date.now() + ttlMs;
+    _deletedOccurrencesTombstones.set(norm, exp);
+    if (clean) _deletedOccurrencesTombstones.set(clean, exp);
+  }
+
+  function registerPendingValidation(record, ttlMs = 45000) {
+    if (!record || typeof record !== 'object') return;
+    const exp = Date.now() + ttlMs;
+    const proto = String(record.numero_protocolo || '').trim().toUpperCase();
+    const occ = String(record.id_ocorrencia || '').trim().toUpperCase();
+    const idInt = String(record.id_interno || '').trim().toUpperCase();
+    const entry = { record: { ...record }, expiresAt: exp };
+    if (proto) _pendingValidationsMap.set(`PROTO:${proto}`, entry);
+    if (occ) _pendingValidationsMap.set(`OCC:${occ}`, entry);
+    if (idInt) _pendingValidationsMap.set(`INT:${idInt}`, entry);
+  }
+
+  function getActivePendingValidation(record) {
+    if (!record || typeof record !== 'object') return null;
+    const now = Date.now();
+    const proto = String(record.numero_protocolo || '').trim().toUpperCase();
+    const occ = String(record.id_ocorrencia || '').trim().toUpperCase();
+    const idInt = String(record.id_interno || '').trim().toUpperCase();
+    const keys = [
+      idInt ? `INT:${idInt}` : '',
+      occ ? `OCC:${occ}` : '',
+      proto ? `PROTO:${proto}` : ''
+    ].filter(Boolean);
+    for (const k of keys) {
+      const entry = _pendingValidationsMap.get(k);
+      if (entry) {
+        if (now < entry.expiresAt) return entry.record;
+        _pendingValidationsMap.delete(k);
+      }
+    }
+    return null;
+  }
 
   function isIndividualOccurrenceFileName(fileName) {
     return /^(?:ocorrencia_).+\.csv$/i.test(String(fileName || '').trim());
@@ -557,13 +621,18 @@ const StorageService = (() => {
     const byProtocolo = new Map();
 
     for (let i = 0; i < rows.length; i++) {
-      const r = rows[i];
+      let r = rows[i];
       if (!r || typeof r !== 'object') continue;
 
       const isOcc = Boolean(r.id_ocorrencia || r.id_interno || r.numero_protocolo);
       let key = '';
 
       if (isOcc) {
+        if (isTombstonedOccurrence(r)) continue;
+        const activeVal = getActivePendingValidation(r);
+        if (activeVal) {
+          r = { ...r, ...activeVal, status_validacao: 'Validada', status: activeVal.status || 'Registrada' };
+        }
         const idInt = String(r.id_interno || '').trim();
         const idOcc = String(r.id_ocorrencia || '').trim();
         const proto = String(r.numero_protocolo || '').trim().toUpperCase();
@@ -636,41 +705,64 @@ const StorageService = (() => {
         const newValid = isRowValidated(r);
         const newPend = isRowPending(r);
 
-        // Uma linha pendente NUNCA pode sobrescrever uma ocorrência já validada
+        // 1. Linha pendente NUNCA pode sobrescrever uma ocorrência já validada
         if (existValid && newPend) {
           continue;
         }
 
-        // Validação estrita de precedência de versão e ciclo de vida
-        if (newValid && !existValid) {
-          // Ocorrência validada sempre substitui versão pendente anterior
-        } else if (vNew > vExist) {
-          // Versão incremental superior sempre prevalece
-        } else if (vNew === vExist) {
-          // Em empate de versões, preserva estados de apuração avançados
-          const sExist = String(existing.status || '').trim().toLowerCase();
-          const sNew = String(r.status || '').trim().toLowerCase();
-          const existHasApur = sExist === 'em apuração' || sExist === 'em apuracao' || sExist === 'encerrada';
-          const newHasApur = sNew === 'em apuração' || sNew === 'em apuracao' || sNew === 'encerrada';
-          if (existHasApur && !newHasApur) {
-            continue;
-          }
-        } else if (!newValid && existValid) {
-          // vNew < vExist ou versão legada não validada não pode reverter registro validado
+        // 2. Se a versão existente for estritamente mais recente que a versão de r, preserva existing
+        if (vExist > vNew) {
+          // Registro existente possui versão incremental superior; o registro legado/antigo não pode reverter
           continue;
         }
 
+        // 3. Validação estrita de precedência de ciclo de vida e versão
+        if (newValid && !existValid) {
+          // Ocorrência validada sempre substitui versão pendente anterior
+        } else if (vNew > vExist) {
+          // Versão incremental superior sempre prevalece (r substitui existing)
+        } else if (vNew === vExist) {
+          // Em empate numérico de versões, desempata por timestamp e avanço de apuração
+          const tExist = Date.parse(existing.data_atualizacao || existing.apuracao_data || existing.data_registro || '') || 0;
+          const tNew = Date.parse(r.data_atualizacao || r.apuracao_data || r.data_registro || '') || 0;
+          const sExist = String(existing.status_apuracao || existing.status || '').trim().toLowerCase();
+          const sNew = String(r.status_apuracao || r.status || '').trim().toLowerCase();
+          const existHasApur = sExist === 'em apuração' || sExist === 'em apuracao' || sExist === 'encerrada' || Boolean(existing.apuracao_notas || existing.apuracao_conclusao);
+          const newHasApur = sNew === 'em apuração' || sNew === 'em apuracao' || sNew === 'encerrada' || Boolean(r.apuracao_notas || r.apuracao_conclusao);
+
+          if (existHasApur && !newHasApur) {
+            continue;
+          }
+          if (tExist > tNew && existHasApur === newHasApur) {
+            continue;
+          }
+        } else if (!newValid && existValid) {
+          // Versão legada não validada não pode reverter registro já validado
+          continue;
+        }
+
+        // A versão r é mais recente ou tem precedência válida sobre existing
         const merged = { ...existing, ...r };
+        // Preserva campos de apuração caso r venha de fonte que omitiu propriedades parciais
+        if (existing.status_apuracao && !r.status_apuracao) merged.status_apuracao = existing.status_apuracao;
+        if (existing.apuracao_notas && !r.apuracao_notas) merged.apuracao_notas = existing.apuracao_notas;
+        if (existing.apuracao_conclusao && !r.apuracao_conclusao) merged.apuracao_conclusao = existing.apuracao_conclusao;
+        if (existing.apuracao_plano_acao && !r.apuracao_plano_acao) merged.apuracao_plano_acao = existing.apuracao_plano_acao;
+        if (existing.apuracao_responsavel && !r.apuracao_responsavel) merged.apuracao_responsavel = existing.apuracao_responsavel;
+        if (existing.apuracao_data && !r.apuracao_data) merged.apuracao_data = existing.apuracao_data;
+
         if (newPend && !existValid && !newValid) {
           merged.status_validacao = 'Pendente de validação';
           merged.status = 'pendente';
         } else if (newValid || existValid) {
           merged.status_validacao = 'Validada';
-          const sLower = String(r.status || existing.status || '').trim().toLowerCase();
+          const sLower = String(r.status_apuracao || r.status || existing.status_apuracao || existing.status || '').trim().toLowerCase();
           if (sLower === 'em apuração' || sLower === 'em apuracao') {
             merged.status = 'Em Apuração';
+            merged.status_apuracao = 'Em Apuração';
           } else if (sLower === 'encerrada' || sLower === 'concluída' || sLower === 'concluida') {
             merged.status = 'Encerrada';
+            merged.status_apuracao = 'Encerrada';
           } else if (sLower === 'registrada' || sLower === 'validada') {
             merged.status = 'Registrada';
           } else if (r.status && !r.status.toLowerCase().includes('pendente')) {
@@ -718,6 +810,9 @@ const StorageService = (() => {
 
     const finalOut = [];
     for (const item of out) {
+      if (isTombstonedOccurrence(item)) {
+        continue;
+      }
       if (isRowPending(item)) {
         const p = String(item.numero_protocolo || '').trim().toUpperCase();
         const intId = String(item.id_interno || '').trim();
@@ -951,7 +1046,13 @@ const StorageService = (() => {
           req.onsuccess = () => {
             const all = req.result || [];
             const now = Date.now();
-            const eligible = all.filter(j => j.status === 'pending' || (j.status === 'retry' && now >= (j.nextRetry || 0)));
+            const eligible = all.filter(j => {
+              if (!j) return false;
+              // Descarta jobs antigos órfãos (> 24h) ou com excesso de retentativas (> 15)
+              if (j.createdAt && (now - j.createdAt > 86400000)) return false;
+              if (j.attempts && j.attempts > 15) return false;
+              return j.status === 'pending' || (j.status === 'retry' && now >= (j.nextRetry || 0));
+            });
             eligible.sort((a, b) => a.createdAt - b.createdAt);
             res(eligible);
           };
@@ -980,6 +1081,42 @@ const StorageService = (() => {
         db.close();
       } catch (err) {
         console.warn('[IndexedDBEngine:removeOutboxJob] Falha ao remover job:', err);
+      }
+    },
+
+    async removeOutboxJobsForRecord(recordIdentifiers) {
+      if (typeof indexedDB === 'undefined' || !recordIdentifiers) return;
+      const rawList = Array.isArray(recordIdentifiers) ? recordIdentifiers : [recordIdentifiers];
+      const ids = rawList.filter(Boolean).map(x => String(x).trim().toUpperCase());
+      if (!ids.length) return;
+      try {
+        const db = await this.open();
+        if (!db || !db.objectStoreNames.contains('sync_outbox')) return;
+        await new Promise((res, rej) => {
+          const tx = db.transaction('sync_outbox', 'readwrite');
+          const store = tx.objectStore('sync_outbox');
+          const req = store.getAll();
+          req.onsuccess = () => {
+            const all = req.result || [];
+            for (const j of all) {
+              const r = j.record || {};
+              const proto = String(r.numero_protocolo || '').trim().toUpperCase();
+              const occ = String(r.id_ocorrencia || '').trim().toUpperCase();
+              const idInt = String(r.id_interno || '').trim().toUpperCase();
+              const fName = String(j.individualFileName || '').trim().toUpperCase();
+              const match = ids.some(id => id === proto || id === occ || id === idInt || (id.length >= 4 && fName.includes(id)));
+              if (match) {
+                store.delete(j.id);
+              }
+            }
+          };
+          tx.oncomplete = () => res();
+          tx.onerror = () => rej(tx.error);
+          tx.onabort = () => rej(tx.error);
+        });
+        db.close();
+      } catch (err) {
+        console.warn('[IndexedDBEngine:removeOutboxJobsForRecord] Falha:', err);
       }
     },
 
@@ -2695,6 +2832,15 @@ const StorageService = (() => {
       }
 
       // 3. FILA DE ESCRITA EM SEGUNDO PLANO (APPEND-ONLY OUTBOX / ARQUIVO INDIVIDUAL POR OCORRÊNCIA)
+      if (fileName === 'ocorrencias.csv') {
+        if (record.status_validacao === 'Validada') {
+          registerPendingValidation(record);
+        }
+        if (!isNewRecord) {
+          await IndexedDBEngine.removeOutboxJobsForRecord([record.numero_protocolo, record.id_ocorrencia, record.id_interno]);
+        }
+      }
+
       const individualFileName = fileName === 'ocorrencias.csv'
         ? getIndividualOccurrenceFileName(record)
         : null;
@@ -3809,34 +3955,51 @@ const StorageService = (() => {
     async deleteOccurrenceRecord(idOrProto) {
       if (!idOrProto) return;
       const norm = String(idOrProto).trim().toUpperCase();
-      const cleanProto = norm.replace(/[^A-Z0-9_-]/g, '_');
-      const targetFileName = `ocorrencia_${cleanProto}.csv`;
-      
-      const dir = getActiveDirectoryHandle();
-      
-      // 1. Remoção do arquivo individual em disco / servidor
-      if (dir) {
-        if (dir.isServer && !dir.relPath) {
-          try {
-            await fetch(`/api/storage/delete?file=${encodeURIComponent(targetFileName)}&_t=${Date.now()}`, { method: 'DELETE' });
-          } catch (delErr) {
-            console.warn('[StorageService:deleteOccurrenceRecord] Falha ao deletar arquivo individual no servidor:', targetFileName, delErr);
-          }
-        } else if (typeof dir.removeEntry === 'function') {
-          try {
-            await dir.removeEntry(targetFileName);
-          } catch (delErr) {
-            if (delErr?.name !== 'NotFoundError') {
-              console.warn('[StorageService:deleteOccurrenceRecord] Falha ao remover entry individual nativa:', targetFileName, delErr);
-            }
-          }
+      const safeId = norm.replace(/[^A-Z0-9_-]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '');
+      const rawClean = norm.replace(/[^A-Z0-9_-]/g, '_');
+
+      addOccurrenceTombstone(norm);
+      if (safeId) addOccurrenceTombstone(safeId);
+
+      const targetFileNames = new Set();
+      if (safeId) targetFileNames.add(`ocorrencia_${safeId}.csv`);
+      if (rawClean) targetFileNames.add(`ocorrencia_${rawClean}.csv`);
+
+      for (const [k, v] of _recordKeyToFileMap.entries()) {
+        const kUpper = k.toUpperCase();
+        if (kUpper === norm || kUpper === `PROTO:${norm}` || kUpper === `OCC:${norm}` || kUpper === `INT:${norm}` || (safeId && kUpper.includes(safeId))) {
+          if (v) targetFileNames.add(v);
         }
       }
 
+      const dir = getActiveDirectoryHandle();
+
+      // 1. Remoção do(s) arquivo(s) individual(is) em disco / servidor
+      for (const targetFileName of targetFileNames) {
+        if (dir) {
+          if (dir.isServer && !dir.relPath) {
+            try {
+              await fetch(`/api/storage/delete?file=${encodeURIComponent(targetFileName)}&_t=${Date.now()}`, { method: 'DELETE' });
+            } catch (delErr) {
+              console.warn('[StorageService:deleteOccurrenceRecord] Falha ao deletar arquivo individual no servidor:', targetFileName, delErr);
+            }
+          } else if (typeof dir.removeEntry === 'function') {
+            try {
+              await dir.removeEntry(targetFileName);
+            } catch (delErr) {
+              if (delErr?.name !== 'NotFoundError') {
+                console.warn('[StorageService:deleteOccurrenceRecord] Falha ao remover entry individual nativa:', targetFileName, delErr);
+              }
+            }
+          }
+        }
+        _individualOccFileCache.delete(targetFileName);
+      }
+
       // 2. Limpeza de caches em memória
-      _individualOccFileCache.delete(targetFileName);
       for (const [k, v] of _recordKeyToFileMap.entries()) {
-        if (v === targetFileName || k.toUpperCase() === norm) {
+        const kUpper = k.toUpperCase();
+        if (targetFileNames.has(v) || kUpper === norm || kUpper === `PROTO:${norm}` || kUpper === `OCC:${norm}` || kUpper === `INT:${norm}` || (safeId && kUpper.includes(safeId))) {
           _recordKeyToFileMap.delete(k);
         }
       }
@@ -3844,6 +4007,7 @@ const StorageService = (() => {
       const cachedOcc = _rawFileCache.get('ocorrencias.csv');
       if (cachedOcc && Array.isArray(cachedOcc.rows)) {
         cachedOcc.rows = cachedOcc.rows.filter(x => {
+          if (isTombstonedOccurrence(x)) return false;
           const xProto = String(x.numero_protocolo || '').trim().toUpperCase();
           const xId = String(x.id_ocorrencia || '').trim().toUpperCase();
           const xInt = String(x.id_interno || '').trim().toUpperCase();
@@ -3851,10 +4015,18 @@ const StorageService = (() => {
         });
       }
 
-      // 3. Remoção do IndexedDB
+      // 3. Cancelamento e remoção imediata de jobs no outbox do IndexedDB para esta ocorrência
+      if (this.IndexedDBEngine?.removeOutboxJobsForRecord) {
+        await this.IndexedDBEngine.removeOutboxJobsForRecord([norm, safeId, rawClean, ...Array.from(targetFileNames)]);
+      }
+
+      // 4. Remoção do IndexedDB
       if (this.IndexedDBEngine?.removeRecord) {
         await this.IndexedDBEngine.removeRecord('ocorrencias.csv', norm);
-        await this.IndexedDBEngine.removeRecord('ocorrencias.csv', targetFileName);
+        if (safeId && safeId !== norm) await this.IndexedDBEngine.removeRecord('ocorrencias.csv', safeId);
+        for (const f of targetFileNames) {
+          await this.IndexedDBEngine.removeRecord('ocorrencias.csv', f);
+        }
       }
     },
 
@@ -3932,7 +4104,11 @@ const StorageService = (() => {
       } catch (legacyDiskErr) {
         console.warn('[StorageService] updateOccurrenceInLegacyBase sincronização de disco:', legacyDiskErr);
       }
-    }
+    },
+    addOccurrenceTombstone,
+    isTombstonedOccurrence,
+    registerPendingValidation,
+    getActivePendingValidation
   };
 })();
 
